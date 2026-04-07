@@ -6,10 +6,14 @@
  *   agent-runner → (spawns this) → reads --mcp-config → spawns MCP server (plugin)
  *   → MCP handshake → receives notifications/claude/channel → writes to stdout
  *
+ * Also handles channel messages injected via stdin (stream-json format) so that
+ * tests can verify delivery via both the MCP notification path and the stdin
+ * injection path used by agent-runner's callback bridge.
+ *
  * Stdout lines:
  *   [mock-claude-mcp] ready            — MCP handshake done
  *   [mock-claude-mcp] prompt: <text>   — initial prompt received from stdin
- *   [mock-claude-mcp] channel: <json>  — notifications/claude/channel received
+ *   [mock-claude-mcp] channel: <json>  — channel message received (MCP or stdin)
  *   [mock-claude-mcp] tool-result: <json> — tool call response received
  *
  * Args parsed: --mcp-config <path>  (others are silently ignored)
@@ -85,23 +89,9 @@ class McpClient {
       return
     }
 
-    // Notification
+    // MCP notification (legacy path — plugin in non-SEND_ONLY mode emits these)
     if (msg.method === 'notifications/claude/channel') {
-      process.stdout.write(`[mock-claude-mcp] channel: ${JSON.stringify(msg.params)}\n`)
-
-      // Optionally auto-reply (for deeper pipeline tests)
-      if (process.env.MOCK_CLAUDE_REPLY === '1' && msg.params?.meta?.chat_id) {
-        const chatId = msg.params.meta.chat_id
-        const text = `[mock-claude] echo: ${msg.params.content ?? '(no text)'}`
-        this.request('tools/call', {
-          name: 'reply',
-          arguments: { chat_id: chatId, text },
-        }).then(result => {
-          process.stdout.write(`[mock-claude-mcp] tool-result: ${JSON.stringify(result)}\n`)
-        }).catch(err => {
-          process.stderr.write(`[mock-claude-mcp] tool error: ${err.message}\n`)
-        })
-      }
+      handleChannel(msg.params)
       return
     }
 
@@ -119,23 +109,95 @@ class McpClient {
   }
 }
 
-// ── main ─────────────────────────────────────────────────────────────────────
+// ── channel handling ──────────────────────────────────────────────────────────
 
 const clients = []
+let mcpReady = false
+const pendingChannels = []
+
+/**
+ * Parse a channel message from a stream-json stdin injection line.
+ * agent-runner wraps channelXml in: {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<channel ...>...</channel>"}]}}
+ */
+function parseChannelFromStdin(line) {
+  try {
+    const obj = JSON.parse(line)
+    const text = obj?.message?.content?.[0]?.text ?? ''
+    const m = text.match(/^<channel([^>]*)>([\s\S]*?)<\/channel>/)
+    if (!m) return null
+    const attrsStr = m[1]
+    const content = m[2].trim()
+    const meta = {}
+    for (const am of attrsStr.matchAll(/(\w+)="([^"]*)"/g)) {
+      meta[am[1]] = am[2]
+    }
+    return { content, meta }
+  } catch {
+    return null
+  }
+}
+
+function handleChannel(ch) {
+  process.stdout.write(`[mock-claude-mcp] channel: ${JSON.stringify(ch)}\n`)
+
+  // Optionally auto-reply (for deeper pipeline tests)
+  if (process.env.MOCK_CLAUDE_REPLY === '1' && ch.meta?.chat_id) {
+    const chatId = ch.meta.chat_id
+    const text = `[mock-claude] echo: ${ch.content ?? '(no text)'}`
+    const client = clients[0]?.client
+    if (client) {
+      client.request('tools/call', {
+        name: 'reply',
+        arguments: { chat_id: chatId, text },
+      }).then(result => {
+        process.stdout.write(`[mock-claude-mcp] tool-result: ${JSON.stringify(result)}\n`)
+      }).catch(err => {
+        process.stderr.write(`[mock-claude-mcp] tool error: ${err.message}\n`)
+      })
+    }
+  }
+}
+
+function flushPending() {
+  while (pendingChannels.length > 0) {
+    handleChannel(pendingChannels.shift())
+  }
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Read initial prompt from stdin (sent by agent-runner before opening channel)
   const rl = readline.createInterface({ input: process.stdin, terminal: false })
-  rl.once('line', (line) => {
-    process.stdout.write(`[mock-claude-mcp] prompt: ${line.trim()}\n`)
+  let firstLineDone = false
+
+  rl.on('line', (line) => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+
+    // First line is always the initial prompt from agent-runner
+    if (!firstLineDone) {
+      firstLineDone = true
+      process.stdout.write(`[mock-claude-mcp] prompt: ${trimmed}\n`)
+      return
+    }
+
+    // Subsequent lines: try to parse as channel injection (stream-json format)
+    const ch = parseChannelFromStdin(trimmed)
+    if (ch) {
+      if (mcpReady) {
+        handleChannel(ch)
+      } else {
+        pendingChannels.push(ch)
+      }
+    } else if (!mcpConfigPath) {
+      // Fallback echo mode (no MCP config)
+      process.stdout.write(`[mock-claude] received: ${trimmed}\n`)
+    }
   })
 
   if (!mcpConfigPath) {
     process.stderr.write('[mock-claude-mcp] no --mcp-config provided — running in stdin-echo mode\n')
-    // Fallback: act like mock-claude.js (stdin echo)
-    rl.on('line', (line) => {
-      if (line.trim()) process.stdout.write(`[mock-claude] received: ${line}\n`)
-    })
+    // rl.on handler above handles all lines
     return
   }
 
@@ -170,7 +232,9 @@ async function main() {
 
     try {
       await client.initialize()
+      mcpReady = true
       process.stdout.write(`[mock-claude-mcp] ready\n`)
+      flushPending()
     } catch (err) {
       process.stderr.write(`[mock-claude-mcp:${name}] init error: ${err.message}\n`)
     }

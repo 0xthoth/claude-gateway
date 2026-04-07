@@ -27,6 +27,9 @@ export class AgentRunner extends EventEmitter {
   private readonly maxConcurrent: number;
   private idleCleanerTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Tracks session IDs with an in-flight API request (prevents concurrent turns)
+  private readonly pendingApiSessions = new Set<string>();
+
   constructor(agentConfig: AgentConfig, gatewayConfig: GatewayConfig, logger?: Logger) {
     super();
     this.agentConfig = agentConfig;
@@ -158,6 +161,11 @@ export class AgentRunner extends EventEmitter {
       this.sessionStore,
     );
     await proc.start();
+
+    // Forward all session output lines so listeners on AgentRunner (GatewayRouter,
+    // CronScheduler, tests) receive them without needing individual session references.
+    proc.on('output', (line: string) => this.emit('output', line));
+
     this.sessions.set(sessionId, proc);
     this.logger.info('Spawned session', {
       sessionId,
@@ -217,12 +225,146 @@ export class AgentRunner extends EventEmitter {
   }
 
   /**
+   * Send a message to an API session and wait for the response.
+   *
+   * - Spawns a new SessionProcess (source='api') if none exists for sessionId.
+   * - Rejects with code 'CONFLICT' if a prior request is still in-flight for this session.
+   * - Rejects with code 'TIMEOUT' if Claude does not respond within timeoutMs.
+   * - Appends user message and assistant reply to SessionStore for history persistence.
+   */
+  async sendApiMessage(
+    sessionId: string,
+    message: string,
+    opts: { timeoutMs: number },
+  ): Promise<string> {
+    if (this.pendingApiSessions.has(sessionId)) {
+      const err = Object.assign(
+        new Error(`Session ${sessionId} already has a pending request`),
+        { code: 'CONFLICT' },
+      );
+      throw err;
+    }
+
+    const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Persist user message
+    await this.sessionStore
+      .appendMessage(this.agentConfig.id, sessionId, {
+        role: 'user',
+        content: message,
+        ts: Date.now(),
+      })
+      .catch(() => {});
+
+    this.pendingApiSessions.add(sessionId);
+    session.touch();
+
+    const channelXml =
+      `<channel source="api" session_id="${sessionId}" ts="${new Date().toISOString()}">\n` +
+      `${message}\n\n` +
+      `[SYSTEM: This is an API request. Reply with plain text only. ` +
+      `Do NOT call any tools. Your text output will be returned directly to the caller.]\n` +
+      `</channel>`;
+
+    return new Promise<string>((resolve, reject) => {
+      const buffer: string[] = [];
+      let quietTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const done = (result: string) => {
+        cleanup();
+        // Persist assistant reply
+        if (result.trim()) {
+          this.sessionStore
+            .appendMessage(this.agentConfig.id, sessionId, {
+              role: 'assistant',
+              content: result.trim(),
+              ts: Date.now(),
+            })
+            .catch(() => {});
+        }
+        resolve(result.trim());
+      };
+
+      const fail = (err: Error) => {
+        cleanup();
+        reject(err);
+      };
+
+      const cleanup = () => {
+        clearTimeout(globalTimer);
+        if (quietTimer) clearTimeout(quietTimer);
+        session.off('output', onOutput);
+        this.pendingApiSessions.delete(sessionId);
+      };
+
+      const resetQuiet = () => {
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => done(buffer.join('')), 2000);
+      };
+
+      const onOutput = (line: string) => {
+        try {
+          const obj = JSON.parse(line) as Record<string, unknown>;
+          // Collect text deltas
+          const text =
+            (obj['text'] as string | undefined) ??
+            ((obj['delta'] as Record<string, unknown> | undefined)?.['text'] as string | undefined) ??
+            '';
+          if (text) {
+            buffer.push(text);
+            resetQuiet();
+          }
+          // result event = end of turn
+          if (obj['type'] === 'result') {
+            const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+            done(resultText);
+          }
+        } catch {
+          /* non-JSON stdout line */
+        }
+      };
+
+      const globalTimer = setTimeout(() => {
+        fail(Object.assign(new Error('Agent response timeout'), { code: 'TIMEOUT' }));
+      }, opts.timeoutMs);
+
+      session.on('output', onOutput);
+      session.sendMessage(channelXml);
+      // Do NOT call resetQuiet() here — the quiet timer should only start
+      // after the first output line arrives, otherwise it fires before the
+      // subprocess has had time to respond (especially on first spawn).
+    });
+  }
+
+  /**
+   * Expose the callback server port for integration tests that need to simulate
+   * incoming Telegram messages by POSTing directly to the channel endpoint.
+   */
+  getCallbackPort(): number {
+    return this.callbackPort;
+  }
+
+  /**
    * Send a message to all active sessions.
    * Used for heartbeat/cron tasks delivered out-of-band.
+   *
+   * If no Telegram sessions are active, a transient `__heartbeat__` API session is
+   * spawned so that CronScheduler tasks can always run regardless of active user sessions.
    */
   sendMessage(message: string): void {
     if (this.sessions.size === 0) {
-      this.logger.warn('sendMessage called but no active sessions');
+      // No active user sessions — spawn a shared heartbeat session so the prompt
+      // reaches a subprocess and output events fire for CronScheduler/tests.
+      this.getOrSpawnSession('__heartbeat__', 'api')
+        .then((session) => {
+          session.sendMessage(message);
+          session.touch();
+        })
+        .catch((err) =>
+          this.logger.error('sendMessage failed to spawn heartbeat session', {
+            error: (err as Error).message,
+          }),
+        );
       return;
     }
     for (const session of this.sessions.values()) {

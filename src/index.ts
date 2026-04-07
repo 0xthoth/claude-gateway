@@ -245,7 +245,7 @@ async function main(): Promise<void> {
   printStartupTable(startupResults);
 
   // Start gateway router
-  const router = new GatewayRouter(agentRunners, agentConfigs);
+  const router = new GatewayRouter(agentRunners, agentConfigs, undefined, config);
   await router.start(PORT);
   console.log(`[gateway] Listening on port ${PORT}`);
 

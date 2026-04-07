@@ -16,6 +16,7 @@ import { GatewayRouter } from '../../src/gateway-router';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 import { ContextIsolationGuard, WorkspaceConflictError, TokenConflictError } from '../../src/context-isolation';
 import { SessionStore } from '../../src/session-store';
+import { SessionProcess } from '../../src/session-process';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -121,36 +122,48 @@ describe('Multi-Agent (Option A)', () => {
   });
 
   // ─── I-MA-02: TELEGRAM_STATE_DIR set per agent ───────────────────────────
-  it('I-MA-02: AgentRunner sets TELEGRAM_STATE_DIR to workspace-scoped path', () => {
+  it('I-MA-02: SessionProcess writes workspace-scoped TELEGRAM_STATE_DIR and BOT_TOKEN in MCP config', () => {
     const ws = createTempWorkspace('ma02-');
     const logDir = createTempDir('ma02-log-');
     const cfg = makeAgentConfig('ma02-agent', 'token-ma02', ws);
     const gatewayCfg = makeGatewayConfig(logDir);
+    const baseDir = path.resolve(ws, '..', '..');
+    const store = new SessionStore(baseDir);
 
-    const runner = new AgentRunner(cfg, gatewayCfg);
-    // Access private buildEnv via reflection
-    const env = (runner as unknown as { buildEnv: () => NodeJS.ProcessEnv }).buildEnv();
+    const proc = new SessionProcess('chat-ma02', 'telegram', cfg, gatewayCfg, store);
+    // writeMcpConfig is private — access via reflection to test the generated file
+    const configPath = (proc as unknown as { writeMcpConfig: () => string | null }).writeMcpConfig();
+
+    expect(configPath).not.toBeNull();
+    const mcpConfig = JSON.parse(fs.readFileSync(configPath!, 'utf-8'));
+    const env = mcpConfig.mcpServers.telegram.env;
 
     expect(env.TELEGRAM_STATE_DIR).toBeDefined();
     expect(env.TELEGRAM_STATE_DIR).toBe(path.join(ws, '.telegram-state'));
     expect(env.TELEGRAM_BOT_TOKEN).toBe('token-ma02');
-    expect(env.CLAUDE_WORKSPACE).toBe(ws);
   });
 
   // ─── I-MA-03: Two agents have separate TELEGRAM_STATE_DIR ──────────────────
-  it('I-MA-03: Two agents have different TELEGRAM_STATE_DIR paths', () => {
+  it('I-MA-03: Two agents have different TELEGRAM_STATE_DIR paths in MCP config', () => {
     const ws1 = createTempWorkspace('ma03-a-');
     const ws2 = createTempWorkspace('ma03-b-');
     const logDir = createTempDir('ma03-log-');
     const cfg1 = makeAgentConfig('ma03-alpha', 'token-ma03-a', ws1);
     const cfg2 = makeAgentConfig('ma03-beta', 'token-ma03-b', ws2);
     const gatewayCfg = makeGatewayConfig(logDir);
+    const base1 = path.resolve(ws1, '..', '..');
+    const base2 = path.resolve(ws2, '..', '..');
+    const store1 = new SessionStore(base1);
+    const store2 = new SessionStore(base2);
 
-    const runner1 = new AgentRunner(cfg1, gatewayCfg);
-    const runner2 = new AgentRunner(cfg2, gatewayCfg);
+    const proc1 = new SessionProcess('chat-ma03', 'telegram', cfg1, gatewayCfg, store1);
+    const proc2 = new SessionProcess('chat-ma03', 'telegram', cfg2, gatewayCfg, store2);
 
-    const env1 = (runner1 as unknown as { buildEnv: () => NodeJS.ProcessEnv }).buildEnv();
-    const env2 = (runner2 as unknown as { buildEnv: () => NodeJS.ProcessEnv }).buildEnv();
+    const configPath1 = (proc1 as unknown as { writeMcpConfig: () => string | null }).writeMcpConfig();
+    const configPath2 = (proc2 as unknown as { writeMcpConfig: () => string | null }).writeMcpConfig();
+
+    const env1 = JSON.parse(fs.readFileSync(configPath1!, 'utf-8')).mcpServers.telegram.env;
+    const env2 = JSON.parse(fs.readFileSync(configPath2!, 'utf-8')).mcpServers.telegram.env;
 
     expect(env1.TELEGRAM_STATE_DIR).not.toBe(env2.TELEGRAM_STATE_DIR);
     expect(env1.TELEGRAM_STATE_DIR).toBe(path.join(ws1, '.telegram-state'));

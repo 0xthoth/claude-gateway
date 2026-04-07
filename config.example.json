@@ -1,7 +1,21 @@
 {
   "gateway": {
     "logDir": "~/.claude-gateway/logs",
-    "timezone": "Asia/Bangkok"
+    "timezone": "Asia/Bangkok",
+    "api": {
+      "keys": [
+        {
+          "key": "${MY_API_KEY}",
+          "description": "Internal app",
+          "agents": ["alfred"]
+        },
+        {
+          "key": "${ADMIN_API_KEY}",
+          "description": "Admin — full access",
+          "agents": "*"
+        }
+      ]
+    }
   },
   "agents": [
     {

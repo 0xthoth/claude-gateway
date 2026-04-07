@@ -136,6 +136,34 @@ export function loadConfig(configPath: string): GatewayConfig {
     ids.add(id);
   }
 
+  // Validate gateway.api.keys if present
+  const gateway = config.gateway as Record<string, unknown>;
+  if (gateway.api !== undefined) {
+    const api = gateway.api as Record<string, unknown>;
+    if (!Array.isArray(api.keys)) {
+      throw new ConfigValidationError('gateway.api.keys must be an array');
+    }
+    const seenKeys = new Set<string>();
+    for (const k of api.keys as unknown[]) {
+      if (typeof k !== 'object' || k === null) {
+        throw new ConfigValidationError('Each entry in gateway.api.keys must be an object');
+      }
+      const entry = k as Record<string, unknown>;
+      if (!entry.key || typeof entry.key !== 'string') {
+        throw new ConfigValidationError('Each API key must have a non-empty "key" string');
+      }
+      if (seenKeys.has(entry.key as string)) {
+        throw new ConfigValidationError(`Duplicate API key value detected`);
+      }
+      seenKeys.add(entry.key as string);
+      if (entry.agents !== '*' && !Array.isArray(entry.agents)) {
+        throw new ConfigValidationError(
+          `API key "${entry.key}": "agents" must be an array of agent IDs or the string "*"`,
+        );
+      }
+    }
+  }
+
   // Now interpolate env vars (may throw MissingEnvVarError)
   const interpolated = interpolateObject(parsed) as GatewayConfig;
 

@@ -347,7 +347,8 @@ describe('Pipeline MCP — Telegram → plugin → Claude Code (step-by-step)', 
   // ── MCP config validation ─────────────────────────────────────────────────
 
   test('MCP config written by agent-runner has correct structure', () => {
-    const mcpConfigPath = path.join(tmpDir, '.mcp-config.json')
+    // MCP config is per-session: written at .sessions/<chatId>/mcp-config.json
+    const mcpConfigPath = path.join(tmpDir, '.sessions', USER_ID, 'mcp-config.json')
     expect(fs.existsSync(mcpConfigPath)).toBe(true)
 
     const config = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'))
@@ -367,7 +368,7 @@ describe('Pipeline MCP — Telegram → plugin → Claude Code (step-by-step)', 
     // Verify from the initial prompt line that Claude was launched
     const promptLine = collectedOutput.find(l => l.includes('[mock-claude-mcp] prompt:'))
     expect(promptLine).toBeDefined()
-    expect(promptLine).toContain('channels mode')
+    expect(promptLine).toContain('Channels mode')
   })
 })
 

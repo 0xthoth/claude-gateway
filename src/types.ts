@@ -38,8 +38,20 @@ export interface WatchHandle {
   close(): void;
 }
 
+export interface ApiKey {
+  key: string;
+  description?: string;
+  agents: string[] | '*'; // agent IDs this key can access, or '*' for all
+}
+
 export interface GatewayConfig {
-  gateway: { logDir: string; timezone: string };
+  gateway: {
+    logDir: string;
+    timezone: string;
+    api?: {
+      keys: ApiKey[];
+    };
+  };
   agents: AgentConfig[];
 }
 
