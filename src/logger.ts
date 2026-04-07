@@ -32,11 +32,12 @@ class AgentLogger implements Logger {
     };
 
     const line = JSON.stringify(entry);
+    const pretty = JSON.stringify(entry, null, 2);
 
-    // Write to stdout
-    process.stdout.write(line + '\n');
+    // Write to stdout (pretty-printed for readability)
+    process.stdout.write(pretty + '\n');
 
-    // Write to log file (append)
+    // Write to log file (compact, one entry per line)
     try {
       fs.appendFileSync(this.logFilePath, line + '\n', 'utf-8');
     } catch {

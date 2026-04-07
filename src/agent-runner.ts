@@ -330,7 +330,9 @@ export class AgentRunner extends EventEmitter {
 
       session.on('output', onOutput);
       session.sendMessage(channelXml);
-      resetQuiet();
+      // Do NOT call resetQuiet() here — the quiet timer should only start
+      // after the first output line arrives, otherwise it fires before the
+      // subprocess has had time to respond (especially on first spawn).
     });
   }
 

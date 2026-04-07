@@ -146,8 +146,13 @@ export class SessionProcess extends EventEmitter {
 
     this.process = proc;
 
-    // Send initial prompt
-    proc.stdin?.write(SessionProcess.toStreamJsonTurn(initialPrompt) + '\n');
+    // Send initial prompt only for Telegram sessions.
+    // API sessions receive the first message directly via sendApiMessage(),
+    // so no activation prompt is needed and sending one would race with
+    // the first API turn, causing sendApiMessage to resolve with the wrong result.
+    if (this.source === 'telegram') {
+      proc.stdin?.write(SessionProcess.toStreamJsonTurn(initialPrompt) + '\n');
+    }
 
     // Capture stdout — emit output events + persist assistant replies
     let assistantBuffer = '';
