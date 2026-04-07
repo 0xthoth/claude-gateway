@@ -16,10 +16,10 @@ start: ## Build and start the gateway
 	npm run build && npm start
 
 create-agent: ## Run the interactive wizard to create a new agent
-	ts-node scripts/create-agent.ts
+	./node_modules/.bin/ts-node scripts/create-agent.ts
 
 pair: ## Approve a Telegram pairing (e.g. make pair agent=alfred code=abc123)
-	ts-node scripts/pair.ts --agent=$(agent) --code=$(code)
+	./node_modules/.bin/ts-node scripts/pair.ts --agent=$(agent) --code=$(code)
 
 plugin-install: ## Install the Telegram plugin and enable channels mode
 	node scripts/setup-claude-settings.js

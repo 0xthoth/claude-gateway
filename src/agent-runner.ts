@@ -313,6 +313,7 @@ export class AgentRunner extends EventEmitter {
     await this.stop();
     this.stopping = false;
     this.restartCount = 0;
+    await this.startCallbackServer();
     this.spawnProcess();
   }
 

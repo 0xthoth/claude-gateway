@@ -306,19 +306,42 @@ async function previewAndAccept(
       } else if (choice === 'edit') {
         const tmpFile = path.join(os.tmpdir(), `claude-gateway-${filename}`);
         fs.writeFileSync(tmpFile, content, 'utf8');
-        const editor = process.env['EDITOR'] || 'nano';
-        const editResult = spawnSync(editor, [tmpFile], { stdio: 'inherit' });
-        if (editResult.error) {
-          console.log(`  Could not open editor "${editor}". Accepting as-is.`);
-          accepted.set(filename, content);
+
+        const editorCandidates = [
+          process.env['VISUAL'],
+          process.env['EDITOR'],
+          'vim',
+          'vi',
+          'nano',
+        ].filter(Boolean) as string[];
+
+        let editResult: ReturnType<typeof spawnSync> | null = null;
+        let usedEditor = '';
+        for (const candidate of editorCandidates) {
+          const result = spawnSync(candidate, [tmpFile], { stdio: 'inherit' });
+          if (!result.error) {
+            editResult = result;
+            usedEditor = candidate;
+            break;
+          }
+        }
+
+        if (!editResult) {
+          console.log(
+            '  Could not open any editor (tried: ' +
+              editorCandidates.join(', ') +
+              ').\n  Set $EDITOR and try again, or choose y/skip.'
+          );
+          fs.unlinkSync(tmpFile);
+          // No break — loop continues, re-prompting the user
         } else {
           const edited = fs.readFileSync(tmpFile, 'utf8');
           fs.unlinkSync(tmpFile);
           accepted.set(filename, edited);
           printFilePreview(filename, edited);
-          console.log('  (edited version accepted)');
+          console.log(`  (edited with ${usedEditor}, accepted)`);
+          break;
         }
-        break;
       } else if (choice === 'skip') {
         if (OPTIONAL_FILES.has(filename)) {
           console.log(`  Skipping ${filename}`);
