@@ -22,6 +22,8 @@ import { randomBytes } from 'crypto';
 import { spawnSync } from 'child_process';
 import { loadWorkspace } from '../src/workspace-loader';
 import { buildGenerationPrompt, parseGeneratedFiles } from './create-agent-prompts';
+import { interactiveSelect } from './interactive-select';
+import { loadCleanTemplate, stripIgnoredPaths } from '../src/config-migrator';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -136,6 +138,8 @@ interface RawAgentEntry {
     dangerouslySkipPermissions: boolean;
     extraFlags: string[];
   };
+  emojiReactionMode?: 'minimal' | 'extensive' | 'none';
+  signatureEmoji?: string;
 }
 
 function loadOrCreateRawConfig(): RawConfig {
@@ -144,10 +148,21 @@ function loadOrCreateRawConfig(): RawConfig {
     const raw = fs.readFileSync(cp, 'utf8');
     return JSON.parse(raw) as RawConfig;
   }
-  return {
-    gateway: { logDir: '~/.claude-gateway/logs', timezone: 'UTC' },
-    agents: [],
-  };
+
+  // First run: try to load from template
+  const templatePath = path.join(__dirname, '..', 'config.template.json');
+  try {
+    const { template, ignorePaths } = loadCleanTemplate(templatePath);
+    stripIgnoredPaths(template, ignorePaths);
+    template.agents = [];
+    return template as unknown as RawConfig;
+  } catch {
+    // Template missing or unreadable — use hardcoded fallback
+    return {
+      gateway: { logDir: '~/.claude-gateway/logs', timezone: 'UTC' },
+      agents: [],
+    };
+  }
 }
 
 function saveConfig(config: RawConfig): void {
@@ -247,11 +262,33 @@ function fallbackFiles(agentId: string): Map<string, string> {
   return files;
 }
 
-async function generateFiles(agentId: string, description: string): Promise<Map<string, string>> {
+interface GenerateResult {
+  files: Map<string, string>;
+  suggestedEmoji?: string;
+}
+
+// Extract a single emoji from the first line of text (Claude suggests one)
+function extractLeadingEmoji(text: string): { emoji: string | undefined; rest: string } {
+  const firstLine = text.split('\n')[0].trim();
+  // Match a single emoji (including compound emoji with ZWJ, skin tones, etc.)
+  const emojiMatch = firstLine.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)(\u200D(\p{Emoji_Presentation}|\p{Emoji}\uFE0F))*$/u);
+  if (emojiMatch) {
+    // Remove the emoji line from content
+    const rest = text.slice(text.indexOf('\n') + 1).trim();
+    return { emoji: firstLine, rest };
+  }
+  return { emoji: undefined, rest: text };
+}
+
+async function generateFiles(
+  agentId: string,
+  description: string,
+  options?: { signatureEmoji?: string; emojiReactionMode?: string }
+): Promise<GenerateResult> {
   const agentName = agentId.charAt(0).toUpperCase() + agentId.slice(1);
   console.log('\nGenerating workspace files with Claude...');
 
-  const genPrompt = buildGenerationPrompt(agentName, description);
+  const genPrompt = buildGenerationPrompt(agentName, description, options);
   const result = spawnSync('claude', ['--print'], {
     input: genPrompt,
     encoding: 'utf8',
@@ -260,16 +297,39 @@ async function generateFiles(agentId: string, description: string): Promise<Map<
 
   if (result.error || result.status !== 0 || !result.stdout?.trim()) {
     console.log('  Warning: Claude generation failed. Using minimal fallback templates.');
-    return fallbackFiles(agentId);
+    return { files: fallbackFiles(agentId) };
   }
 
-  const parsed = parseGeneratedFiles(result.stdout);
+  // Strip wrapping code fences that Claude sometimes adds
+  let raw = result.stdout.trim();
+  const fenceMatch = raw.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
+  if (fenceMatch) {
+    raw = fenceMatch[1].trim();
+  }
+
+  // Extract suggested emoji from first line
+  const { emoji: suggestedEmoji, rest } = extractLeadingEmoji(raw);
+  if (suggestedEmoji) {
+    raw = rest;
+  }
+
+  const parsed = parseGeneratedFiles(raw);
   if (!parsed.has('agent.md')) {
+    // Fallback: if Claude output looks like markdown content without markers, use as agent.md
+    const headingIdx = raw.indexOf('# ');
+    if (headingIdx >= 0) {
+      const content = raw.slice(headingIdx).replace(/\n```\s*$/, '').trim();
+      if (content.length > 50) {
+        console.log('  Note: Claude output had no section markers — treating as agent.md');
+        parsed.set('agent.md', content);
+        return { files: parsed, suggestedEmoji };
+      }
+    }
     console.log('  Warning: agent.md not found in Claude output. Using minimal fallback templates.');
-    return fallbackFiles(agentId);
+    return { files: fallbackFiles(agentId) };
   }
 
-  return parsed;
+  return { files: parsed, suggestedEmoji };
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +339,7 @@ async function generateFiles(agentId: string, description: string): Promise<Map<
 const OPTIONAL_FILES = new Set(['soul.md', 'user.md', 'tools.md', 'heartbeat.md', 'bootstrap.md']);
 const SEPARATOR_WIDTH = 42;
 
-function printFilePreview(filename: string, content: string): void {
+export function printFilePreview(filename: string, content: string): void {
   const label = `─── ${filename} `;
   const padding = Math.max(0, SEPARATOR_WIDTH - label.length);
   console.log('\n' + label + '─'.repeat(padding));
@@ -380,7 +440,8 @@ export async function createWorkspace(agentId: string, files: Map<string, string
 export async function appendToConfig(
   agentId: string,
   wsDir: string,
-  agentMdContent: string
+  agentMdContent: string,
+  options?: { emojiReactionMode?: 'minimal' | 'extensive' | 'none'; signatureEmoji?: string }
 ): Promise<void> {
   console.log('Updating config.json...');
 
@@ -406,6 +467,13 @@ export async function appendToConfig(
       extraFlags: [],
     },
   };
+
+  if (options?.emojiReactionMode) {
+    newAgent.emojiReactionMode = options.emojiReactionMode;
+  }
+  if (options?.signatureEmoji) {
+    newAgent.signatureEmoji = options.signatureEmoji;
+  }
 
   config.agents.push(newAgent);
   saveConfig(config);
@@ -787,14 +855,42 @@ async function main(): Promise<void> {
   console.log('Step 1/6 · Agent Name\n');
   const agentId = await promptAgentName(rl, existingIds);
   const agentName = agentId.charAt(0).toUpperCase() + agentId.slice(1);
+
   const state: WizardState = { agentId, agentName, lastCompletedStep: 1 };
   saveWizardState(state);
 
   // ── Step 2 ──────────────────────────────────────────────────────────────
   console.log('\nStep 2/6 · Describe Your Agent\n');
   const description = await promptDescription(rl);
-  const generatedFiles = await generateFiles(agentId, description);
-  const acceptedFiles = await previewAndAccept(rl, generatedFiles);
+  rl.close(); // close rl before interactiveSelect (uses raw stdin)
+
+  const { files: generatedFiles, suggestedEmoji } = await generateFiles(agentId, description);
+
+  // ── Emoji selection (after generation) ────────────────────────────────
+  // interactiveSelect pauses stdin — resume before creating new readline
+  process.stdin.resume();
+
+  const defaultEmoji = suggestedEmoji || '🤖';
+  console.log(`\n  Suggested signature emoji: ${defaultEmoji}`);
+  const rl2 = createRl();
+  const emojiInput = await prompt(
+    rl2,
+    `Signature emoji [${defaultEmoji}] (press Enter to accept, or type a new one): `
+  );
+  const signatureEmoji = emojiInput.trim() || defaultEmoji;
+  console.log(`  ✓ Signature emoji: ${signatureEmoji}`);
+  rl2.close();
+
+  // ── Reaction mode selection ───────────────────────────────────────────
+  const reactionModes = ['minimal — react only when clearly warranted', 'extensive — react to most messages', 'none — no emoji reactions'];
+  const modeIdx = await interactiveSelect(reactionModes, 'Select emoji reaction mode (↑/↓ to move, Enter to select):');
+  const emojiReactionMode = (['minimal', 'extensive', 'none'] as const)[modeIdx];
+  console.log(`  ✓ Reaction mode: ${emojiReactionMode}`);
+
+  // Resume stdin + new readline for file preview
+  process.stdin.resume();
+  const rl3 = createRl();
+  const acceptedFiles = await previewAndAccept(rl3, generatedFiles);
 
   if (!acceptedFiles.has('agent.md')) {
     const fallback = fallbackFiles(agentId);
@@ -806,7 +902,10 @@ async function main(): Promise<void> {
   // ── Step 3 ──────────────────────────────────────────────────────────────
   console.log('\nStep 3/6 · Create Workspace\n');
   const wsDir = await createWorkspace(agentId, acceptedFiles);
-  await appendToConfig(agentId, wsDir, acceptedFiles.get('agent.md')!);
+  await appendToConfig(agentId, wsDir, acceptedFiles.get('agent.md')!, {
+    emojiReactionMode,
+    signatureEmoji,
+  });
   state.wsDir = wsDir;
   state.lastCompletedStep = 3;
   saveWizardState(state);
@@ -822,14 +921,14 @@ async function main(): Promise<void> {
   console.log('       123456789:AAHfiqksKZ8WmHPDKxxxxxxxxxxxxxxxx');
   console.log('     Copy the entire token.\n');
 
-  const { token, username: botUsername } = await promptBotToken(rl, agentId);
+  const { token, username: botUsername } = await promptBotToken(rl3, agentId);
   state.token = token;
   state.botUsername = botUsername;
   state.lastCompletedStep = 4;
   saveWizardState(state);
 
   // ── Step 5 ──────────────────────────────────────────────────────────────
-  rl.close();
+  rl3.close();
 
   console.log('\nStep 5/6 · Pair Your Telegram Account\n');
   console.log('The wizard will detect your message and approve pairing automatically.\n');
@@ -856,7 +955,7 @@ async function resumeWizard(state: WizardState): Promise<void> {
     // Need to redo step 2 — files not yet created
     console.log('Step 2/6 · Describe Your Agent\n');
     const description = await promptDescription(rl);
-    const generatedFiles = await generateFiles(agentId, description);
+    const { files: generatedFiles } = await generateFiles(agentId, description);
     const acceptedFiles = await previewAndAccept(rl, generatedFiles);
     if (!acceptedFiles.has('agent.md')) {
       acceptedFiles.set('agent.md', fallbackFiles(agentId).get('agent.md')!);
@@ -912,7 +1011,9 @@ async function resumeWizard(state: WizardState): Promise<void> {
   clearWizardState();
 }
 
-main().catch((err) => {
-  console.error('\nFatal error:', (err as Error).message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('\nFatal error:', (err as Error).message);
+    process.exit(1);
+  });
+}
