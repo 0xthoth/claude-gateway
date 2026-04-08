@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as readline from 'readline';
 
 function expandTilde(p: string): string {
   if (p === '~' || p.startsWith('~/')) {
@@ -9,7 +10,7 @@ function expandTilde(p: string): string {
   return p;
 }
 import { loadConfig } from './config-loader';
-import { migrateConfig } from './config-migrator';
+import { detectMigration, applyMigration, loadCleanTemplate } from './config-migrator';
 import { loadWorkspace, watchWorkspace, markBootstrapComplete } from './workspace-loader';
 import { AgentRunner } from './agent-runner';
 import { CronScheduler } from './cron-scheduler';
@@ -128,9 +129,43 @@ async function main(): Promise<void> {
   const pkgPath = path.join(__dirname, '..', 'package.json');
   const pkgVersion: string = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version;
   try {
-    const migration = migrateConfig(CONFIG_PATH, templatePath, pkgVersion);
-    if (migration.migrated) {
-      console.log(`[gateway] Config migrated to v${pkgVersion}. Added: ${migration.addedFields.join(', ')}`);
+    const detection = detectMigration(CONFIG_PATH, templatePath, pkgVersion);
+    if (detection.needed) {
+      let shouldMigrate = false;
+
+      if (args['auto-migrate']) {
+        shouldMigrate = true;
+      } else {
+        // Prompt user for confirmation
+        const rl = readline.createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
+        const answer = await new Promise<string>((resolve) => {
+          rl.question(
+            `[gateway] Config migration available (v${detection.fromVersion} -> v${detection.toVersion}). Migrate config? (y/n) [y]: `,
+            (ans) => {
+              rl.close();
+              resolve(ans.trim().toLowerCase());
+            },
+          );
+        });
+        shouldMigrate = answer === '' || answer === 'y' || answer === 'yes';
+      }
+
+      if (shouldMigrate) {
+        const { ignorePaths } = loadCleanTemplate(templatePath);
+        const migration = applyMigration(
+          CONFIG_PATH,
+          detection.config,
+          detection.template,
+          pkgVersion,
+          ignorePaths,
+        );
+        console.log(`[gateway] Config migrated to v${pkgVersion}. Added: ${migration.addedFields.join(', ')}`);
+      } else {
+        console.warn(`[gateway] Config migration skipped by user. Running with current config.`);
+      }
     }
   } catch (err) {
     console.warn(`[gateway] Config migration skipped: ${(err as Error).message}`);

@@ -1,4 +1,10 @@
 {
+  "_migration": {
+    "ignorePaths": [
+      "gateway.api",
+      "gateway.api.keys"
+    ]
+  },
   "configVersion": "1.0.0",
   "gateway": {
     "logDir": "~/.claude-gateway/logs",

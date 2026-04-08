@@ -22,6 +22,7 @@ import { randomBytes } from 'crypto';
 import { spawnSync } from 'child_process';
 import { loadWorkspace } from '../src/workspace-loader';
 import { buildGenerationPrompt, parseGeneratedFiles } from './create-agent-prompts';
+import { loadCleanTemplate, stripIgnoredPaths } from '../src/config-migrator';
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -146,10 +147,21 @@ function loadOrCreateRawConfig(): RawConfig {
     const raw = fs.readFileSync(cp, 'utf8');
     return JSON.parse(raw) as RawConfig;
   }
-  return {
-    gateway: { logDir: '~/.claude-gateway/logs', timezone: 'UTC' },
-    agents: [],
-  };
+
+  // First run: try to load from template
+  const templatePath = path.join(__dirname, '..', 'config.template.json');
+  try {
+    const { template, ignorePaths } = loadCleanTemplate(templatePath);
+    stripIgnoredPaths(template, ignorePaths);
+    template.agents = [];
+    return template as unknown as RawConfig;
+  } catch {
+    // Template missing or unreadable — use hardcoded fallback
+    return {
+      gateway: { logDir: '~/.claude-gateway/logs', timezone: 'UTC' },
+      agents: [],
+    };
+  }
 }
 
 function saveConfig(config: RawConfig): void {
