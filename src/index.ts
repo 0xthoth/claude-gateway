@@ -9,6 +9,7 @@ function expandTilde(p: string): string {
   return p;
 }
 import { loadConfig } from './config-loader';
+import { migrateConfig } from './config-migrator';
 import { loadWorkspace, watchWorkspace, markBootstrapComplete } from './workspace-loader';
 import { AgentRunner } from './agent-runner';
 import { CronScheduler } from './cron-scheduler';
@@ -121,6 +122,19 @@ async function main(): Promise<void> {
   // Load agent .env files before config interpolation so ${TOKEN} vars resolve
   const gatewayAgentsDir = path.join(path.dirname(CONFIG_PATH), 'agents');
   loadAgentEnvFiles(gatewayAgentsDir);
+
+  // ── Auto-migrate config (add missing fields from template) ────────────────
+  const templatePath = path.join(__dirname, '..', 'config.template.json');
+  const pkgPath = path.join(__dirname, '..', 'package.json');
+  const pkgVersion: string = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version;
+  try {
+    const migration = migrateConfig(CONFIG_PATH, templatePath, pkgVersion);
+    if (migration.migrated) {
+      console.log(`[gateway] Config migrated to v${pkgVersion}. Added: ${migration.addedFields.join(', ')}`);
+    }
+  } catch (err) {
+    console.warn(`[gateway] Config migration skipped: ${(err as Error).message}`);
+  }
 
   console.log(`[gateway] Loading config from ${CONFIG_PATH}`);
   const config: GatewayConfig = loadConfig(CONFIG_PATH);

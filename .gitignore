@@ -9,7 +9,7 @@ dist/
 .env.*
 !.env.example
 config.json
-!config.example.json
+!config.template.json
 
 # Logs
 *.log
@@ -36,5 +36,5 @@ planning*.md
 design*.md
 testcase*.md
 feature*.md
-task-imp*.md
+task-*.md
 research*.md
