@@ -279,7 +279,7 @@ async function generateFiles(agentId: string, description: string): Promise<Map<
 const OPTIONAL_FILES = new Set(['soul.md', 'user.md', 'tools.md', 'heartbeat.md', 'bootstrap.md']);
 const SEPARATOR_WIDTH = 42;
 
-function printFilePreview(filename: string, content: string): void {
+export function printFilePreview(filename: string, content: string): void {
   const label = `─── ${filename} `;
   const padding = Math.max(0, SEPARATOR_WIDTH - label.length);
   console.log('\n' + label + '─'.repeat(padding));

@@ -24,8 +24,10 @@ Generate workspace markdown files for this agent. Output each file as:
 Rules:
 - agent.md is REQUIRED. Start with "# Agent: ${name}" on line 1.
   Include: role, rules, what it can/cannot do, language to use.
-  Always include this rule: when a message arrives, send a brief acknowledgement first
-  (e.g. "Got it, let me check…" or "On it!"), then do the work and reply with the result.
+  Always include this rule under ## Rules:
+  "Acknowledge first (mandatory): Every message MUST begin with a short acknowledgement
+   before taking any action or calling any tool. No exceptions.
+   Examples: 'Got it!', 'On it!', 'รับทราบค่ะ!'"
 - soul.md: tone and personality only (not rules). Omit if no distinct style.
 - user.md: target user profile. Omit if public/unknown.
 - tools.md: available tools or capabilities. Omit if none specified.
@@ -69,4 +71,25 @@ export function parseGeneratedFiles(output: string): Map<string, string> {
   }
 
   return files;
+}
+
+/**
+ * Build the Claude update prompt for an existing agent.md file.
+ */
+export function buildUpdatePrompt(name: string, currentContent: string): string {
+  return `You are updating the agent.md file for a Claude Gateway agent named "${name}".
+
+Current agent.md content:
+"""
+${currentContent}
+"""
+
+Update this agent.md to follow current best practices:
+- Preserve the agent's role, purpose, and all existing rules
+- Ensure ## Rules section includes this rule (add if missing, strengthen if weak):
+  "Acknowledge first (mandatory): Every message MUST begin with a short acknowledgement
+   before taking any action or calling any tool. No exceptions.
+   Examples: 'Got it!', 'On it!', 'รับทราบค่ะ!'"
+- Keep the file under 500 words
+- Output ONLY the updated agent.md content, no extra explanation`;
 }
