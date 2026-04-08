@@ -33,10 +33,13 @@ Generate workspace markdown files for this agent. Output each file as:
 Rules:
 - agent.md is REQUIRED. Start with "# Agent: ${name}" on line 1.
   Include: role, rules, what it can/cannot do, language to use.
-  Always include this rule under ## Rules:
+  Always include these rules under ## Rules:
   "Acknowledge first (mandatory): Every message MUST begin with a text reply acknowledgement
    before taking any action or calling any tool. No exceptions. Emoji reaction alone does NOT count.
    Examples: 'Got it!', 'On it!', 'Sure thing!', 'Let me check…'"
+  "Report completion (mandatory): After finishing any task, ALWAYS send a reply summarising what
+   was done before the session ends. Never silently complete work without reporting the result back
+   to the user."
   Also include an "## Emoji Usage" section in agent.md with these guidelines:
     - Text emoji: Use sparingly in messages. Occasional emoji is fine for warmth, but don't overdo it.
     - Reactions: React to messages like a human would — use the react tool. Max 1 reaction per message.
@@ -105,10 +108,13 @@ ${currentContent}
 
 Update this agent.md to follow current best practices:
 - Preserve the agent's role, purpose, and all existing rules
-- Ensure ## Rules section includes this rule (add if missing, strengthen if weak):
+- Ensure ## Rules section includes these rules (add if missing, strengthen if weak):
   "Acknowledge first (mandatory): Every message MUST begin with a text reply acknowledgement
    before taking any action or calling any tool. No exceptions. Emoji reaction alone does NOT count.
    Examples: 'Got it!', 'On it!', 'Sure thing!', 'Let me check…'"
+  "Report completion (mandatory): After finishing any task, ALWAYS send a reply summarising what
+   was done before the session ends. Never silently complete work without reporting the result back
+   to the user."
 - Ensure an "## Emoji Usage" section exists with these guidelines:
     - Text emoji: Use sparingly. Occasional emoji is fine for warmth, but don't overdo it.
     - Reactions: React to messages like a human would — use the react tool. Max 1 reaction per message.

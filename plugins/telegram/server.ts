@@ -25,9 +25,10 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import { createWorkingStateManager } from './typing'
 
 // Standalone fallback: default state dir to ~/.claude/channels/telegram
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -77,6 +78,21 @@ const bot = new Bot(TOKEN, {
   client: { apiRoot: process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org' },
 })
 let botUsername = ''
+
+// ─── Typing indicator / working state (receiver + SEND_ONLY coordination) ────
+
+const TYPING_DIR = join(STATE_DIR, 'typing')
+
+const typingManager = createWorkingStateManager(
+  TYPING_DIR,
+  {
+    sendChatAction: (chatId, action) => bot.api.sendChatAction(chatId, action),
+    sendMessage: (chatId, text) => bot.api.sendMessage(chatId, text),
+    editMessageText: (chatId, msgId, text) => bot.api.editMessageText(chatId, msgId, text),
+    deleteMessage: (chatId, msgId) => bot.api.deleteMessage(chatId, msgId),
+  },
+  { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync, statSync },
+)
 
 type PendingEntry = {
   senderId: string
@@ -545,6 +561,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
             : `sent ${sentIds.length} parts (ids: ${sentIds.join(', ')})`
+
         return { content: [{ type: 'text', text: result }] }
       }
       case 'react': {
@@ -730,12 +747,17 @@ async function handleInbound(
     },
   }
 
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: channelParams,
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  // In RECEIVER_MODE the MCP transport is never connected (gateway spawns this
+  // standalone and uses CLAUDE_CHANNEL_CALLBACK below for delivery). Skip the
+  // notification in that mode to avoid noisy "Not connected" errors.
+  if (!RECEIVER_MODE) {
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: channelParams,
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+    })
+  }
 
   // Callback bridge: when agent-runner provides CLAUDE_CHANNEL_CALLBACK, POST
   // the channel params there so the gateway can inject them as stream-json
@@ -750,6 +772,10 @@ async function handleInbound(
     }).catch(err => {
       process.stderr.write(`telegram channel: callback POST failed: ${err}\n`)
     })
+    // Start typing indicator loop — only in receiver mode with a real AgentRunner
+    if (RECEIVER_MODE) {
+      typingManager.start(chat_id)
+    }
   }
 }
 

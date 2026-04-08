@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
@@ -106,6 +107,8 @@ export class AgentRunner extends EventEmitter {
                 chatId,
                 error: (err as Error).message,
               });
+              const code = (err as Error).message.includes('pool full') ? 'POOL_FULL' : 'SPAWN_FAILED';
+              this.writeTypingError(chatId, code);
             });
         } catch (err) {
           this.logger.warn('Failed to parse channel callback body', {
@@ -194,6 +197,24 @@ export class AgentRunner extends EventEmitter {
     // CronScheduler, tests) receive them without needing individual session references.
     proc.on('output', (line: string) => this.emit('output', line));
 
+    // Notify typing indicator when session permanently fails (max restarts exceeded)
+    if (source === 'telegram') {
+      proc.once('failed', () => {
+        this.writeTypingError(sessionId, 'PROCESS_FAILED');
+        this.sessions.delete(sessionId);
+      });
+      // Stop typing loop when Claude's turn truly ends (result event = end of turn).
+      // This is deferred from the reply tool so typing stays active during multi-step work.
+      proc.on('output', (line: string) => {
+        try {
+          const obj = JSON.parse(line) as Record<string, unknown>;
+          if (obj['type'] === 'result') {
+            this.writeTypingDone(sessionId);
+          }
+        } catch { /* non-JSON */ }
+      });
+    }
+
     this.sessions.set(sessionId, proc);
     this.logger.info('Spawned session', {
       sessionId,
@@ -201,6 +222,34 @@ export class AgentRunner extends EventEmitter {
       total: this.sessions.size,
     });
     return proc;
+  }
+
+  /**
+   * Write an error code to the typing signal directory so the receiver's
+   * typing loop can pick it up and notify the user via Telegram.
+   * Non-fatal: if the write fails the typing loop will stop via stalled timer.
+   */
+  private writeTypingError(chatId: string, code: string): void {
+    const typingDir = path.join(this.agentConfig.workspace, '.telegram-state', 'typing');
+    try {
+      fs.mkdirSync(typingDir, { recursive: true });
+      fs.writeFileSync(path.join(typingDir, `${chatId}.error`), code);
+    } catch {
+      // Non-fatal — typing loop will stop via stalled timer instead
+    }
+  }
+
+  /**
+   * Delete the typing signal file so the receiver's typing loop stops on next tick.
+   * Called when Claude's turn is truly complete (result event), not on individual reply calls.
+   */
+  private writeTypingDone(chatId: string): void {
+    const typingDir = path.join(this.agentConfig.workspace, '.telegram-state', 'typing');
+    try {
+      fs.rmSync(path.join(typingDir, chatId), { force: true });
+    } catch {
+      // Non-fatal
+    }
   }
 
   private startIdleCleaner(): void {

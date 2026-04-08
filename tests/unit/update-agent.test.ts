@@ -84,7 +84,7 @@ describe('buildGenerationPrompt — strengthened acknowledge rule', () => {
 
   it('states that every message MUST begin with acknowledgement', () => {
     const prompt = buildGenerationPrompt('TestAgent', 'A test agent.');
-    expect(prompt).toContain('Every message MUST begin with a short acknowledgement');
+    expect(prompt).toContain('Every message MUST begin with a text reply acknowledgement');
   });
 
   it('states no exceptions', () => {

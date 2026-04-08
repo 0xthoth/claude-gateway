@@ -205,8 +205,15 @@ export class SessionProcess extends EventEmitter {
     }
 
     // Capture stdout — emit output events + persist assistant replies
+    const heartbeatPath = this.source === 'telegram'
+      ? path.join(this.agentConfig.workspace, '.telegram-state', 'typing', `${this.sessionId}.heartbeat`)
+      : null;
     let assistantBuffer = '';
     proc.stdout?.on('data', (data: Buffer) => {
+      // Update heartbeat so the receiver's stalled detector knows Claude is active
+      if (heartbeatPath) {
+        try { fs.writeFileSync(heartbeatPath, String(Date.now())) } catch {}
+      }
       const lines = data.toString().split('\n');
       for (const line of lines) {
         if (!line.trim()) continue;
