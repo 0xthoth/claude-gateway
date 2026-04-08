@@ -73,7 +73,7 @@ describe('config-loader', () => {
   // -------------------------------------------------------------------------
   // U-CL-04: Agent missing botToken
   // -------------------------------------------------------------------------
-  it('U-CL-04: throws ConfigValidationError when botToken is missing', () => {
+  it('U-CL-04: skips agent when botToken is missing, throws if no agents remain', () => {
     const configPath = path.join(tmpDir, 'no-token.json');
     fs.writeFileSync(configPath, JSON.stringify({
       gateway: { logDir: '/tmp', timezone: 'UTC' },
@@ -88,7 +88,7 @@ describe('config-loader', () => {
     }));
 
     expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
-    expect(() => loadConfig(configPath)).toThrow(/botToken/i);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
   });
 
   // -------------------------------------------------------------------------
@@ -126,7 +126,7 @@ describe('config-loader', () => {
   // -------------------------------------------------------------------------
   // U-CL-07: Env var interpolation — missing variable
   // -------------------------------------------------------------------------
-  it('U-CL-07: throws MissingEnvVarError when env variable is not set', () => {
+  it('U-CL-07: skips agent with missing env var, throws if no agents remain', () => {
     delete process.env.NONEXISTENT_VAR;
     const configPath = path.join(tmpDir, 'missing-env.json');
     fs.writeFileSync(configPath, JSON.stringify({
@@ -141,8 +141,8 @@ describe('config-loader', () => {
       }],
     }));
 
-    expect(() => loadConfig(configPath)).toThrow(MissingEnvVarError);
-    expect(() => loadConfig(configPath)).toThrow('NONEXISTENT_VAR');
+    expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
   });
 
   // -------------------------------------------------------------------------
@@ -180,7 +180,7 @@ describe('config-loader', () => {
   // -------------------------------------------------------------------------
   // U-CL-09: dmPolicy invalid value
   // -------------------------------------------------------------------------
-  it('U-CL-09: throws ConfigValidationError for invalid dmPolicy', () => {
+  it('U-CL-09: skips agent with invalid dmPolicy, throws if no agents remain', () => {
     const configPath = path.join(tmpDir, 'invalid-policy.json');
     fs.writeFileSync(configPath, JSON.stringify({
       gateway: { logDir: '/tmp', timezone: 'UTC' },
@@ -195,7 +195,7 @@ describe('config-loader', () => {
     }));
 
     expect(() => loadConfig(configPath)).toThrow(ConfigValidationError);
-    expect(() => loadConfig(configPath)).toThrow(/dmPolicy/i);
+    expect(() => loadConfig(configPath)).toThrow(/no valid agents/i);
   });
 
   // -------------------------------------------------------------------------

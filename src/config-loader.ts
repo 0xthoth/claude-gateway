@@ -56,32 +56,34 @@ function interpolateObject(obj: unknown): unknown {
   return obj;
 }
 
-function validateAgent(agent: Record<string, unknown>, index: number): void {
+/**
+ * Validate an agent config. Returns an error message if invalid, or null if valid.
+ */
+function validateAgent(agent: Record<string, unknown>, index: number): string | null {
   if (!agent.id || typeof agent.id !== 'string') {
-    throw new ConfigValidationError(`Agent at index ${index} is missing required field "id"`);
+    return `Agent at index ${index} is missing required field "id"`;
   }
   if (!agent.telegram || typeof agent.telegram !== 'object') {
-    throw new ConfigValidationError(`Agent "${agent.id}" is missing "telegram" config`);
+    return `Agent "${agent.id}" is missing "telegram" config`;
   }
   const telegram = agent.telegram as Record<string, unknown>;
   if (!telegram.botToken || typeof telegram.botToken !== 'string') {
-    throw new ConfigValidationError(`Agent "${agent.id}" is missing "telegram.botToken"`);
+    return `Agent "${agent.id}" is missing "telegram.botToken"`;
   }
   if (telegram.dmPolicy !== 'allowlist' && telegram.dmPolicy !== 'open') {
-    throw new ConfigValidationError(
-      `Agent "${agent.id}" has invalid dmPolicy "${telegram.dmPolicy}". Must be "allowlist" or "open".`
-    );
+    return `Agent "${agent.id}" has invalid dmPolicy "${telegram.dmPolicy}". Must be "allowlist" or "open".`;
   }
 
   if (agent.session !== undefined && typeof agent.session === 'object') {
     const session = agent.session as Record<string, unknown>;
     if (session.idleTimeoutMinutes !== undefined && (typeof session.idleTimeoutMinutes !== 'number' || session.idleTimeoutMinutes <= 0)) {
-      throw new ConfigValidationError(`agent '${agent.id}': session.idleTimeoutMinutes must be > 0`);
+      return `agent '${agent.id}': session.idleTimeoutMinutes must be > 0`;
     }
     if (session.maxConcurrent !== undefined && (typeof session.maxConcurrent !== 'number' || session.maxConcurrent <= 0)) {
-      throw new ConfigValidationError(`agent '${agent.id}': session.maxConcurrent must be > 0`);
+      return `agent '${agent.id}': session.maxConcurrent must be > 0`;
     }
   }
+  return null;
 }
 
 /**
@@ -117,18 +119,29 @@ export function loadConfig(configPath: string): GatewayConfig {
     throw new ConfigValidationError('Config is missing required "gateway" object');
   }
 
-  // Validate each agent before interpolation (so we get good error messages)
+  // Validate each agent before interpolation — skip invalid agents with a warning
+  const validAgents: Record<string, unknown>[] = [];
+  const skippedAgents: string[] = [];
   for (let i = 0; i < (config.agents as unknown[]).length; i++) {
     const agent = (config.agents as unknown[])[i];
     if (typeof agent !== 'object' || agent === null) {
-      throw new ConfigValidationError(`Agent at index ${i} must be an object`);
+      console.warn(`[gateway] Skipping agent at index ${i}: must be an object`);
+      skippedAgents.push(`index ${i}`);
+      continue;
     }
-    validateAgent(agent as Record<string, unknown>, i);
+    const error = validateAgent(agent as Record<string, unknown>, i);
+    if (error) {
+      const agentId = (agent as Record<string, unknown>).id || `index ${i}`;
+      console.warn(`[gateway] Skipping agent "${agentId}": ${error}`);
+      skippedAgents.push(String(agentId));
+      continue;
+    }
+    validAgents.push(agent as Record<string, unknown>);
   }
 
-  // Check for duplicate IDs before interpolation
+  // Check for duplicate IDs among valid agents
   const ids = new Set<string>();
-  for (const agent of config.agents as Array<Record<string, unknown>>) {
+  for (const agent of validAgents) {
     const id = agent.id as string;
     if (ids.has(id)) {
       throw new DuplicateAgentIdError(id);
@@ -164,8 +177,36 @@ export function loadConfig(configPath: string): GatewayConfig {
     }
   }
 
-  // Now interpolate env vars (may throw MissingEnvVarError)
-  const interpolated = interpolateObject(parsed) as GatewayConfig;
+  // Interpolate gateway config (fatal if env vars missing here)
+  const interpolatedGateway = interpolateObject(config.gateway);
 
-  return interpolated;
+  // Interpolate each agent individually — skip agents with missing env vars
+  const interpolatedAgents: unknown[] = [];
+  for (const agent of validAgents) {
+    try {
+      interpolatedAgents.push(interpolateObject(agent));
+    } catch (err) {
+      if (err instanceof MissingEnvVarError) {
+        console.warn(`[gateway] Skipping agent "${agent.id}": ${err.message}`);
+        skippedAgents.push(String(agent.id));
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (interpolatedAgents.length === 0) {
+    throw new ConfigValidationError(
+      'No valid agents found in config. All agents were skipped due to configuration errors.'
+    );
+  }
+
+  if (skippedAgents.length > 0) {
+    console.warn(`[gateway] ${skippedAgents.length} agent(s) skipped: ${skippedAgents.join(', ')}`);
+  }
+
+  return {
+    agents: interpolatedAgents,
+    gateway: interpolatedGateway,
+  } as GatewayConfig;
 }
