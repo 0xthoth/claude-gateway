@@ -469,7 +469,7 @@ export class CronManager extends EventEmitter {
       jobs: [...this.jobs.values()],
     };
 
-    const tmpPath = this.storePath + '.tmp';
+    const tmpPath = `${this.storePath}.tmp.${randomUUID()}`;
     await fs.promises.writeFile(tmpPath, JSON.stringify(store, null, 2), 'utf8');
     await fs.promises.rename(tmpPath, this.storePath);
   }
