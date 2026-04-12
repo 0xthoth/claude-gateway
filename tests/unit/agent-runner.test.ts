@@ -334,18 +334,18 @@ describe('AgentRunner — typing error notification', () => {
   });
 
   // --------------------------------------------------------------------------
-  // U-AR-TYPING-AF-02: writeAutoForward writes JSON with markdownv2 format
+  // U-AR-TYPING-AF-02: writeAutoForward writes JSON with html format
   // --------------------------------------------------------------------------
-  it('U-AR-TYPING-AF-02: writeAutoForward writes JSON with markdownv2 format', () => {
+  it('U-AR-TYPING-AF-02: writeAutoForward writes JSON with html format', () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
 
     (runner as unknown as { writeAutoForward: (chatId: string, text: string, format: string) => void })
-      .writeAutoForward('123456789', 'Hello `code`', 'markdownv2');
+      .writeAutoForward('123456789', 'Hello <code>code</code>', 'html');
 
     const forwardFile = path.join(getTypingDir(), '123456789.forward');
     expect(fs.existsSync(forwardFile)).toBe(true);
     const content = JSON.parse(fs.readFileSync(forwardFile, 'utf8'));
-    expect(content).toEqual({ text: 'Hello `code`', format: 'markdownv2' });
+    expect(content).toEqual({ text: 'Hello <code>code</code>', format: 'html' });
   });
 
   // --------------------------------------------------------------------------
@@ -945,4 +945,5 @@ describe('AgentRunner — typing persistence', () => {
     const typingFile = path.join(getTypingDir(), chatId);
     expect(fs.existsSync(typingFile)).toBe(true);
   }, 15000);
+
 });

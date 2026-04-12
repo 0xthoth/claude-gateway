@@ -194,6 +194,8 @@ export function gateLogic(
   return { action: 'drop' }
 }
 
+export { hasMarkdown, toTelegramHtml } from '../../src/markdown'
+
 export function isMentionedPure(input: GateInput, extraPatterns?: string[]): boolean {
   const entities = input.messageEntities ?? input.captionEntities ?? []
   const text = input.messageText ?? ''

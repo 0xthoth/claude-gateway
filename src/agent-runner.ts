@@ -8,6 +8,7 @@ import { createLogger } from './logger';
 import { SessionProcess } from './session-process';
 import { SessionStore } from './session-store';
 import { TelegramReceiver } from './telegram-receiver';
+import { hasMarkdown, toTelegramHtml } from './markdown';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
@@ -375,10 +376,16 @@ export class AgentRunner extends EventEmitter {
             }
           }
           if (obj['type'] === 'result') {
-            // Auto-forward result text if agent didn't call reply tool
+            // Always forward result text — it contains the agent's completion summary.
+            // If the agent also called reply tool, this summary still reaches the user.
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
-            if (!replyCalled && resultText.trim()) {
-              this.writeAutoForward(sessionId, resultText.trim());
+            if (resultText.trim()) {
+              const text = resultText.trim();
+              if (hasMarkdown(text)) {
+                this.writeAutoForward(sessionId, toTelegramHtml(text), 'html');
+              } else {
+                this.writeAutoForward(sessionId, text);
+              }
             }
             replyCalled = false; // reset for next turn
             // Delay typing done — agent may continue with more work
@@ -443,7 +450,7 @@ export class AgentRunner extends EventEmitter {
    * The file is written as JSON { text, format } so the receiver can apply the
    * correct parse_mode when sending the Telegram message.
    */
-  private writeAutoForward(chatId: string, text: string, format: 'text' | 'markdownv2' = 'text'): void {
+  private writeAutoForward(chatId: string, text: string, format: 'text' | 'html' = 'text'): void {
     const typingDir = path.join(this.agentConfig.workspace, '.telegram-state', 'typing');
     try {
       fs.mkdirSync(typingDir, { recursive: true });

@@ -29,6 +29,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 import { createWorkingStateManager } from './typing'
+import { hasMarkdown, toTelegramHtml } from './pure'
 
 // Standalone fallback: default state dir to ~/.claude/channels/telegram
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
@@ -445,8 +446,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'html'],
+            description: "Rendering mode. 'html' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per HTML rules (&amp; &lt; &gt;). Default: 'text' (plain, no escaping needed).",
           },
         },
         required: ['chat_id', 'text'],
@@ -487,8 +488,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           format: {
             type: 'string',
-            enum: ['text', 'markdownv2'],
-            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+            enum: ['text', 'html'],
+            description: "Rendering mode. 'html' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per HTML rules (&amp; &lt; &gt;). Default: 'text' (plain, no escaping needed).",
           },
         },
         required: ['chat_id', 'message_id', 'text'],
@@ -506,8 +507,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
-        const format = (args.format as string | undefined) ?? 'text'
-        const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const explicitFormat = args.format as string | undefined
+        // Auto-detect markdown when caller didn't specify format explicitly
+        const useHtml = explicitFormat === 'html' || (!explicitFormat && hasMarkdown(text))
+        const sendText = useHtml && !explicitFormat ? toTelegramHtml(text) : text
+        const parseMode = useHtml ? 'HTML' as const : undefined
 
         assertAllowedChat(chat_id)
 
@@ -523,7 +527,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+        const chunks = chunk(sendText, limit, mode)
         const sentIds: number[] = []
 
         try {
@@ -567,7 +571,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Write .replied marker so auto-forward in typing.ts skips duplicate send.
         try {
           mkdirSync(TYPING_DIR, { recursive: true })
-          writeFileSync(join(TYPING_DIR, `${chat_id}.replied`), String(Date.now()))
+          writeFileSync(join(TYPING_DIR, `${chat_id}.replied`), sendText)
         } catch { /* non-fatal */ }
 
         const result =
@@ -605,7 +609,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
         const editFormat = (args.format as string | undefined) ?? 'text'
-        const editParseMode = editFormat === 'markdownv2' ? 'MarkdownV2' as const : undefined
+        const editParseMode = editFormat === 'html' ? 'HTML' as const : undefined
         const edited = await bot.api.editMessageText(
           args.chat_id as string,
           Number(args.message_id),
