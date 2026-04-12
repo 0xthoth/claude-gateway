@@ -36,7 +36,8 @@ function convertBulletLists(text: string): string {
 }
 
 /**
- * Converts consecutive Markdown table lines to a monospace code block.
+ * Converts consecutive Markdown table lines to an aligned monospace code block.
+ * Renders without | delimiters — columns are padded with spaces, header separated by dashes.
  * Telegram does not support native tables — code blocks preserve alignment.
  */
 function convertTablesToCodeBlocks(text: string): string {
@@ -44,11 +45,38 @@ function convertTablesToCodeBlocks(text: string): string {
   const out: string[] = []
   let tableLines: string[] = []
 
+  const isSeparatorRow = (line: string): boolean =>
+    /^\s*\|[-:\s|]+\|\s*$/.test(line) && line.includes('---')
+
+  const parseRow = (line: string): string[] =>
+    line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+
   const flushTable = (): void => {
-    if (tableLines.length > 0) {
-      out.push('```', ...tableLines, '```')
+    if (tableLines.length === 0) return
+
+    const rows = tableLines.filter(l => !isSeparatorRow(l)).map(parseRow)
+    if (rows.length === 0) {
       tableLines = []
+      return
     }
+
+    const colCount = Math.max(...rows.map(r => r.length))
+    const colWidths: number[] = Array(colCount).fill(0)
+    for (const row of rows) {
+      for (let c = 0; c < row.length; c++) {
+        colWidths[c] = Math.max(colWidths[c], row[c].length)
+      }
+    }
+
+    const padRow = (row: string[]): string =>
+      row.map((cell, c) => c < colCount - 1 ? cell.padEnd(colWidths[c]) : cell).join('  ')
+
+    const totalWidth = colWidths.reduce((sum, w, i) => sum + w + (i < colCount - 1 ? 2 : 0), 0)
+    const separator = '-'.repeat(totalWidth)
+    const formatted = [padRow(rows[0]), separator, ...rows.slice(1).map(padRow)]
+
+    out.push('```', ...formatted, '```')
+    tableLines = []
   }
 
   for (const line of lines) {
@@ -133,6 +161,16 @@ export function toMarkdownV2(text: string): string {
       }
     }
 
+    // Italic _..._ (underscore style)
+    if (text[i] === '_' && text[i + 1] !== '_' && text[i + 1] !== ' ' && text[i + 1] !== undefined) {
+      const closeIdx = text.indexOf('_', i + 1)
+      if (closeIdx !== -1 && !text.slice(i + 1, closeIdx).includes('\n')) {
+        out.push('_' + escapePlain(text.slice(i + 1, closeIdx)) + '_')
+        i = closeIdx + 1
+        continue
+      }
+    }
+
     // Link [text](url)
     if (text[i] === '[') {
       const closeBracket = text.indexOf(']', i + 1)
@@ -172,6 +210,7 @@ export function toMarkdownV2(text: string): string {
         (c === '`' && text[j + 1] !== '`') ||
         text.startsWith('**', j) ||
         (c === '*' && text[j + 1] !== '*' && text[j + 1] !== ' ') ||
+        (c === '_' && text[j + 1] !== '_' && text[j + 1] !== ' ') ||
         c === '[' ||
         (c === '#' && (j === 0 || text[j - 1] === '\n'))
       ) break

@@ -145,12 +145,14 @@ describe('toMarkdownV2()', () => {
   })
 
   describe('table conversion', () => {
-    test('wraps table in code block', () => {
+    test('wraps table in aligned code block without | delimiters', () => {
       const input = '| A | B |\n|---|---|\n| 1 | 2 |'
       const result = toMarkdownV2(input)
       expect(result).toContain('```')
-      expect(result).toContain('| A | B |')
-      expect(result).toContain('| 1 | 2 |')
+      expect(result).toContain('A  B')
+      expect(result).toContain('1  2')
+      expect(result).toContain('----')
+      expect(result).not.toContain('| A | B |')
     })
 
     test('table before and after text', () => {
@@ -173,6 +175,14 @@ describe('toMarkdownV2()', () => {
 
     test('italic surrounded by plain text', () => {
       expect(toMarkdownV2('This is *italic* text.')).toBe('This is _italic_ text\\.')
+    })
+
+    test('converts _italic_ (underscore style) to _italic_', () => {
+      expect(toMarkdownV2('_italic_')).toBe('_italic_')
+    })
+
+    test('_italic_ surrounded by plain text', () => {
+      expect(toMarkdownV2('This is _italic_ text.')).toBe('This is _italic_ text\\.')
     })
   })
 
