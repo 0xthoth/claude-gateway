@@ -224,10 +224,10 @@ AgentRunner  (session pool manager)
 While an agent is working, the gateway sends real-time status updates to Telegram showing what the agent is doing:
 
 ```
-✅ 🧠 Analyzing the codebase structure...
-✅ 📖 Reading: src/agent-runner.ts
-✅ 🔍 Searching for: "sendMessage" in src/
-🕐 ✏️ Editing: src/typing.ts
+☑️ : 🧠 Analyzing the codebase structure...
+☑️ : 📖 Reading: src/agent-runner.ts
+☑️ : 🔍 Searching for: "sendMessage" in src/
+🕐 : ✏️ Editing: src/typing.ts
 (elapsed: 2m 30s)
 ```
 
