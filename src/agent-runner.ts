@@ -8,6 +8,7 @@ import { createLogger } from './logger';
 import { SessionProcess } from './session-process';
 import { SessionStore } from './session-store';
 import { TelegramReceiver } from './telegram-receiver';
+import { hasMarkdown, toMarkdownV2 } from './markdown';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
@@ -378,7 +379,12 @@ export class AgentRunner extends EventEmitter {
             // Auto-forward result text if agent didn't call reply tool
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
             if (!replyCalled && resultText.trim()) {
-              this.writeAutoForward(sessionId, resultText.trim());
+              const text = resultText.trim();
+              if (hasMarkdown(text)) {
+                this.writeAutoForward(sessionId, toMarkdownV2(text), 'markdownv2');
+              } else {
+                this.writeAutoForward(sessionId, text);
+              }
             }
             replyCalled = false; // reset for next turn
             // Delay typing done — agent may continue with more work
