@@ -8,7 +8,7 @@ import { createLogger } from './logger';
 import { SessionProcess } from './session-process';
 import { SessionStore } from './session-store';
 import { TelegramReceiver } from './telegram-receiver';
-import { hasMarkdown, toMarkdownV2 } from './markdown';
+import { hasMarkdown, toTelegramHtml } from './markdown';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
@@ -382,7 +382,7 @@ export class AgentRunner extends EventEmitter {
             if (resultText.trim()) {
               const text = resultText.trim();
               if (hasMarkdown(text)) {
-                this.writeAutoForward(sessionId, toMarkdownV2(text), 'markdownv2');
+                this.writeAutoForward(sessionId, toTelegramHtml(text), 'html');
               } else {
                 this.writeAutoForward(sessionId, text);
               }
@@ -450,7 +450,7 @@ export class AgentRunner extends EventEmitter {
    * The file is written as JSON { text, format } so the receiver can apply the
    * correct parse_mode when sending the Telegram message.
    */
-  private writeAutoForward(chatId: string, text: string, format: 'text' | 'markdownv2' = 'text'): void {
+  private writeAutoForward(chatId: string, text: string, format: 'text' | 'html' = 'text'): void {
     const typingDir = path.join(this.agentConfig.workspace, '.telegram-state', 'typing');
     try {
       fs.mkdirSync(typingDir, { recursive: true });

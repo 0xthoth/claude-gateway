@@ -1,7 +1,7 @@
 /**
- * Unit tests for hasMarkdown() and toMarkdownV2() from src/markdown.ts
+ * Unit tests for hasMarkdown() and toTelegramHtml() from src/markdown.ts
  */
-import { hasMarkdown, toMarkdownV2 } from '../../../src/markdown'
+import { hasMarkdown, toTelegramHtml } from '../../../src/markdown'
 
 describe('hasMarkdown()', () => {
   test('detects **bold**', () => {
@@ -51,175 +51,190 @@ describe('hasMarkdown()', () => {
   test('single asterisk math expression is not markdown', () => {
     expect(hasMarkdown('price is 5 * 2 = 10')).toBe(false)
   })
+
+  test('detects _italic_', () => {
+    expect(hasMarkdown('this is _italic_ text')).toBe(true)
+  })
 })
 
-describe('toMarkdownV2()', () => {
+describe('toTelegramHtml()', () => {
   describe('plain text escaping', () => {
-    test('escapes special chars in plain text', () => {
-      expect(toMarkdownV2('hello. world!')).toBe('hello\\. world\\!')
-    })
-
-    test('escapes dash and underscore', () => {
-      expect(toMarkdownV2('foo-bar_baz')).toBe('foo\\-bar\\_baz')
-    })
-
-    test('escapes parentheses and brackets', () => {
-      expect(toMarkdownV2('(test) [value]')).toBe('\\(test\\) \\[value\\]')
+    test('escapes & < > in plain text', () => {
+      expect(toTelegramHtml('a & b < c > d')).toBe('a &amp; b &lt; c &gt; d')
     })
 
     test('simple text without special chars passes through', () => {
-      expect(toMarkdownV2('hello world')).toBe('hello world')
+      expect(toTelegramHtml('hello world')).toBe('hello world')
+    })
+
+    test('plain text with no markdown chars is unchanged', () => {
+      expect(toTelegramHtml('just some plain text')).toBe('just some plain text')
+    })
+
+    test('escapes ampersand', () => {
+      expect(toTelegramHtml('foo & bar')).toBe('foo &amp; bar')
+    })
+
+    test('escapes less-than and greater-than', () => {
+      expect(toTelegramHtml('a < b > c')).toBe('a &lt; b &gt; c')
     })
   })
 
   describe('bold conversion', () => {
-    test('converts **bold** to *bold* with content escaped', () => {
-      expect(toMarkdownV2('**hello world**')).toBe('*hello world*')
-    })
-
-    test('escapes special chars inside bold', () => {
-      expect(toMarkdownV2('**foo.bar**')).toBe('*foo\\.bar*')
+    test('converts **bold** to <b>bold</b>', () => {
+      expect(toTelegramHtml('**hello world**')).toBe('<b>hello world</b>')
     })
 
     test('bold surrounded by plain text', () => {
-      expect(toMarkdownV2('This is **bold** text.')).toBe('This is *bold* text\\.')
+      expect(toTelegramHtml('This is **bold** text.')).toBe('This is <b>bold</b> text.')
     })
 
     test('multiple bold segments', () => {
-      expect(toMarkdownV2('**a** and **b**')).toBe('*a* and *b*')
+      expect(toTelegramHtml('**a** and **b**')).toBe('<b>a</b> and <b>b</b>')
+    })
+
+    test('escapes HTML chars inside bold', () => {
+      expect(toTelegramHtml('**foo & bar**')).toBe('<b>foo &amp; bar</b>')
+    })
+  })
+
+  describe('italic conversion', () => {
+    test('converts *italic* to <i>italic</i>', () => {
+      expect(toTelegramHtml('*italic*')).toBe('<i>italic</i>')
+    })
+
+    test('italic surrounded by plain text', () => {
+      expect(toTelegramHtml('This is *italic* text.')).toBe('This is <i>italic</i> text.')
+    })
+
+    test('converts _italic_ (underscore style) to <i>italic</i>', () => {
+      expect(toTelegramHtml('_italic_')).toBe('<i>italic</i>')
+    })
+
+    test('_italic_ surrounded by plain text', () => {
+      expect(toTelegramHtml('This is _italic_ text.')).toBe('This is <i>italic</i> text.')
+    })
+
+    test('escapes HTML chars inside italic', () => {
+      expect(toTelegramHtml('*foo & bar*')).toBe('<i>foo &amp; bar</i>')
     })
   })
 
   describe('inline code', () => {
-    test('preserves inline code', () => {
-      expect(toMarkdownV2('Use `npm install`')).toBe('Use `npm install`')
+    test('converts `code` to <code>code</code>', () => {
+      expect(toTelegramHtml('Use `npm install`')).toBe('Use <code>npm install</code>')
     })
 
-    test('passes through inline code content unchanged (only \\ and ` escaped)', () => {
-      // Input: `hello world` — no special escaping needed
-      expect(toMarkdownV2('`hello world`')).toBe('`hello world`')
+    test('escapes HTML chars inside inline code', () => {
+      expect(toTelegramHtml('`a < b`')).toBe('<code>a &lt; b</code>')
     })
   })
 
   describe('code blocks', () => {
-    test('preserves code block with language', () => {
+    test('converts ```block``` to <pre><code>block</code></pre>', () => {
       const input = '```typescript\nconst x = 1\n```'
-      const result = toMarkdownV2(input)
-      expect(result).toBe('```typescript\nconst x = 1\n```')
+      expect(toTelegramHtml(input)).toBe('<pre><code>const x = 1</code></pre>')
     })
 
-    test('escapes special chars inside code block content', () => {
-      const input = '```\nfoo.bar()\n```'
-      const result = toMarkdownV2(input)
-      // Only \ and ` are escaped in code blocks, not . or ()
-      expect(result).toBe('```\nfoo.bar()\n```')
+    test('escapes HTML chars inside code block', () => {
+      const input = '```\nfoo < bar & baz\n```'
+      expect(toTelegramHtml(input)).toBe('<pre><code>foo &lt; bar &amp; baz</code></pre>')
+    })
+
+    test('code block without language', () => {
+      const input = '```\nconst x = 1\n```'
+      expect(toTelegramHtml(input)).toBe('<pre><code>const x = 1</code></pre>')
     })
   })
 
   describe('headers', () => {
-    test('converts # header to *bold*', () => {
-      expect(toMarkdownV2('# My Title')).toBe('*My Title*')
+    test('converts # header to <b>header</b>', () => {
+      expect(toTelegramHtml('# My Title')).toBe('<b>My Title</b>')
     })
 
-    test('converts ## header to *bold*', () => {
-      expect(toMarkdownV2('## Section')).toBe('*Section*')
+    test('converts ## header to <b>header</b>', () => {
+      expect(toTelegramHtml('## Section')).toBe('<b>Section</b>')
     })
 
-    test('escapes special chars in header', () => {
-      expect(toMarkdownV2('# Hello World!')).toBe('*Hello World\\!*')
+    test('escapes HTML chars in header', () => {
+      expect(toTelegramHtml('# Hello & World')).toBe('<b>Hello &amp; World</b>')
     })
   })
 
   describe('links', () => {
-    test('converts [text](url) link — URL only escapes ) and \\', () => {
-      // Telegram MarkdownV2: URL part only requires ) and \ escaped
-      const result = toMarkdownV2('[Click here](https://example.com)')
-      expect(result).toBe('[Click here](https://example.com)')
+    test('converts [text](url) to <a href="url">text</a>', () => {
+      const result = toTelegramHtml('[Click here](https://example.com)')
+      expect(result).toBe('<a href="https://example.com">Click here</a>')
     })
 
-    test('escapes special chars in link text but not in URL', () => {
-      const result = toMarkdownV2('[foo.bar](https://example.com)')
-      expect(result).toBe('[foo\\.bar](https://example.com)')
+    test('escapes HTML chars in link text', () => {
+      const result = toTelegramHtml('[foo & bar](https://example.com)')
+      expect(result).toBe('<a href="https://example.com">foo &amp; bar</a>')
+    })
+
+    test('escapes HTML chars in URL', () => {
+      const result = toTelegramHtml('[link](https://example.com?a=1&b=2)')
+      expect(result).toBe('<a href="https://example.com?a=1&amp;b=2">link</a>')
     })
   })
 
   describe('table conversion', () => {
-    test('wraps table in aligned code block without | delimiters', () => {
+    test('wraps table in <pre> with aligned columns', () => {
       const input = '| A | B |\n|---|---|\n| 1 | 2 |'
-      const result = toMarkdownV2(input)
-      expect(result).toContain('```')
-      expect(result).toContain('A  B')
-      expect(result).toContain('1  2')
-      expect(result).toContain('----')
-      expect(result).not.toContain('| A | B |')
+      const result = toTelegramHtml(input)
+      expect(result).toBe('<pre>| A | B |\n| - | - |\n| 1 | 2 |</pre>')
+    })
+
+    test('escapes HTML chars inside table', () => {
+      const input = '| A & B | C |\n| 1 | 2 |'
+      const result = toTelegramHtml(input)
+      expect(result).toContain('&amp;')
+      expect(result).toContain('<pre>')
     })
 
     test('table before and after text', () => {
       const input = 'Before\n| A | B |\n| 1 | 2 |\nAfter'
-      const result = toMarkdownV2(input)
-      expect(result).toContain('```')
+      const result = toTelegramHtml(input)
+      expect(result).toContain('<pre>')
       expect(result).toContain('Before')
       expect(result).toContain('After')
     })
   })
 
-  describe('italic conversion', () => {
-    test('converts *italic* to _italic_', () => {
-      expect(toMarkdownV2('*italic*')).toBe('_italic_')
-    })
-
-    test('italic with special chars escaped inside', () => {
-      expect(toMarkdownV2('*hello.world*')).toBe('_hello\\.world_')
-    })
-
-    test('italic surrounded by plain text', () => {
-      expect(toMarkdownV2('This is *italic* text.')).toBe('This is _italic_ text\\.')
-    })
-
-    test('converts _italic_ (underscore style) to _italic_', () => {
-      expect(toMarkdownV2('_italic_')).toBe('_italic_')
-    })
-
-    test('_italic_ surrounded by plain text', () => {
-      expect(toMarkdownV2('This is _italic_ text.')).toBe('This is _italic_ text\\.')
-    })
-  })
-
   describe('bullet list conversion', () => {
     test('converts - item to bullet character', () => {
-      expect(toMarkdownV2('- item one')).toBe('• item one')
+      expect(toTelegramHtml('- item one')).toBe('• item one')
     })
 
     test('converts multiple bullet items', () => {
-      const result = toMarkdownV2('- item one\n- item two\n- item three')
+      const result = toTelegramHtml('- item one\n- item two\n- item three')
       expect(result).toContain('• item one')
       expect(result).toContain('• item two')
       expect(result).toContain('• item three')
     })
 
     test('only converts line-start dash, not inline dash', () => {
-      const result = toMarkdownV2('foo-bar\n- item')
+      const result = toTelegramHtml('foo-bar\n- item')
       expect(result).toContain('• item')
-      expect(result).toContain('foo\\-bar')
+      expect(result).toContain('foo-bar')
     })
   })
 
   describe('mixed content', () => {
     test('handles bold + code block + plain text', () => {
       const input = '**Title**\n\n```js\nconst x = 1\n```\n\nSome text.'
-      const result = toMarkdownV2(input)
-      expect(result).toContain('*Title*')
-      expect(result).toContain('```js')
-      expect(result).toContain('const x = 1')
-      expect(result).toContain('Some text\\.')
+      const result = toTelegramHtml(input)
+      expect(result).toContain('<b>Title</b>')
+      expect(result).toContain('<pre><code>const x = 1</code></pre>')
+      expect(result).toContain('Some text.')
     })
 
     test('planning-17 style output renders correctly', () => {
       const input = '**Planning 17 — Overview**\n\n- Point one\n- Point two\n\n`lastRecalledAt`'
-      const result = toMarkdownV2(input)
-      expect(result).toContain('*Planning 17')
-      expect(result).toContain('`lastRecalledAt`')
+      const result = toTelegramHtml(input)
+      expect(result).toContain('<b>Planning 17')
+      expect(result).toContain('<code>lastRecalledAt</code>')
+      expect(result).toContain('• Point one')
     })
   })
 })
-

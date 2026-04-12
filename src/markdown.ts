@@ -1,11 +1,11 @@
 /**
- * Markdown detection and conversion utilities for Telegram MarkdownV2.
+ * Markdown detection and conversion utilities for Telegram HTML mode.
  * Used by AgentRunner to auto-format agent output before forwarding.
  */
 
 /**
  * Detects whether text contains markdown formatting patterns
- * that warrant MarkdownV2 rendering in Telegram.
+ * that warrant HTML rendering in Telegram.
  */
 export function hasMarkdown(text: string): boolean {
   return (
@@ -22,92 +22,107 @@ export function hasMarkdown(text: string): boolean {
 }
 
 /**
- * Escapes all MarkdownV2 special characters in a plain text segment.
+ * Escapes HTML special characters in plain text.
  */
-function escapePlain(text: string): string {
-  return text.replace(/([_*[\]()~`>#+=|{}.!\-\\])/g, '\\$1')
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 /**
- * Converts Markdown bullet list lines (- item) to bullet character (• item).
- * Telegram MarkdownV2 does not support native bullet lists.
+ * Escapes HTML special characters in a URL attribute value.
  */
-function convertBulletLists(text: string): string {
-  return text.replace(/^- /gm, '• ')
+function escapeHtmlAttr(url: string): string {
+  return escapeHtml(url).replace(/"/g, '&quot;')
 }
 
 /**
- * Converts consecutive Markdown table lines to an aligned monospace code block.
- * Renders without | delimiters — columns are padded with spaces, header separated by dashes.
- * Telegram does not support native tables — code blocks preserve alignment.
+ * Measures display width of a string, treating Thai/Unicode combining chars as 0-width.
+ * Each base character counts as 1 column.
  */
-function convertTablesToCodeBlocks(text: string): string {
-  const lines = text.split('\n')
-  const out: string[] = []
-  let tableLines: string[] = []
+function displayWidth(s: string): number {
+  // Strip Unicode combining characters (Mn category) — these include Thai tone marks,
+  // vowel signs above/below (U+0E31, U+0E34–U+0E3A, U+0E47–U+0E4E), and other combining marks
+  const stripped = s.replace(/[\u0300-\u036F\u0E31\u0E34-\u0E3A\u0E47-\u0E4E\u0E4F]/g, '')
+  return stripped.length
+}
 
-  const isSeparatorRow = (line: string): boolean =>
-    /^\s*\|[-:\s|]+\|\s*$/.test(line) && line.includes('---')
+/**
+ * Pads a string on the right to reach the target display width.
+ */
+function padEnd(s: string, width: number): string {
+  const pad = width - displayWidth(s)
+  return pad > 0 ? s + ' '.repeat(pad) : s
+}
 
-  const parseRow = (line: string): string[] =>
-    line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+/**
+ * Splits a table row like `| a | b | c |` into trimmed cell strings.
+ */
+function splitCells(line: string): string[] {
+  return line
+    .replace(/^\s*\|\s*/, '')
+    .replace(/\s*\|\s*$/, '')
+    .split(/\s*\|\s*/)
+}
 
-  const flushTable = (): void => {
-    if (tableLines.length === 0) return
+/**
+ * Returns true if the line is a separator row (e.g. |---|:---:|---:|)
+ */
+function isSeparator(line: string): boolean {
+  return /^\s*\|[\s\-:|]+\|\s*$/.test(line)
+}
 
-    const rows = tableLines.filter(l => !isSeparatorRow(l)).map(parseRow)
-    if (rows.length === 0) {
-      tableLines = []
-      return
+/**
+ * Aligns table columns by padding each cell to the widest value in its column.
+ */
+function formatTable(lines: string[]): string {
+  const dataLines = lines.filter(l => !isSeparator(l))
+  const rows = dataLines.map(splitCells)
+
+  // Find column count
+  const colCount = rows.reduce((m, r) => Math.max(m, r.length), 0)
+
+  // Compute max display width per column
+  const colWidths: number[] = Array(colCount).fill(0)
+  for (const row of rows) {
+    for (let c = 0; c < row.length; c++) {
+      colWidths[c] = Math.max(colWidths[c], displayWidth(row[c]))
     }
-
-    const colCount = Math.max(...rows.map(r => r.length))
-    const colWidths: number[] = Array(colCount).fill(0)
-    for (const row of rows) {
-      for (let c = 0; c < row.length; c++) {
-        colWidths[c] = Math.max(colWidths[c], row[c].length)
-      }
-    }
-
-    const padRow = (row: string[]): string =>
-      row.map((cell, c) => c < colCount - 1 ? cell.padEnd(colWidths[c]) : cell).join('  ')
-
-    const totalWidth = colWidths.reduce((sum, w, i) => sum + w + (i < colCount - 1 ? 2 : 0), 0)
-    const separator = '-'.repeat(totalWidth)
-    const formatted = [padRow(rows[0]), separator, ...rows.slice(1).map(padRow)]
-
-    out.push('```', ...formatted, '```')
-    tableLines = []
   }
 
-  for (const line of lines) {
-    const isTableLine = /^\s*\|.*\|\s*$/.test(line)
-    if (isTableLine) {
-      tableLines.push(line)
-    } else {
-      flushTable()
-      out.push(line)
-    }
+  // Render rows
+  const rendered = rows.map(row => {
+    const cells = Array.from({ length: colCount }, (_, c) => padEnd(row[c] ?? '', colWidths[c]))
+    return '| ' + cells.join(' | ') + ' |'
+  })
+
+  // Rebuild separator line from computed widths
+  const sep = '| ' + colWidths.map(w => '-'.repeat(w)).join(' | ') + ' |'
+
+  // Insert separator after header (first row)
+  if (rendered.length > 1) {
+    rendered.splice(1, 0, sep)
   }
-  flushTable()
-  return out.join('\n')
+
+  return rendered.join('\n')
 }
 
 /**
- * Converts standard Markdown to Telegram MarkdownV2 format.
+ * Converts standard Markdown to Telegram HTML format.
  *
  * Conversions:
- * - **bold** → *bold*
- * - `code` → `code` (inner chars escaped)
- * - ```block``` → ```block``` (inner chars escaped)
- * - [text](url) → [text](url) (properly escaped)
- * - # Header → *Header* (bold)
- * - | table | → wrapped in code block
- * - plain text → all special chars escaped
+ * - **bold** → <b>bold</b>
+ * - *italic* / _italic_ → <i>italic</i>
+ * - `code` → <code>code</code>
+ * - ```block``` → <pre><code>block</code></pre>
+ * - [text](url) → <a href="url">text</a>
+ * - # Header → <b>Header</b>
+ * - | table | → wrapped in <pre> (pipes preserved, monospace)
+ * - - bullet → • bullet
+ * - plain text → HTML-escaped (&amp; &lt; &gt;)
  */
-export function toMarkdownV2(text: string): string {
-  text = convertBulletLists(text)
-  text = convertTablesToCodeBlocks(text)
+export function toTelegramHtml(text: string): string {
+  // Convert bullet lists first (line-level transform, safe as pre-pass)
+  text = text.replace(/^- /gm, '• ')
 
   const out: string[] = []
   let i = 0
@@ -120,11 +135,8 @@ export function toMarkdownV2(text: string): string {
       if (closeIdx !== -1) {
         const inner = text.slice(i + 3, closeIdx)
         const nlIdx = inner.indexOf('\n')
-        // nlIdx > 0 means there's a language tag before the first newline
-        const lang = nlIdx > 0 ? inner.slice(0, nlIdx) : ''
         const code = nlIdx > 0 ? inner.slice(nlIdx + 1) : inner.replace(/^\n/, '')
-        const esc = code.replace(/\\/g, '\\\\').replace(/`/g, '\\`')
-        out.push('```' + lang + '\n' + esc + '\n```')
+        out.push('<pre><code>' + escapeHtml(code) + '</code></pre>')
         i = closeIdx + 4
         continue
       }
@@ -134,19 +146,17 @@ export function toMarkdownV2(text: string): string {
     if (text[i] === '`' && text[i + 1] !== '`') {
       const closeIdx = text.indexOf('`', i + 1)
       if (closeIdx !== -1) {
-        const code = text.slice(i + 1, closeIdx)
-        const esc = code.replace(/\\/g, '\\\\').replace(/`/g, '\\`')
-        out.push('`' + esc + '`')
+        out.push('<code>' + escapeHtml(text.slice(i + 1, closeIdx)) + '</code>')
         i = closeIdx + 1
         continue
       }
     }
 
-    // Bold **...** (single-line only)
+    // Bold **...**
     if (text.startsWith('**', i) && text[i + 2] !== '*' && text[i + 2] !== ' ') {
       const closeIdx = text.indexOf('**', i + 2)
       if (closeIdx !== -1 && !text.slice(i + 2, closeIdx).includes('\n')) {
-        out.push('*' + escapePlain(text.slice(i + 2, closeIdx)) + '*')
+        out.push('<b>' + escapeHtml(text.slice(i + 2, closeIdx)) + '</b>')
         i = closeIdx + 2
         continue
       }
@@ -156,7 +166,7 @@ export function toMarkdownV2(text: string): string {
     if (text[i] === '*' && text[i + 1] !== '*' && text[i + 1] !== ' ' && text[i + 1] !== undefined) {
       const closeIdx = text.indexOf('*', i + 1)
       if (closeIdx !== -1 && !text.slice(i + 1, closeIdx).includes('\n')) {
-        out.push('_' + escapePlain(text.slice(i + 1, closeIdx)) + '_')
+        out.push('<i>' + escapeHtml(text.slice(i + 1, closeIdx)) + '</i>')
         i = closeIdx + 1
         continue
       }
@@ -166,7 +176,7 @@ export function toMarkdownV2(text: string): string {
     if (text[i] === '_' && text[i + 1] !== '_' && text[i + 1] !== ' ' && text[i + 1] !== undefined) {
       const closeIdx = text.indexOf('_', i + 1)
       if (closeIdx !== -1 && !text.slice(i + 1, closeIdx).includes('\n')) {
-        out.push('_' + escapePlain(text.slice(i + 1, closeIdx)) + '_')
+        out.push('<i>' + escapeHtml(text.slice(i + 1, closeIdx)) + '</i>')
         i = closeIdx + 1
         continue
       }
@@ -180,8 +190,7 @@ export function toMarkdownV2(text: string): string {
         if (closeParen !== -1) {
           const linkText = text.slice(i + 1, closeBracket)
           const url = text.slice(closeBracket + 2, closeParen)
-          const escapedUrl = url.replace(/\\/g, '\\\\').replace(/\)/g, '\\)')
-          out.push('[' + escapePlain(linkText) + '](' + escapedUrl + ')')
+          out.push('<a href="' + escapeHtmlAttr(url) + '">' + escapeHtml(linkText) + '</a>')
           i = closeParen + 1
           continue
         }
@@ -195,9 +204,31 @@ export function toMarkdownV2(text: string): string {
       if (level <= 6 && text[i + level] === ' ') {
         const lineEnd = text.indexOf('\n', i + level + 1)
         const end = lineEnd === -1 ? len : lineEnd
-        const headerText = text.slice(i + level + 1, end)
-        out.push('*' + escapePlain(headerText) + '*')
+        out.push('<b>' + escapeHtml(text.slice(i + level + 1, end)) + '</b>')
         i = end
+        continue
+      }
+    }
+
+    // Table lines starting with | at line start → collect, align columns, wrap in <pre>
+    if ((i === 0 || text[i - 1] === '\n') && text[i] === '|') {
+      const tableLines: string[] = []
+      let j = i
+      while (j < len) {
+        const lineEnd = text.indexOf('\n', j)
+        const end = lineEnd === -1 ? len : lineEnd
+        const line = text.slice(j, end)
+        if (/^\s*\|.*\|\s*$/.test(line)) {
+          tableLines.push(line)
+          j = lineEnd === -1 ? len : lineEnd + 1
+          if (lineEnd === -1) break
+        } else {
+          break
+        }
+      }
+      if (tableLines.length > 0) {
+        out.push('<pre>' + escapeHtml(formatTable(tableLines)) + '</pre>')
+        i = j
         continue
       }
     }
@@ -213,11 +244,12 @@ export function toMarkdownV2(text: string): string {
         (c === '*' && text[j + 1] !== '*' && text[j + 1] !== ' ') ||
         (c === '_' && text[j + 1] !== '_' && text[j + 1] !== ' ') ||
         c === '[' ||
-        (c === '#' && (j === 0 || text[j - 1] === '\n'))
+        (c === '#' && (j === 0 || text[j - 1] === '\n')) ||
+        (c === '|' && (j === 0 || text[j - 1] === '\n'))
       ) break
       j++
     }
-    out.push(escapePlain(text.slice(i, j)))
+    out.push(escapeHtml(text.slice(i, j)))
     i = j
   }
 
