@@ -155,17 +155,9 @@ export function createWorkingStateManager(
           forwardText = raw
           parseMode = undefined
         }
-        // Skip if the reply tool already sent the exact same text (content-based dedup)
-        let isDuplicate = false
-        if (fsApi.existsSync(repliedPath)) {
-          try {
-            const repliedText = fsApi.readFileSync(repliedPath, 'utf8').trim()
-            isDuplicate = repliedText === forwardText.trim()
-          } catch {
-            isDuplicate = true  // Unreadable → assume duplicate to avoid double-send
-          }
-        }
-        if (!isDuplicate && forwardText) {
+        // Skip if the reply tool already sent a message (agent already replied)
+        const alreadyReplied = fsApi.existsSync(repliedPath)
+        if (!alreadyReplied && forwardText) {
           const msgOpts = parseMode ? { parse_mode: parseMode } : {}
           await botApi.sendMessage(chatId, forwardText, msgOpts).catch(() => {})
         }
@@ -316,7 +308,7 @@ export function createWorkingStateManager(
       if (Date.now() - lastActivity >= STALLED_TIMEOUT_MS) {
         await botApi.sendMessage(
           chatId,
-          '⚠️ Claude has not responded in 2 minutes. It may be waiting for input or stuck. Please try sending a new message.',
+          '⚠️ Claude has not responded in 5 minutes. It may be waiting for input or stuck. Please try sending a new message.',
         ).catch(() => {})
         await stop(chatId)
       }

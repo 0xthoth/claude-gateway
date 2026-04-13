@@ -219,12 +219,13 @@ describe('SessionProcess', () => {
   // U-SP-07: History injected into initial prompt when SessionStore has data
   // --------------------------------------------------------------------------
   it('U-SP-07: injects history into initial prompt when session has stored messages', async () => {
-    await sessionStore.appendMessage('alfred', 'chat:111', {
+    // Use new telegram multi-session API: write to telegram-chat:111/chat:111.json
+    await sessionStore.appendTelegramMessage('alfred', 'chat:111', 'chat:111', {
       role: 'user',
       content: 'Hello',
       ts: Date.now(),
     });
-    await sessionStore.appendMessage('alfred', 'chat:111', {
+    await sessionStore.appendTelegramMessage('alfred', 'chat:111', 'chat:111', {
       role: 'assistant',
       content: 'Hi there!',
       ts: Date.now(),
@@ -262,9 +263,9 @@ describe('SessionProcess', () => {
   // U-SP-09: History truncated to MAX_HISTORY_MESSAGES (50)
   // --------------------------------------------------------------------------
   it('U-SP-09: history is truncated to 50 messages', async () => {
-    // Insert 60 messages
+    // Insert 60 messages using new telegram multi-session API
     for (let i = 0; i < 60; i++) {
-      await sessionStore.appendMessage('alfred', 'chat:111', {
+      await sessionStore.appendTelegramMessage('alfred', 'chat:111', 'chat:111', {
         role: 'user',
         content: `Message ${i}`,
         ts: Date.now() + i,
@@ -596,7 +597,7 @@ describe('SessionProcess', () => {
     await new Promise(r => setTimeout(r, 200));
 
     // Load session from store — should contain "Hello world", not "HelloHello world"
-    const messages = await sessionStore.loadSession('alfred', 'chat:partial');
+    const messages = await sessionStore.loadTelegramSession('alfred', 'chat:partial', 'chat:partial');
     const assistantMessages = messages.filter(m => m.role === 'assistant');
     expect(assistantMessages.length).toBeGreaterThanOrEqual(1);
     const lastAssistant = assistantMessages[assistantMessages.length - 1];
@@ -636,6 +637,126 @@ describe('SessionProcess', () => {
       }
     }
     // If status file doesn't exist at all, that's the expected behavior — partial didn't write it
+  });
+
+  // --------------------------------------------------------------------------
+  // U9: stream-json result with usage data → tokenUsage event fired with correct counts
+  // --------------------------------------------------------------------------
+  it('U9: result event with usage data fires tokenUsage event with correct counts', async () => {
+    const sp = new SessionProcess('chat:tok9', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const tokenEvents: Array<{ inputTokens: number; outputTokens: number; totalTokens: number }> = [];
+    sp.on('tokenUsage', (data) => tokenEvents.push(data));
+
+    // Emit message_start first (context is derived from this event now)
+    const messageStart = JSON.stringify({
+      type: 'stream_event',
+      event: {
+        type: 'message_start',
+        message: {
+          usage: {
+            input_tokens: 100,
+            cache_read_input_tokens: 20,
+            cache_creation_input_tokens: 10,
+          },
+        },
+      },
+    });
+    lastProcess!.stdout!.emit('data', Buffer.from(messageStart + '\n'));
+
+    const resultLine = JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: 'Done',
+      usage: { output_tokens: 50 },
+    });
+    lastProcess!.stdout!.emit('data', Buffer.from(resultLine + '\n'));
+
+    expect(tokenEvents).toHaveLength(1);
+    // inputTokens = 100 + 20 + 10 = 130 (from message_start)
+    expect(tokenEvents[0].inputTokens).toBe(130);
+    expect(tokenEvents[0].outputTokens).toBe(50);
+    // totalTokens = 130 + 50 = 180
+    expect(tokenEvents[0].totalTokens).toBe(180);
+  });
+
+  it('U9b: result event without usage data does not fire tokenUsage event', async () => {
+    const sp = new SessionProcess('chat:tok9b', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const tokenEvents: unknown[] = [];
+    sp.on('tokenUsage', (data) => tokenEvents.push(data));
+
+    // Result with no usage field
+    const resultLine = JSON.stringify({ type: 'result', is_error: false, result: 'Done' });
+    lastProcess!.stdout!.emit('data', Buffer.from(resultLine + '\n'));
+
+    expect(tokenEvents).toHaveLength(0);
+  });
+
+  // --------------------------------------------------------------------------
+  // U10: cumulative tokens tracked — each turn adds to total
+  // --------------------------------------------------------------------------
+  it('U10: cumulative tokens tracked — each result event fires tokenUsage with that turn count', async () => {
+    const sp = new SessionProcess('chat:tok10', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const tokenEvents: Array<{ totalTokens: number }> = [];
+    sp.on('tokenUsage', (data) => tokenEvents.push(data));
+
+    // Helper to emit a message_start + result pair
+    const emitTurn = (inputTokens: number, outputTokens: number, label: string) => {
+      const ms = JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'message_start', message: { usage: { input_tokens: inputTokens } } },
+      });
+      lastProcess!.stdout!.emit('data', Buffer.from(ms + '\n'));
+      const result = JSON.stringify({
+        type: 'result', is_error: false, result: label,
+        usage: { output_tokens: outputTokens },
+      });
+      lastProcess!.stdout!.emit('data', Buffer.from(result + '\n'));
+    };
+
+    emitTurn(60, 40, 'Turn 1');   // total = 60 + 40 = 100
+    emitTurn(50, 30, 'Turn 2');   // total = 50 + 30 = 80
+    emitTurn(150, 50, 'Turn 3');  // total = 150 + 50 = 200
+
+    // Three separate tokenUsage events emitted, one per turn
+    expect(tokenEvents).toHaveLength(3);
+    expect(tokenEvents[0].totalTokens).toBe(100);  // 60 + 40
+    expect(tokenEvents[1].totalTokens).toBe(80);   // 50 + 30
+    expect(tokenEvents[2].totalTokens).toBe(200);  // 150 + 50
+  });
+
+  it('U10b: tokenUsage correctly handles missing optional cache fields', async () => {
+    const sp = new SessionProcess('chat:tok10b', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const tokenEvents: Array<{ inputTokens: number; outputTokens: number; totalTokens: number }> = [];
+    sp.on('tokenUsage', (data) => tokenEvents.push(data));
+
+    // message_start without cache fields
+    const messageStart = JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { usage: { input_tokens: 200 } } },
+    });
+    lastProcess!.stdout!.emit('data', Buffer.from(messageStart + '\n'));
+
+    const resultLine = JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: 'Done',
+      usage: { output_tokens: 100 },
+    });
+    lastProcess!.stdout!.emit('data', Buffer.from(resultLine + '\n'));
+
+    expect(tokenEvents).toHaveLength(1);
+    expect(tokenEvents[0].inputTokens).toBe(200);
+    expect(tokenEvents[0].outputTokens).toBe(100);
+    // totalTokens = 200 + 100 = 300
+    expect(tokenEvents[0].totalTokens).toBe(300);
   });
 
   // --------------------------------------------------------------------------

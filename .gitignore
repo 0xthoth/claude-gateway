@@ -39,3 +39,5 @@ testcase*.md
 feature*.md
 task-*.md
 research*.md
+restart.sh
+stop.sh

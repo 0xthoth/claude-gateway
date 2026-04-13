@@ -272,7 +272,7 @@ describe('createWorkingStateManager', () => {
 
       expect(bot.sendMessage).toHaveBeenCalledWith(
         CHAT_ID,
-        expect.stringContaining('Claude has not responded in 2 minutes'),
+        expect.stringContaining('Claude has not responded in 5 minutes'),
       )
       expect(mgr.states.has(CHAT_ID)).toBe(false)
     })
@@ -297,7 +297,7 @@ describe('createWorkingStateManager', () => {
 
       expect(bot.sendMessage).not.toHaveBeenCalledWith(
         CHAT_ID,
-        expect.stringContaining('2 minutes'),
+        expect.stringContaining('5 minutes'),
       )
       expect(mgr.states.has(CHAT_ID)).toBe(true)
 
@@ -318,7 +318,7 @@ describe('createWorkingStateManager', () => {
 
       expect(bot.sendMessage).not.toHaveBeenCalledWith(
         CHAT_ID,
-        expect.stringContaining('2 minutes'),
+        expect.stringContaining('5 minutes'),
       )
     })
   })
@@ -689,15 +689,15 @@ describe('createWorkingStateManager', () => {
       expect(bot.sendMessage).toHaveBeenCalledWith(CHAT_ID, 'Plain text fallback', {})
     })
 
-    it('U-TY-08: skips forward when .replied text matches .forward text (content-based dedup)', async () => {
+    it('U-TY-08: skips forward when .replied exists (agent already replied via tool)', async () => {
       const bot = makeBotApi()
       const fsApi = makeFsApi()
       const mgr = createWorkingStateManager(TYPING_DIR, bot, fsApi)
 
       mgr.start(CHAT_ID)
-      // Simulate both .forward and .replied exist with the SAME text (agent already sent it via tool)
+      // Simulate both .forward and .replied exist — agent already sent a reply
       fsApi._files.set(`${TYPING_DIR}/${CHAT_ID}.forward`, JSON.stringify({ text: 'Hello from agent', format: 'text' }))
-      fsApi._files.set(`${TYPING_DIR}/${CHAT_ID}.replied`, 'Hello from agent')
+      fsApi._files.set(`${TYPING_DIR}/${CHAT_ID}.replied`, String(Date.now()))
 
       // Remove signal file to trigger stop on next tick
       fsApi._files.delete(`${TYPING_DIR}/${CHAT_ID}`)
@@ -706,32 +706,11 @@ describe('createWorkingStateManager', () => {
       await Promise.resolve()
       await Promise.resolve()
 
-      // sendMessage should NOT be called with the forward text — it's a duplicate
+      // sendMessage should NOT be called — agent already replied
       const forwardCalls = bot.sendMessage.mock.calls.filter(
         (c: unknown[]) => c[1] === 'Hello from agent'
       )
       expect(forwardCalls).toHaveLength(0)
-    })
-
-    it('U-TY-08b: forwards when .replied text differs from .forward text (different content)', async () => {
-      const bot = makeBotApi()
-      const fsApi = makeFsApi()
-      const mgr = createWorkingStateManager(TYPING_DIR, bot, fsApi)
-
-      mgr.start(CHAT_ID)
-      // Agent replied with a status update, but result text is different
-      fsApi._files.set(`${TYPING_DIR}/${CHAT_ID}.forward`, JSON.stringify({ text: 'Final result text', format: 'text' }))
-      fsApi._files.set(`${TYPING_DIR}/${CHAT_ID}.replied`, 'Different earlier reply')
-
-      // Remove signal file to trigger stop on next tick
-      fsApi._files.delete(`${TYPING_DIR}/${CHAT_ID}`)
-      jest.advanceTimersByTime(TYPING_INTERVAL_MS)
-      await Promise.resolve()
-      await Promise.resolve()
-      await Promise.resolve()
-
-      // sendMessage SHOULD be called with forward text — it's not a duplicate
-      expect(bot.sendMessage).toHaveBeenCalledWith(CHAT_ID, 'Final result text', {})
     })
 
     it('U-TY-09: cleans up both .forward and .replied files after stop', async () => {
