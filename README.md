@@ -409,16 +409,32 @@ This switches `dmPolicy` to `pairing`, prints pairing instructions, and reminds 
 
 Once paired, the following bot commands are available in a private chat:
 
+**Session management**
+
+| Command | Description |
+|---------|-------------|
+| `/session` | Show current session info (name, message count, context %) |
+| `/sessions` | List all sessions with inline keyboard — switch or delete |
+| `/new <name>` | Create a new session, optionally with a name |
+| `/rename <name>` | Rename the current session |
+| `/clear` | Clear current session history (with confirmation) |
+| `/compact` | Summarise old history and keep only recent messages |
+| `/restart` | Graceful session restart — shows a confirmation button; confirms and notifies when the session is back online |
+
+**Agent**
+
+| Command | Description |
+|---------|-------------|
+| `/model` | Show the current AI model |
+| `/models` | Switch AI model — shows an inline keyboard; selecting a model triggers a graceful restart and notifies when back online |
+
+**Account**
+
 | Command | Description |
 |---------|-------------|
 | `/start` | Pairing instructions |
-| `/help` | Show available commands |
 | `/status` | Check your pairing state |
-| `/model` | Show the current AI model |
-| `/models` | Switch AI model — shows an inline keyboard; selecting a model triggers a graceful restart and notifies when back online |
-| `/restart` | Graceful session restart — shows a confirmation button; confirms and notifies when the session is back online |
-
-> **Note:** `/model`, `/models`, and `/restart` require the agent to be running in `TELEGRAM_RECEIVER_MODE` with a reachable `CLAUDE_CHANNEL_CALLBACK` endpoint. If no active session exists when switching model or restarting, the change is applied immediately and a success message is shown without a restart.
+| `/help` | Show available commands |
 
 ---
 
