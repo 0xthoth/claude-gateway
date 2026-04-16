@@ -8,10 +8,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import supertest from 'supertest';
-import { loadWorkspace, watchWorkspace, markBootstrapComplete, deleteBootstrap } from '../../src/workspace-loader';
-import { MemoryManager } from '../../src/memory-manager';
-import { AgentRunner } from '../../src/agent-runner';
-import { GatewayRouter } from '../../src/gateway-router';
+import { loadWorkspace, watchWorkspace, markBootstrapComplete, deleteBootstrap } from '../../src/agent/workspace-loader';
+import { MemoryManager } from '../../src/memory/manager';
+import { AgentRunner } from '../../src/agent/runner';
+import { GatewayRouter } from '../../src/api/gateway-router';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 
 // ─── helpers ────────────────────────────────────────────────────────────────

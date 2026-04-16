@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { GatewayConfig, AgentConfig } from './types';
+import { GatewayConfig, AgentConfig } from '../types';
 
 export class ConfigValidationError extends Error {
   constructor(message: string) {

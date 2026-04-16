@@ -1,4 +1,4 @@
-import { TelegramModule } from '../../mcp/gateway/tools/telegram/module';
+import { TelegramModule } from '../../mcp/tools/telegram/module';
 
 describe('TelegramModule', () => {
   let originalEnv: NodeJS.ProcessEnv;

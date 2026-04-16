@@ -1,4 +1,4 @@
-import type { ChannelModule, ToolModule, McpToolDefinition, ToolVisibility, ChannelId } from '../../mcp/gateway/types';
+import type { ChannelModule, ToolModule, McpToolDefinition, ToolVisibility, ChannelId } from '../../mcp/types';
 
 type AnyModule = ChannelModule | ToolModule;
 

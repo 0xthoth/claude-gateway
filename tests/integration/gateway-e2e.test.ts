@@ -9,10 +9,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import supertest from 'supertest';
-import { AgentRunner } from '../../src/agent-runner';
-import { GatewayRouter } from '../../src/gateway-router';
+import { AgentRunner } from '../../src/agent/runner';
+import { GatewayRouter } from '../../src/api/gateway-router';
 import { AgentConfig, GatewayConfig } from '../../src/types';
-import { loadWorkspace } from '../../src/workspace-loader';
+import { loadWorkspace } from '../../src/agent/workspace-loader';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -362,7 +362,7 @@ describe('Gateway E2E (Option A — monitoring only)', () => {
 
   // ─── I-E2E-11: Session store works correctly ──────────────────────────────
   it('I-E2E-11: Session persisted to .jsonl after message stored', async () => {
-    const { SessionStore } = await import('../../src/session-store');
+    const { SessionStore } = await import('../../src/session/store');
 
     const baseDir = createTempDir('e2e-11-sessions-');
     const store = new SessionStore(baseDir);

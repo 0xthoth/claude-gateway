@@ -9,7 +9,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
-import { CronManager } from '../../src/cron-manager';
+import { CronManager } from '../../src/cron/manager';
 import { CronJobCreate, AgentConfig } from '../../src/types';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

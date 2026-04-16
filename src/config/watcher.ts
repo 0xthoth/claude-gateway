@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
 import chokidar from 'chokidar';
-import { loadConfig } from './config-loader';
-import { AgentConfig, GatewayConfig, Logger } from './types';
+import { loadConfig } from './loader';
+import { AgentConfig, GatewayConfig, Logger } from '../types';
 
 // Fields that can be hot-reloaded without restarting the gateway
 const HOT_RELOADABLE_AGENT_FIELDS: string[] = [

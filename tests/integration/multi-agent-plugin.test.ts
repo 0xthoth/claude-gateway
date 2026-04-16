@@ -13,7 +13,7 @@ import {
   saveAccess,
   pruneExpired,
   Access,
-} from '../../mcp/gateway/tools/telegram/pure'
+} from '../../mcp/tools/telegram/pure'
 
 function makeTmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'tg-multi-test-'))

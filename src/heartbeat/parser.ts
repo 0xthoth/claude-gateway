@@ -1,5 +1,5 @@
 import * as yaml from 'js-yaml';
-import { HeartbeatTask } from './types';
+import { HeartbeatTask } from '../types';
 
 // ---------- Error classes ----------
 

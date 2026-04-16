@@ -1,8 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
-import { AgentRunner } from './agent-runner';
-import { AgentConfig, ApiKey } from './types';
-import { createApiAuthMiddleware, canAccessAgent } from './api-auth';
+import { AgentRunner } from '../agent/runner';
+import { AgentConfig, ApiKey } from '../types';
+import { createApiAuthMiddleware, canAccessAgent } from './auth';
 
 const MAX_MESSAGE_LENGTH = 10_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -63,7 +63,7 @@ export function createApiRouter(
       let cleanup: (() => void) | undefined;
       try {
         const sseCallbacks = {
-          onChunk: (event: import('./types').StreamEvent) => {
+          onChunk: (event: import('../types').StreamEvent) => {
             try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch { /* client gone */ }
           },
           onDone: (fullText: string) => {

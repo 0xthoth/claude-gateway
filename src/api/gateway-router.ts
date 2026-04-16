@@ -1,11 +1,11 @@
 import express, { Request, Response } from 'express';
 import { Server } from 'http';
-import { AgentRunner } from './agent-runner';
-import { AgentConfig, AgentStats, ApiKey, GatewayConfig, HeartbeatResult } from './types';
-import { CronScheduler } from './cron-scheduler';
-import { CronManager } from './cron-manager';
-import { generateDashboardHtml } from './web-ui';
-import { createApiRouter } from './api-router';
+import { AgentRunner } from '../agent/runner';
+import { AgentConfig, AgentStats, ApiKey, GatewayConfig, HeartbeatResult } from '../types';
+import { CronScheduler } from '../cron/scheduler';
+import { CronManager } from '../cron/manager';
+import { generateDashboardHtml } from '../ui/web-ui';
+import { createApiRouter } from './router';
 import { createCronRouter } from './cron-router';
 
 export class GatewayRouter {

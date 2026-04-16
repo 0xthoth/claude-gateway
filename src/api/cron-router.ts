@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
-import { CronManager } from './cron-manager';
-import { ApiKey, CronJobCreate, CronJobUpdate } from './types';
-import { createApiAuthMiddleware, canAccessAgent } from './api-auth';
+import { CronManager } from '../cron/manager';
+import { ApiKey, CronJobCreate, CronJobUpdate } from '../types';
+import { createApiAuthMiddleware, canAccessAgent } from './auth';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 

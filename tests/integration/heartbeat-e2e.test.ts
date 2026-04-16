@@ -12,10 +12,10 @@ import * as os from 'os';
 import * as http from 'http';
 import express from 'express';
 import supertest from 'supertest';
-import { AgentRunner } from '../../src/agent-runner';
-import { GatewayRouter } from '../../src/gateway-router';
-import { CronScheduler } from '../../src/cron-scheduler';
-import { HeartbeatHistory } from '../../src/heartbeat-history';
+import { AgentRunner } from '../../src/agent/runner';
+import { GatewayRouter } from '../../src/api/gateway-router';
+import { CronScheduler } from '../../src/cron/scheduler';
+import { HeartbeatHistory } from '../../src/heartbeat/history';
 import { AgentConfig, GatewayConfig, HeartbeatResult } from '../../src/types';
 
 // ─── constants ────────────────────────────────────────────────────────────────

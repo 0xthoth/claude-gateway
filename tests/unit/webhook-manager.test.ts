@@ -7,7 +7,7 @@
 import * as http from 'http';
 import * as net from 'net';
 import express from 'express';
-import { registerWebhook, deleteWebhook, getWebhookInfo, WebhookInfo } from '../../src/webhook-manager';
+import { registerWebhook, deleteWebhook, getWebhookInfo, WebhookInfo } from '../../src/webhook/manager';
 
 // ─── Minimal mock Telegram server ───────────────────────────────────────────
 

@@ -1,9 +1,9 @@
 import { EventEmitter } from 'events';
 import * as nodeCron from 'node-cron';
-import { parseHeartbeat } from './heartbeat-parser';
-import { AgentRunner } from './agent-runner';
-import { AgentConfig, HeartbeatResult, Logger } from './types';
-import { HeartbeatHistory } from './heartbeat-history';
+import { parseHeartbeat } from '../heartbeat/parser';
+import { AgentRunner } from '../agent/runner';
+import { AgentConfig, HeartbeatResult, Logger } from '../types';
+import { HeartbeatHistory } from '../heartbeat/history';
 
 const DEFAULT_RATE_LIMIT_MINUTES = 30;
 

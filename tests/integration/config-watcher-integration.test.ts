@@ -7,9 +7,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { ConfigWatcher, ConfigChange } from '../../src/config-watcher';
+import { ConfigWatcher, ConfigChange } from '../../src/config/watcher';
 import { GatewayConfig, Logger } from '../../src/types';
-import { loadConfig } from '../../src/config-loader';
+import { loadConfig } from '../../src/config/loader';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 

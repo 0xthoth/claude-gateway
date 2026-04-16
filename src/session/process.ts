@@ -4,9 +4,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import chokidar from 'chokidar';
-import { AgentConfig, GatewayConfig } from './types';
-import { SessionStore } from './session-store';
-import { createLogger } from './logger';
+import { AgentConfig, GatewayConfig } from '../types';
+import { SessionStore } from './store';
+import { createLogger } from '../logger';
 
 const MAX_HISTORY_MESSAGES = 50;
 const AUTO_RESTART_DELAY_MS = 5_000;
@@ -179,7 +179,7 @@ export class SessionProcess extends EventEmitter {
     const sessionDir = path.join(this.agentConfig.workspace, '.sessions', this.sessionId);
     fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
-    const mcpServerPath = path.resolve(__dirname, '..', 'mcp', 'gateway', 'server.ts');
+    const mcpServerPath = path.resolve(__dirname, '..', '..', 'mcp', 'server.ts');
 
     // Merge stdio servers from Claude Code user + project configs (project overrides user).
     // Skip "telegram" and "gateway" from both — gateway always generates its own config below.
@@ -205,6 +205,8 @@ export class SessionProcess extends EventEmitter {
             GATEWAY_API_URL: process.env.GATEWAY_API_URL ?? `http://127.0.0.1:${process.env.PORT ?? '3000'}`,
             GATEWAY_API_KEY: this.findApiKeyForAgent(this.agentConfig.id),
             GATEWAY_ORIGIN_CHANNEL: 'telegram',
+            GATEWAY_WORKSPACE_DIR: this.agentConfig.workspace,
+            GATEWAY_SHARED_SKILLS_DIR: path.join(os.homedir(), '.claude-gateway', 'shared-skills'),
           },
         },
       },

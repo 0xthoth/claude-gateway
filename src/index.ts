@@ -9,16 +9,17 @@ function expandTilde(p: string): string {
   }
   return p;
 }
-import { loadConfig } from './config-loader';
-import { detectMigration, applyMigration, loadCleanTemplate } from './config-migrator';
-import { loadWorkspace, watchWorkspace, markBootstrapComplete, migrateWorkspaceFiles } from './workspace-loader';
-import { AgentRunner } from './agent-runner';
-import { CronScheduler } from './cron-scheduler';
-import { CronManager } from './cron-manager';
-import { GatewayRouter } from './gateway-router';
-import { ContextIsolationGuard } from './context-isolation';
+import { loadConfig } from './config/loader';
+import { detectMigration, applyMigration, loadCleanTemplate } from './config/migrator';
+import { loadWorkspace, watchWorkspace, markBootstrapComplete, migrateWorkspaceFiles } from './agent/workspace-loader';
+import { watchSkills } from './skills';
+import { AgentRunner } from './agent/runner';
+import { CronScheduler } from './cron/scheduler';
+import { CronManager } from './cron/manager';
+import { GatewayRouter } from './api/gateway-router';
+import { ContextIsolationGuard } from './agent/context-isolation';
 import { createLogger } from './logger';
-import { ConfigWatcher, ConfigChange } from './config-watcher';
+import { ConfigWatcher, ConfigChange } from './config/watcher';
 import { AgentConfig, GatewayConfig } from './types';
 
 // ─── Simple argument parsing (no heavy deps) ──────────────────────────────────
@@ -212,9 +213,15 @@ async function main(): Promise<void> {
     }
 
     // Load workspace
+    const mcpToolsDir = path.resolve(__dirname, '..', 'mcp', 'tools');
+    const sharedSkillsDir = path.join(os.homedir(), '.claude-gateway', 'shared-skills');
     let workspace;
     try {
-      workspace = await loadWorkspace(agentConfig.workspace);
+      workspace = await loadWorkspace(agentConfig.workspace, {
+        mcpToolsDir,
+        sharedSkillsDir,
+        logger,
+      });
     } catch (err) {
       const reason = (err as Error).message;
       logger.error('Failed to load workspace', { error: reason });
@@ -245,6 +252,9 @@ async function main(): Promise<void> {
     let runner: AgentRunner;
     try {
       runner = new AgentRunner(agentConfig, config, logger);
+      if (workspace.skillRegistry) {
+        runner.setSkillRegistry(workspace.skillRegistry);
+      }
       await runner.start();
     } catch (err) {
       const reason = (err as Error).message;
@@ -283,7 +293,11 @@ async function main(): Promise<void> {
     watchWorkspace(agentConfig.workspace, async () => {
       logger.info('Workspace changed, reloading');
       try {
-        const updated = await loadWorkspace(agentConfig.workspace);
+        const updated = await loadWorkspace(agentConfig.workspace, {
+          mcpToolsDir,
+          sharedSkillsDir,
+          logger,
+        });
         // Rewrite CLAUDE.md with updated system prompt and restart subprocess
         await fs.promises.writeFile(
           path.join(agentConfig.workspace, 'CLAUDE.md'),
@@ -291,11 +305,44 @@ async function main(): Promise<void> {
           'utf8',
         );
         logger.info('Updated CLAUDE.md, restarting runner');
+        if (updated.skillRegistry) {
+          runner.setSkillRegistry(updated.skillRegistry);
+        }
         await runner.restart();
         scheduler.load(updated.files.heartbeatMd);
       } catch (err) {
         logger.error('Failed to reload workspace', { error: (err as Error).message });
       }
+    });
+
+    // Watch skill directories for hot-reload (SKILL.md add/modify/delete)
+    const workspaceSkillsDir = path.join(agentConfig.workspace, 'skills');
+    watchSkills({
+      dirs: [workspaceSkillsDir, mcpToolsDir, sharedSkillsDir],
+      onChange: async () => {
+        logger.info('Skills changed, reloading registry');
+        try {
+          const updated = await loadWorkspace(agentConfig.workspace, {
+            mcpToolsDir,
+            sharedSkillsDir,
+            logger,
+          });
+          if (updated.skillRegistry) {
+            runner.setSkillRegistry(updated.skillRegistry);
+          }
+          // Rewrite CLAUDE.md with updated skills section
+          await fs.promises.writeFile(
+            path.join(agentConfig.workspace, 'CLAUDE.md'),
+            updated.systemPrompt,
+            'utf8',
+          );
+          logger.info('Skills registry updated', {
+            count: updated.skillRegistry?.skills.size ?? 0,
+          });
+        } catch (err) {
+          logger.error('Failed to reload skills', { error: (err as Error).message });
+        }
+      },
     });
 
     startupResults.push({ id: agentConfig.id, status: 'started', workspace: agentConfig.workspace });

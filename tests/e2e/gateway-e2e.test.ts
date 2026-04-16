@@ -3,11 +3,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { MockGatewayAPI } from './fixtures/mock-gateway-api';
 import { MockTelegramServer } from './fixtures/mock-telegram-server';
-import { CronModule } from '../../mcp/gateway/tools/cron/module';
-import { TelegramModule } from '../../mcp/gateway/tools/telegram/module';
-import { createChannelManager } from '../../mcp/gateway/channel-manager';
-import { resolveRoute, buildChannelContext, renderChannelContextSection } from '../../mcp/gateway/router';
-import type { ChannelModule, InboundMessage, InboundMessageHandler, ChannelId, McpToolDefinition } from '../../mcp/gateway/types';
+import { CronModule } from '../../mcp/tools/cron/module';
+import { TelegramModule } from '../../mcp/tools/telegram/module';
+import { createChannelManager } from '../../mcp/channel-manager';
+import { resolveRoute, buildChannelContext, renderChannelContextSection } from '../../mcp/router';
+import type { ChannelModule, InboundMessage, InboundMessageHandler, ChannelId, McpToolDefinition } from '../../mcp/types';
 
 function createTestMessage(overrides: Partial<InboundMessage> = {}): InboundMessage {
   return {

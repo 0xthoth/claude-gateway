@@ -6,10 +6,10 @@
  */
 
 import { EventEmitter } from 'events';
-import { CronScheduler } from '../../src/cron-scheduler';
-import { HeartbeatHistory } from '../../src/heartbeat-history';
+import { CronScheduler } from '../../src/cron/scheduler';
+import { HeartbeatHistory } from '../../src/heartbeat/history';
 import { AgentConfig, GatewayConfig, HeartbeatResult } from '../../src/types';
-import { AgentRunner } from '../../src/agent-runner';
+import { AgentRunner } from '../../src/agent/runner';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 

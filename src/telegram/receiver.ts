@@ -1,7 +1,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
-import { AgentConfig } from './types';
-import { createLogger } from './logger';
+import { AgentConfig } from '../types';
+import { createLogger } from '../logger';
 
 const AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_RESTARTS = 3;
@@ -27,7 +27,7 @@ export class TelegramReceiver {
   }
 
   private spawnProcess(): void {
-    const receiverPath = path.resolve(__dirname, '..', 'mcp', 'gateway', 'tools', 'telegram', 'receiver-server.ts');
+    const receiverPath = path.resolve(__dirname, '..', '..', 'mcp', 'tools', 'telegram', 'receiver-server.ts');
     const stateDir = path.join(this.agentConfig.workspace, '.telegram-state');
 
     this.process = spawn('bun', [receiverPath], {

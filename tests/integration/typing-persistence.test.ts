@@ -57,9 +57,9 @@ jest.mock('child_process', () => ({
 
 // ── Imports (after mock) ────────────────────────────────────────────────────
 
-import { AgentRunner } from '../../src/agent-runner';
+import { AgentRunner } from '../../src/agent/runner';
 import { AgentConfig, GatewayConfig } from '../../src/types';
-import { SessionProcess } from '../../src/session-process';
+import { SessionProcess } from '../../src/session/process';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

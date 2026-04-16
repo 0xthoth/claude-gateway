@@ -1,4 +1,4 @@
-import { AgentConfig } from './types';
+import { AgentConfig } from '../types';
 
 export class WorkspaceConflictError extends Error {
   constructor(public readonly agentIds: [string, string], public readonly workspace: string) {

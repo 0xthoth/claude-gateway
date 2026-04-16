@@ -72,8 +72,8 @@ jest.mock('child_process', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 
-import { SessionProcess } from '../../src/session-process';
-import { SessionStore } from '../../src/session-store';
+import { SessionProcess } from '../../src/session/process';
+import { SessionStore } from '../../src/session/store';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -25,5 +25,5 @@ pair: ## Approve a Telegram pairing (e.g. make pair agent=alfred code=abc123)
 	./node_modules/.bin/ts-node scripts/pair.ts --agent=$(agent) --code=$(code)
 
 mcp-install: ## Install MCP gateway dependencies
-	cd mcp/gateway && bun install
+	cd mcp && bun install
 	node scripts/setup-claude-settings.js

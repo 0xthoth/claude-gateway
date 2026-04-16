@@ -3,13 +3,14 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, ModelConfig, StreamEvent } from './types';
-import { createLogger } from './logger';
-import { SessionProcess } from './session-process';
-import { SessionStore } from './session-store';
-import { SessionCompactor } from './session-compactor';
-import { TelegramReceiver } from './telegram-receiver';
-import { hasMarkdown, toTelegramHtml } from './markdown';
+import { AgentConfig, GatewayConfig, Logger, ModelConfig, StreamEvent } from '../types';
+import { createLogger } from '../logger';
+import { SessionProcess } from '../session/process';
+import { SessionStore } from '../session/store';
+import { SessionCompactor } from '../session/compactor';
+import { TelegramReceiver } from '../telegram/receiver';
+import { hasMarkdown, toTelegramHtml } from '../telegram/markdown';
+import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
@@ -39,6 +40,9 @@ export class AgentRunner extends EventEmitter {
   // Tracks session IDs with an in-flight API request (prevents concurrent turns)
   private readonly pendingApiSessions = new Set<string>();
 
+  // Skill registry for detecting /skill-name commands in user messages
+  private skillRegistry: SkillRegistry = { skills: new Map() };
+
   // Path to gateway config.json for persisting model changes
   private readonly configPath: string;
 
@@ -57,6 +61,13 @@ export class AgentRunner extends EventEmitter {
     this.idleTimeoutMs =
       (agentConfig.session?.idleTimeoutMinutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES) * 60 * 1000;
     this.maxConcurrent = agentConfig.session?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+  }
+
+  /**
+   * Update the skill registry used for detecting /skill-name commands.
+   */
+  setSkillRegistry(registry: SkillRegistry): void {
+    this.skillRegistry = registry;
   }
 
   /**
@@ -126,7 +137,19 @@ export class AgentRunner extends EventEmitter {
               });
               // Route to session process (map key = chatId, actual sessionId passed separately)
               const session = await this.getOrSpawnSession(chatId, 'telegram', sessionId);
-              const channelXml = AgentRunner.buildChannelXml(params);
+              let channelXml = AgentRunner.buildChannelXml(params);
+
+              // Detect skill commands and inject skill content
+              const skillInvocation = detectSkillCommand(content, this.skillRegistry);
+              if (skillInvocation) {
+                channelXml += formatSkillContext(skillInvocation);
+                this.logger.info('Skill invoked', {
+                  skill: skillInvocation.skillKey,
+                  args: skillInvocation.args,
+                  chatId,
+                });
+              }
+
               session.sendMessage(channelXml);
               session.touch();
               this.logger.debug('Injected channel turn into session', {

@@ -14,6 +14,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { TelegramModule } from './tools/telegram/module';
 import { CronModule } from './tools/cron/module';
+import { SkillsModule } from './tools/skills/module';
 import type { ChannelModule, ToolModule, McpToolDefinition } from './types';
 
 const ORIGIN_CHANNEL = process.env.GATEWAY_ORIGIN_CHANNEL ?? '';
@@ -27,6 +28,7 @@ function isChannelModule(mod: AnyModule): mod is ChannelModule {
 const modules: AnyModule[] = [
   new TelegramModule(),
   new CronModule(),
+  new SkillsModule(),
 ];
 
 // Build tool-to-module mapping for enabled modules

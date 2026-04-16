@@ -12,19 +12,19 @@ import * as http from 'http';
 import express from 'express';
 import supertest from 'supertest';
 
-import { loadConfig, MissingEnvVarError, DuplicateAgentIdError, ConfigValidationError } from '../../src/config-loader';
-import { loadWorkspace, markBootstrapComplete, deleteBootstrap, watchWorkspace } from '../../src/workspace-loader';
-import { MemoryManager } from '../../src/memory-manager';
-import { parseHeartbeat, InvalidCronError } from '../../src/heartbeat-parser';
-import { SessionStore } from '../../src/session-store';
+import { loadConfig, MissingEnvVarError, DuplicateAgentIdError, ConfigValidationError } from '../../src/config/loader';
+import { loadWorkspace, markBootstrapComplete, deleteBootstrap, watchWorkspace } from '../../src/agent/workspace-loader';
+import { MemoryManager } from '../../src/memory/manager';
+import { parseHeartbeat, InvalidCronError } from '../../src/heartbeat/parser';
+import { SessionStore } from '../../src/session/store';
 import { isAllowed } from '../../src/security';
-import { GatewayRouter } from '../../src/gateway-router';
-import { AgentRunner } from '../../src/agent-runner';
-import { ContextIsolationGuard, TokenConflictError, WorkspaceConflictError } from '../../src/context-isolation';
-import { registerWebhook, getWebhookInfo } from '../../src/webhook-manager';
+import { GatewayRouter } from '../../src/api/gateway-router';
+import { AgentRunner } from '../../src/agent/runner';
+import { ContextIsolationGuard, TokenConflictError, WorkspaceConflictError } from '../../src/agent/context-isolation';
+import { registerWebhook, getWebhookInfo } from '../../src/webhook/manager';
 import { AgentConfig, GatewayConfig, HeartbeatResult } from '../../src/types';
-import { HeartbeatHistory } from '../../src/heartbeat-history';
-import { CronScheduler } from '../../src/cron-scheduler';
+import { HeartbeatHistory } from '../../src/heartbeat/history';
+import { CronScheduler } from '../../src/cron/scheduler';
 import { EventEmitter } from 'events';
 
 // ─── constants ───────────────────────────────────────────────────────────────

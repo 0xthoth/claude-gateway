@@ -1,11 +1,11 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { ConfigWatcher, ConfigChange, _deepEqual } from '../../src/config-watcher';
+import { ConfigWatcher, ConfigChange, _deepEqual } from '../../src/config/watcher';
 import { GatewayConfig, AgentConfig, Logger, ApiKey } from '../../src/types';
-import { loadConfig } from '../../src/config-loader';
-import { GatewayRouter } from '../../src/gateway-router';
-import { CronScheduler } from '../../src/cron-scheduler';
+import { loadConfig } from '../../src/config/loader';
+import { GatewayRouter } from '../../src/api/gateway-router';
+import { CronScheduler } from '../../src/cron/scheduler';
 
 const FIXTURES = path.join(__dirname, '../fixtures/configs');
 
@@ -542,7 +542,7 @@ describe('config-watcher', () => {
       removeListener: jest.fn(),
       sendMessage: jest.fn(),
       isRunning: jest.fn().mockReturnValue(true),
-    } as unknown as import('../../src/agent-runner').AgentRunner;
+    } as unknown as import('../../src/agent/runner').AgentRunner;
 
     const scheduler = new CronScheduler('alfred', mockRunner, logger, agentConfig);
 
@@ -572,7 +572,7 @@ describe('config-watcher', () => {
       removeListener: jest.fn(),
       sendMessage: jest.fn(),
       isRunning: jest.fn().mockReturnValue(true),
-    } as unknown as import('../../src/agent-runner').AgentRunner;
+    } as unknown as import('../../src/agent/runner').AgentRunner;
 
     const scheduler = new CronScheduler('alfred', mockRunner, logger, agentConfig);
 

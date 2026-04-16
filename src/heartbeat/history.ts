@@ -1,4 +1,4 @@
-import { HeartbeatResult } from './types';
+import { HeartbeatResult } from '../types';
 
 const MAX_ENTRIES_PER_AGENT = 100;
 

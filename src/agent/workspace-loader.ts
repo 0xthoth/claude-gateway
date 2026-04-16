@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import chokidar from 'chokidar';
-import { WorkspaceFiles, LoadedWorkspace, WatchHandle } from './types';
+import { WorkspaceFiles, LoadedWorkspace, WatchHandle } from '../types';
+import { loadSkills, renderSkillsSection } from '../skills';
 
 export class MissingRequiredFileError extends Error {
   constructor(fileName: string) {
@@ -71,10 +72,16 @@ export function migrateWorkspaceFiles(workspaceDir: string): void {
   }
 }
 
+export interface LoadWorkspaceOptions {
+  mcpToolsDir?: string;
+  sharedSkillsDir?: string;
+  logger?: { warn: (msg: string) => void };
+}
+
 /**
  * Load workspace markdown files and assemble the system prompt.
  */
-export async function loadWorkspace(workspaceDir: string): Promise<LoadedWorkspace> {
+export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOptions): Promise<LoadedWorkspace> {
   const agentMdPath = path.join(workspaceDir, 'AGENTS.md');
 
   // AGENTS.md is required
@@ -111,6 +118,15 @@ export async function loadWorkspace(workspaceDir: string): Promise<LoadedWorkspa
   const memoryMd = truncateResult(rawMemory);
   const bootstrapMd = rawBootstrap !== null ? truncateResult(rawBootstrap) : null;
 
+  // Load agent skills
+  const skillRegistry = loadSkills({
+    workspaceDir,
+    mcpToolsDir: opts?.mcpToolsDir,
+    sharedSkillsDir: opts?.sharedSkillsDir,
+    logger: opts?.logger,
+  });
+  const skillsSection = renderSkillsSection(skillRegistry);
+
   // Assemble system prompt (bootstrap not included in prompt sections)
   let systemPrompt =
     `--- AGENT IDENTITY ---\n${agentMd}\n\n` +
@@ -118,6 +134,7 @@ export async function loadWorkspace(workspaceDir: string): Promise<LoadedWorkspa
     `--- SOUL ---\n${soulMd}\n\n` +
     `--- USER PROFILE ---\n${userMd}\n\n` +
     `--- AVAILABLE TOOLS ---\n${toolsMd}\n\n` +
+    (skillsSection ? `--- AVAILABLE SKILLS ---\n${skillsSection}\n\n` : '') +
     `--- LONG-TERM MEMORY ---\n${memoryMd}\n\n` +
     `--- HEARTBEAT CONFIG ---\n${heartbeatMd}`;
 
@@ -143,6 +160,7 @@ export async function loadWorkspace(workspaceDir: string): Promise<LoadedWorkspa
     systemPrompt,
     files,
     truncated: anyTruncated,
+    skillRegistry,
   };
 }
 

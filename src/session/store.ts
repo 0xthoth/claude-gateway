@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import PQueue from 'p-queue';
-import { Message, SessionIndex, SessionMeta } from './types';
+import { Message, SessionIndex, SessionMeta } from '../types';
 
 export class SessionStore {
   private readonly agentsBaseDir: string;

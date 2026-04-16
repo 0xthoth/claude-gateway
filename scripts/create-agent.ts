@@ -20,10 +20,10 @@ import * as readline from 'readline';
 import * as https from 'https';
 import { randomBytes } from 'crypto';
 import { spawnSync } from 'child_process';
-import { loadWorkspace } from '../src/workspace-loader';
+import { loadWorkspace } from '../src/agent/workspace-loader';
 import { buildGenerationPrompt, parseGeneratedFiles } from './create-agent-prompts';
 import { interactiveSelect } from './interactive-select';
-import { loadCleanTemplate, stripIgnoredPaths } from '../src/config-migrator';
+import { loadCleanTemplate, stripIgnoredPaths } from '../src/config/migrator';
 
 // ---------------------------------------------------------------------------
 // Path helpers

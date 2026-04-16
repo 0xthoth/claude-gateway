@@ -1,7 +1,7 @@
 /**
- * Unit tests for hasMarkdown() and toTelegramHtml() from src/markdown.ts
+ * Unit tests for hasMarkdown() and toTelegramHtml() from src/telegram/markdown.ts
  */
-import { hasMarkdown, toTelegramHtml } from '../../../src/markdown'
+import { hasMarkdown, toTelegramHtml } from '../../../src/telegram/markdown'
 
 describe('hasMarkdown()', () => {
   test('detects **bold**', () => {

@@ -12,8 +12,8 @@ import {
   CronManagerConfig,
   Logger,
   AgentConfig,
-} from './types';
-import type { AgentRunner } from './agent-runner';
+} from '../types';
+import type { AgentRunner } from '../agent/runner';
 
 const DEFAULT_STORE_PATH = path.join(
   process.env.HOME ?? '/tmp',

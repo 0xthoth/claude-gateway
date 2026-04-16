@@ -8,7 +8,7 @@ import {
   migrateWorkspaceFiles,
   watchWorkspace,
   MissingRequiredFileError,
-} from '../../src/workspace-loader';
+} from '../../src/agent/workspace-loader';
 
 const FIXTURES = path.join(__dirname, '../fixtures/workspaces');
 

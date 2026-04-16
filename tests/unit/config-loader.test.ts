@@ -6,7 +6,7 @@ import {
   ConfigValidationError,
   DuplicateAgentIdError,
   MissingEnvVarError,
-} from '../../src/config-loader';
+} from '../../src/config/loader';
 
 const FIXTURES = path.join(__dirname, '../fixtures/configs');
 

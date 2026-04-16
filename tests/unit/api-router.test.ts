@@ -2,7 +2,7 @@ import express from 'express';
 import { EventEmitter } from 'events';
 import * as supertest from 'supertest';
 import * as http from 'http';
-import { createApiRouter } from '../../src/api-router';
+import { createApiRouter } from '../../src/api/router';
 import { AgentConfig, ApiKey, StreamEvent } from '../../src/types';
 
 // ── Minimal mock AgentRunner ─────────────────────────────────────────────────
@@ -76,7 +76,7 @@ const apiKeys: ApiKey[] = [
 
 function buildApp(runnerImpl: (sessionId: string, msg: string) => Promise<string>) {
   const runner = new MockAgentRunner(runnerImpl);
-  const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent-runner').AgentRunner]]);
+  const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
   const configs = new Map([[AGENT_ID, agentConfig]]);
   const app = express();
   app.use(express.json());
@@ -93,7 +93,7 @@ function buildStreamApp(
 ): { app: express.Express; runner: MockAgentRunner } {
   const runner = new MockAgentRunner(async () => 'ok');
   runner.sendApiMessageStreamImpl = streamImpl;
-  const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent-runner').AgentRunner]]);
+  const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
   const configs = new Map([[AGENT_ID, agentConfig]]);
   const app = express();
   app.use(express.json());
@@ -195,7 +195,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
     // Use a key that only accesses a different agent
     const restrictedKeys: ApiKey[] = [{ key: 'sk-test-app', agents: ['other-agent'] }];
     const runner = new MockAgentRunner(async () => 'ok');
-    const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent-runner').AgentRunner]]);
+    const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
     const configs = new Map([[AGENT_ID, agentConfig]]);
     const restrictedApp = express();
     restrictedApp.use(express.json());

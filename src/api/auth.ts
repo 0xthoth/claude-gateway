@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { timingSafeEqual } from 'crypto';
-import { ApiKey } from './types';
+import { ApiKey } from '../types';
 
 /**
  * Express middleware that validates the Bearer token or X-Api-Key header

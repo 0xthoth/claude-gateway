@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawnSync } from 'child_process';
-import { Message } from './types';
-import { SessionStore } from './session-store';
+import { Message } from '../types';
+import { SessionStore } from './store';
 
 export interface CompactionResult {
   beforeMessages: number;
