@@ -97,6 +97,7 @@ export interface LoadedWorkspace {
   systemPrompt: string;
   files: WorkspaceFiles;
   truncated: boolean;
+  skillRegistry?: import('./skills').SkillRegistry;
 }
 
 export interface Message {
