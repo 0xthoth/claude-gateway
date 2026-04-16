@@ -83,6 +83,7 @@ describe('workspace-loader', () => {
     const result = await loadWorkspace(path.join(FIXTURES, 'valid-full'));
     const prompt = result.systemPrompt;
 
+    const memoryRuleIdx = prompt.indexOf('--- MEMORY RULE ---');
     const agentIdx = prompt.indexOf('--- AGENT IDENTITY ---');
     const identityIdx = prompt.indexOf('--- IDENTITY ---');
     const soulIdx = prompt.indexOf('--- SOUL ---');
@@ -90,7 +91,8 @@ describe('workspace-loader', () => {
     const memoryIdx = prompt.indexOf('--- LONG-TERM MEMORY ---');
     const heartbeatIdx = prompt.indexOf('--- HEARTBEAT CONFIG ---');
 
-    expect(agentIdx).toBeGreaterThanOrEqual(0);
+    expect(memoryRuleIdx).toBeGreaterThanOrEqual(0);
+    expect(agentIdx).toBeGreaterThan(memoryRuleIdx);
     expect(identityIdx).toBeGreaterThan(agentIdx);
     expect(soulIdx).toBeGreaterThan(identityIdx);
     expect(userIdx).toBeGreaterThan(soulIdx);
@@ -109,6 +111,17 @@ describe('workspace-loader', () => {
     expect(result.systemPrompt).toContain('--- USER PROFILE ---');
     expect(result.systemPrompt).toContain('--- LONG-TERM MEMORY ---');
     expect(result.systemPrompt).toContain('--- HEARTBEAT CONFIG ---');
+    expect(result.systemPrompt).toContain('--- MEMORY RULE ---');
+  });
+
+  // -------------------------------------------------------------------------
+  // TC-1: Memory rule is injected into system prompt
+  // -------------------------------------------------------------------------
+  it('TC-1: system prompt contains memory rule text', async () => {
+    const result = await loadWorkspace(path.join(FIXTURES, 'valid-full'));
+    expect(result.systemPrompt).toContain('## Memory Rule');
+    expect(result.systemPrompt).toContain('MEMORY.md');
+    expect(result.systemPrompt).toContain('AGENTS.md');
   });
 
   // -------------------------------------------------------------------------
