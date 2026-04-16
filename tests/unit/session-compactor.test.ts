@@ -1,8 +1,8 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { SessionStore } from '../../src/session-store';
-import { SessionCompactor, NotEnoughMessagesError } from '../../src/session-compactor';
+import { SessionStore } from '../../src/session/store';
+import { SessionCompactor, NotEnoughMessagesError } from '../../src/session/compactor';
 import { Message } from '../../src/types';
 
 // ── Mock child_process.spawnSync ─────────────────────────────────────────────

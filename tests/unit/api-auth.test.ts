@@ -1,6 +1,6 @@
 import { createServer } from 'http';
 import express from 'express';
-import { createApiAuthMiddleware, canAccessAgent } from '../../src/api-auth';
+import { createApiAuthMiddleware, canAccessAgent } from '../../src/api/auth';
 import { ApiKey } from '../../src/types';
 import * as supertest from 'supertest';
 

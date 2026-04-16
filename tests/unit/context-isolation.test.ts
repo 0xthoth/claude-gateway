@@ -7,7 +7,7 @@ import {
   WorkspaceConflictError,
   TokenConflictError,
   SessionDirConflictError,
-} from '../../src/context-isolation';
+} from '../../src/agent/context-isolation';
 import { AgentConfig } from '../../src/types';
 
 function makeAgent(id: string, botToken: string, workspace: string): AgentConfig {

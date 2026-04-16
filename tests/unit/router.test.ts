@@ -3,8 +3,8 @@ import {
   buildSessionKey,
   buildChannelContext,
   renderChannelContextSection,
-} from '../../mcp/gateway/router';
-import type { InboundMessage, ResolvedRoute } from '../../mcp/gateway/types';
+} from '../../mcp/router';
+import type { InboundMessage, ResolvedRoute } from '../../mcp/types';
 
 function createTestMessage(overrides: Partial<InboundMessage> = {}): InboundMessage {
   return {

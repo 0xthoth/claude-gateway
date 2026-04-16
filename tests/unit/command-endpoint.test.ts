@@ -48,9 +48,9 @@ jest.mock('child_process', () => ({
 
 // ── Imports ─────────────────────────────────────────────────────────────────��─
 
-import { AgentRunner } from '../../src/agent-runner';
+import { AgentRunner } from '../../src/agent/runner';
 import { AgentConfig, GatewayConfig } from '../../src/types';
-import { SessionProcess } from '../../src/session-process';
+import { SessionProcess } from '../../src/session/process';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -370,7 +370,7 @@ describe('SessionProcess restart watcher notify payload', () => {
       'telegram',
       agentConfig,
       gatewayConfig,
-      sessionStore as unknown as import('../../src/session-store').SessionStore,
+      sessionStore as unknown as import('../../src/session/store').SessionStore,
     );
     await sp.start();
 
@@ -416,7 +416,7 @@ describe('SessionProcess restart watcher notify payload', () => {
       'telegram',
       agentConfig,
       gatewayConfig,
-      sessionStore as unknown as import('../../src/session-store').SessionStore,
+      sessionStore as unknown as import('../../src/session/store').SessionStore,
     );
     await sp.start();
 

@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { MemoryManager } from '../../src/memory-manager';
+import { MemoryManager } from '../../src/memory/manager';
 
 function createTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'mm-test-'));

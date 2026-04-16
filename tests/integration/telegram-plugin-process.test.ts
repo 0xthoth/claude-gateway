@@ -21,7 +21,7 @@ import * as path from 'path'
 import * as os from 'os'
 import * as net from 'net'
 
-const RECEIVER_PATH = path.resolve(__dirname, '../../mcp/gateway/tools/telegram/receiver-server.ts')
+const RECEIVER_PATH = path.resolve(__dirname, '../../mcp/tools/telegram/receiver-server.ts')
 const BOT_TOKEN = 'test_token_e2e'
 const USER_ID = '111222333'
 

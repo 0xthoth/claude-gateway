@@ -1,4 +1,4 @@
-import { CronModule } from '../../mcp/gateway/tools/cron/module';
+import { CronModule } from '../../mcp/tools/cron/module';
 
 describe('CronModule', () => {
   let originalEnv: NodeJS.ProcessEnv;

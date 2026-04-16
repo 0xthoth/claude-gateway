@@ -9,7 +9,7 @@ import {
   applyMigration,
   loadCleanTemplate,
   stripIgnoredPaths,
-} from '../../src/config-migrator';
+} from '../../src/config/migrator';
 
 describe('config-migrator', () => {
   let tmpDir: string;

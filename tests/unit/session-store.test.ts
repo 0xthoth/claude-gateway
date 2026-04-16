@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { SessionStore } from '../../src/session-store';
+import { SessionStore } from '../../src/session/store';
 import { Message } from '../../src/types';
 
 function makeMsg(role: 'user' | 'assistant', content: string): Message {

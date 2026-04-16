@@ -1,5 +1,5 @@
-import { createChannelManager } from '../../mcp/gateway/channel-manager';
-import type { ChannelModule, InboundMessageHandler, ChannelId } from '../../mcp/gateway/types';
+import { createChannelManager } from '../../mcp/channel-manager';
+import type { ChannelModule, InboundMessageHandler, ChannelId } from '../../mcp/types';
 
 function createMockModule(overrides: Partial<ChannelModule> = {}): ChannelModule {
   return {

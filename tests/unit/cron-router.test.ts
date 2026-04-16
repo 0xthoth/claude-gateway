@@ -8,8 +8,8 @@
 
 import express from 'express';
 import request from 'supertest';
-import { CronManager } from '../../src/cron-manager';
-import { createCronRouter } from '../../src/cron-router';
+import { CronManager } from '../../src/cron/manager';
+import { createCronRouter } from '../../src/api/cron-router';
 import { ApiKey } from '../../src/types';
 
 function makeLogger() {

@@ -9,7 +9,7 @@ import {
   MissingNameError,
   AmbiguousScheduleError,
   MissingScheduleError,
-} from '../../src/heartbeat-parser';
+} from '../../src/heartbeat/parser';
 
 const FIXTURES = path.join(__dirname, '../fixtures/heartbeat');
 

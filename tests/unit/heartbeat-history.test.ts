@@ -1,4 +1,4 @@
-import { HeartbeatHistory } from '../../src/heartbeat-history';
+import { HeartbeatHistory } from '../../src/heartbeat/history';
 import { HeartbeatResult } from '../../src/types';
 
 function makeResult(

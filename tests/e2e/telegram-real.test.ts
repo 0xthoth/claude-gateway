@@ -30,10 +30,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as https from 'https';
-import { AgentRunner } from '../../src/agent-runner';
-import { GatewayRouter } from '../../src/gateway-router';
+import { AgentRunner } from '../../src/agent/runner';
+import { GatewayRouter } from '../../src/api/gateway-router';
 import { AgentConfig, GatewayConfig } from '../../src/types';
-import { loadWorkspace } from '../../src/workspace-loader';
+import { loadWorkspace } from '../../src/agent/workspace-loader';
 
 // ─── env guard ───────────────────────────────────────────────────────────────
 

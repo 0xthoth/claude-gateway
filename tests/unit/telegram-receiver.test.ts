@@ -43,7 +43,7 @@ jest.mock('child_process', () => ({
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-import { TelegramReceiver } from '../../src/telegram-receiver';
+import { TelegramReceiver } from '../../src/telegram/receiver';
 import { AgentConfig } from '../../src/types';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

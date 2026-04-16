@@ -26,7 +26,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as net from 'net'
-import { AgentRunner } from '../../src/agent-runner'
+import { AgentRunner } from '../../src/agent/runner'
 import { AgentConfig, GatewayConfig } from '../../src/types'
 
 const MOCK_CLAUDE_MCP_BIN = path.resolve(__dirname, '../helpers/mock-claude-mcp.js')
@@ -370,7 +370,7 @@ describe('Pipeline MCP — Telegram → plugin → Claude Code (step-by-step)', 
 
     const gw = config.mcpServers.gateway
     expect(gw.command).toBe('bun')
-    expect(gw.args[0]).toMatch(/mcp\/gateway\/server\.ts$/)
+    expect(gw.args[0]).toMatch(/mcp\/server\.ts$/)
     expect(gw.env.TELEGRAM_BOT_TOKEN).toBe(BOT_TOKEN)
     expect(gw.env.TELEGRAM_STATE_DIR).toMatch(/\.telegram-state$/)
   })

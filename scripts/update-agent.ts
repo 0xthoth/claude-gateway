@@ -14,7 +14,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as readline from 'readline';
 import { spawnSync } from 'child_process';
-import { loadWorkspace } from '../src/workspace-loader';
+import { loadWorkspace } from '../src/agent/workspace-loader';
 import { buildUpdatePrompt } from './create-agent-prompts';
 import { expandHome, printFilePreview } from './create-agent';
 import { interactiveSelect } from './interactive-select';
