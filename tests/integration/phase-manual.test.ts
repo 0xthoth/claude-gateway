@@ -49,7 +49,6 @@ function makeTempWorkspace(
   const files: Record<string, string> = {
     'AGENTS.md': '# Agent\nYou are a test assistant.',
     'SOUL.md': '# Soul\nBe helpful.',
-    'TOOLS.md': '# Tools\nNo tools.',
     'USER.md': '# User\nTester.',
     'HEARTBEAT.md': '# Heartbeat\n',
     'MEMORY.md': '# Memory\n',
@@ -244,14 +243,13 @@ describe('Phase 1: Config Loader', () => {
 
 describe('Phase 1: Workspace Loader', () => {
   // P1-04
-  it('P1-04: all 7 files assembled into system prompt with correct section headers', async () => {
+  it('P1-04: all 6 files assembled into system prompt with correct section headers', async () => {
     const workspace = makeTempWorkspace('p104-');
     const result = await loadWorkspace(workspace);
 
     expect(result.systemPrompt).toContain('--- AGENT IDENTITY ---');
     expect(result.systemPrompt).toContain('--- SOUL ---');
     expect(result.systemPrompt).toContain('--- USER PROFILE ---');
-    expect(result.systemPrompt).toContain('--- AVAILABLE TOOLS ---');
     expect(result.systemPrompt).toContain('--- LONG-TERM MEMORY ---');
     expect(result.systemPrompt).toContain('--- HEARTBEAT CONFIG ---');
 
@@ -259,7 +257,6 @@ describe('Phase 1: Workspace Loader', () => {
     expect(result.systemPrompt).toContain('You are a test assistant.');
     expect(result.systemPrompt).toContain('Be helpful.');
     expect(result.systemPrompt).toContain('Tester.');
-    expect(result.systemPrompt).toContain('No tools.');
 
     expect(result.truncated).toBe(false);
   });

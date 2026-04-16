@@ -41,19 +41,19 @@ describe('Skills integration with workspace-loader', () => {
     expect(result.systemPrompt).not.toContain('--- AVAILABLE SKILLS ---');
   });
 
-  it('SI-3: AVAILABLE SKILLS section appears between AVAILABLE TOOLS and LONG-TERM MEMORY', async () => {
+  it('SI-3: AVAILABLE SKILLS section appears between USER PROFILE and LONG-TERM MEMORY', async () => {
     const skillsDir = path.join(tmpDir, 'skills');
     writeSkill(skillsDir, 'test-skill', 'name: test-skill\ndescription: A test skill');
 
     const result = await loadWorkspace(tmpDir);
-    const toolsIdx = result.systemPrompt.indexOf('--- AVAILABLE TOOLS ---');
+    const userIdx = result.systemPrompt.indexOf('--- USER PROFILE ---');
     const skillsIdx = result.systemPrompt.indexOf('--- AVAILABLE SKILLS ---');
     const memoryIdx = result.systemPrompt.indexOf('--- LONG-TERM MEMORY ---');
 
-    expect(toolsIdx).toBeGreaterThan(-1);
+    expect(userIdx).toBeGreaterThan(-1);
     expect(skillsIdx).toBeGreaterThan(-1);
     expect(memoryIdx).toBeGreaterThan(-1);
-    expect(toolsIdx).toBeLessThan(skillsIdx);
+    expect(userIdx).toBeLessThan(skillsIdx);
     expect(skillsIdx).toBeLessThan(memoryIdx);
   });
 

@@ -335,10 +335,10 @@ async function generateFiles(
 // Step 2 — Preview and accept generated files
 // ---------------------------------------------------------------------------
 
-const OPTIONAL_FILES = new Set(['IDENTITY.md', 'SOUL.md', 'USER.md', 'TOOLS.md', 'HEARTBEAT.md']);
+const OPTIONAL_FILES = new Set(['IDENTITY.md', 'SOUL.md', 'USER.md', 'HEARTBEAT.md']);
 
 /** Standard files that should always exist in a workspace (created as stubs if not generated). */
-const STANDARD_STUB_FILES = ['HEARTBEAT.md', 'MEMORY.md', 'SOUL.md', 'TOOLS.md', 'USER.md'];
+const STANDARD_STUB_FILES = ['HEARTBEAT.md', 'MEMORY.md', 'SOUL.md', 'USER.md'];
 const SEPARATOR_WIDTH = 42;
 
 export function printFilePreview(filename: string, content: string): void {

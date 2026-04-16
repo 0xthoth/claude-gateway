@@ -33,7 +33,6 @@ function createTempWorkspace(prefix = 'ma-test-ws-'): string {
   const files: Record<string, string> = {
     'AGENTS.md': '# Agent\nYou are a test assistant.',
     'SOUL.md': '# Soul\nBe helpful.',
-    'TOOLS.md': '# Tools\nNo tools.',
     'USER.md': '# User\nTester.',
     'HEARTBEAT.md': '# Heartbeat\n',
     'MEMORY.md': '# Memory\n',

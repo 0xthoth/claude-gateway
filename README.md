@@ -120,7 +120,6 @@ Each agent has a workspace directory with markdown files that define its behavio
 | `IDENTITY.md` | No | Agent name, emoji, avatar, personality identity |
 | `SOUL.md` | No | Tone, personality, speaking style |
 | `USER.md` | No | User profile and preferences |
-| `TOOLS.md` | No | Available tools and how to use them |
 | `MEMORY.md` | No | Long-term memory (auto-appended by the agent) |
 | `HEARTBEAT.md` | No | Scheduled/proactive tasks |
 | `skills/` | No | Directory of SKILL.md files — agent-specific skills |
@@ -426,7 +425,6 @@ claude-gateway/
             ├── IDENTITY.md             ← name, emoji, avatar
             ├── SOUL.md                 ← tone, personality, speaking style
             ├── USER.md                 ← user profile and preferences
-            ├── TOOLS.md               ← available tools and usage
             ├── MEMORY.md               ← long-term memory (auto-appended)
             ├── HEARTBEAT.md            ← scheduled/proactive tasks
             ├── skills/                 ← agent-specific skills (hot-reloaded)

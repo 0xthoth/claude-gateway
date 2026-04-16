@@ -69,7 +69,7 @@ This is the agent content.`;
       expect(content).toContain('# Agent: Clean');
     });
 
-    it('handles five sections correctly', () => {
+    it('handles four sections correctly', () => {
       const output = `=== AGENTS.md ===
 # Agent: Full
 Role description.
@@ -80,19 +80,15 @@ Personality.
 === USER.md ===
 User profile.
 
-=== TOOLS.md ===
-Available tools.
-
 === HEARTBEAT.md ===
 tasks:
   - name: daily
     cron: "0 8 * * *"`;
       const files = parseGeneratedFiles(output);
-      expect(files.size).toBe(5);
+      expect(files.size).toBe(4);
       expect(files.has('AGENTS.md')).toBe(true);
       expect(files.has('SOUL.md')).toBe(true);
       expect(files.has('USER.md')).toBe(true);
-      expect(files.has('TOOLS.md')).toBe(true);
       expect(files.has('HEARTBEAT.md')).toBe(true);
     });
 
