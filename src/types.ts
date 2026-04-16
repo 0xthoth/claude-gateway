@@ -69,7 +69,6 @@ export interface WorkspaceFiles {
   agentMd: string;
   identityMd: string;
   soulMd: string;
-  toolsMd: string;
   userMd: string;
   heartbeatMd: string;
   memoryMd: string;

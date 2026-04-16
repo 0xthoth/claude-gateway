@@ -21,7 +21,6 @@ const LOWERCASE_TO_UPPERCASE: Record<string, string> = {
   'identity.md': 'IDENTITY.md',
   'soul.md': 'SOUL.md',
   'user.md': 'USER.md',
-  'tools.md': 'TOOLS.md',
   'memory.md': 'MEMORY.md',
   'heartbeat.md': 'HEARTBEAT.md',
 
@@ -91,7 +90,6 @@ export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOp
   const rawAgent = fs.readFileSync(agentMdPath, 'utf-8');
   const rawIdentity = readFileOrDefault(path.join(workspaceDir, 'IDENTITY.md'), '');
   const rawSoul = readFileOrDefault(path.join(workspaceDir, 'SOUL.md'), '');
-  const rawTools = readFileOrDefault(path.join(workspaceDir, 'TOOLS.md'), '');
   const rawUser = readFileOrDefault(path.join(workspaceDir, 'USER.md'), '');
   const rawHeartbeat = readFileOrDefault(path.join(workspaceDir, 'HEARTBEAT.md'), '');
   const rawMemory = readFileOrDefault(path.join(workspaceDir, 'MEMORY.md'), '');
@@ -107,7 +105,6 @@ export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOp
   const agentMd = truncateResult(rawAgent);
   const identityMd = truncateResult(rawIdentity);
   const soulMd = truncateResult(rawSoul);
-  const toolsMd = truncateResult(rawTools);
   const userMd = truncateResult(rawUser);
   const heartbeatMd = truncateResult(rawHeartbeat);
   const memoryMd = truncateResult(rawMemory);
@@ -127,7 +124,6 @@ export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOp
     `--- IDENTITY ---\n${identityMd}\n\n` +
     `--- SOUL ---\n${soulMd}\n\n` +
     `--- USER PROFILE ---\n${userMd}\n\n` +
-    `--- AVAILABLE TOOLS ---\n${toolsMd}\n\n` +
     (skillsSection ? `--- AVAILABLE SKILLS ---\n${skillsSection}\n\n` : '') +
     `--- LONG-TERM MEMORY ---\n${memoryMd}\n\n` +
     `--- HEARTBEAT CONFIG ---\n${heartbeatMd}`;
@@ -142,7 +138,6 @@ export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOp
     agentMd,
     identityMd,
     soulMd,
-    toolsMd,
     userMd,
     heartbeatMd,
     memoryMd,

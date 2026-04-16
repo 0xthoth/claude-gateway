@@ -24,7 +24,6 @@ function createTempWorkspace(prefix = 'gw-test-ws-'): string {
   const files: Record<string, string> = {
     'AGENTS.md': '# Agent\nYou are a test assistant.',
     'SOUL.md': '# Soul\nBe helpful.',
-    'TOOLS.md': '# Tools\nNo tools.',
     'USER.md': '# User\nTester.',
     'HEARTBEAT.md': '# Heartbeat\n',
     'MEMORY.md': '# Memory\n',
@@ -174,8 +173,6 @@ describe('Gateway E2E (Option A — monitoring only)', () => {
     expect(loaded.systemPrompt).toContain('Be helpful.');
     expect(loaded.systemPrompt).toContain('--- USER PROFILE ---');
     expect(loaded.systemPrompt).toContain('Tester.');
-    expect(loaded.systemPrompt).toContain('--- AVAILABLE TOOLS ---');
-    expect(loaded.systemPrompt).toContain('No tools.');
     expect(loaded.systemPrompt).toContain('--- LONG-TERM MEMORY ---');
     expect(loaded.systemPrompt).toContain('--- HEARTBEAT CONFIG ---');
     expect(loaded.truncated).toBe(false);

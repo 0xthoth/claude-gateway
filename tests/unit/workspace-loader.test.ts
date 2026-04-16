@@ -19,7 +19,6 @@ describe('workspace-loader', () => {
     expect(result.systemPrompt).toBeTruthy();
     expect(result.files.agentMd).toContain('Alfred');
     expect(result.files.soulMd).toContain('Tone');
-    expect(result.files.toolsMd).toContain('Tools');
     expect(result.files.userMd).toContain('User Profile');
     expect(result.files.heartbeatMd).toContain('morning-brief');
     expect(result.files.memoryMd).toContain('Memory');
@@ -60,7 +59,6 @@ describe('workspace-loader', () => {
       // Each file is 25,000 chars — will be individually truncated to 20,000
       fs.writeFileSync(path.join(tmpDir, 'AGENTS.md'), '# Agent\n' + 'A'.repeat(25_000));
       fs.writeFileSync(path.join(tmpDir, 'SOUL.md'), 'S'.repeat(25_000));
-      fs.writeFileSync(path.join(tmpDir, 'TOOLS.md'), 'T'.repeat(25_000));
       fs.writeFileSync(path.join(tmpDir, 'USER.md'), 'U'.repeat(25_000));
       fs.writeFileSync(path.join(tmpDir, 'MEMORY.md'), 'M'.repeat(25_000));
       fs.writeFileSync(path.join(tmpDir, 'HEARTBEAT.md'), 'H'.repeat(25_000));
@@ -89,7 +87,6 @@ describe('workspace-loader', () => {
     const identityIdx = prompt.indexOf('--- IDENTITY ---');
     const soulIdx = prompt.indexOf('--- SOUL ---');
     const userIdx = prompt.indexOf('--- USER PROFILE ---');
-    const toolsIdx = prompt.indexOf('--- AVAILABLE TOOLS ---');
     const memoryIdx = prompt.indexOf('--- LONG-TERM MEMORY ---');
     const heartbeatIdx = prompt.indexOf('--- HEARTBEAT CONFIG ---');
 
@@ -97,8 +94,7 @@ describe('workspace-loader', () => {
     expect(identityIdx).toBeGreaterThan(agentIdx);
     expect(soulIdx).toBeGreaterThan(identityIdx);
     expect(userIdx).toBeGreaterThan(soulIdx);
-    expect(toolsIdx).toBeGreaterThan(userIdx);
-    expect(memoryIdx).toBeGreaterThan(toolsIdx);
+    expect(memoryIdx).toBeGreaterThan(userIdx);
     expect(heartbeatIdx).toBeGreaterThan(memoryIdx);
   });
 
@@ -111,7 +107,6 @@ describe('workspace-loader', () => {
     expect(result.systemPrompt).toContain('--- IDENTITY ---');
     expect(result.systemPrompt).toContain('--- SOUL ---');
     expect(result.systemPrompt).toContain('--- USER PROFILE ---');
-    expect(result.systemPrompt).toContain('--- AVAILABLE TOOLS ---');
     expect(result.systemPrompt).toContain('--- LONG-TERM MEMORY ---');
     expect(result.systemPrompt).toContain('--- HEARTBEAT CONFIG ---');
   });
@@ -201,7 +196,7 @@ describe('workspace-loader', () => {
   it('migrateWorkspaceFiles: all 6 lowercase files → all renamed to uppercase', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wl-migrate-'));
     try {
-      const files = ['agent.md', 'soul.md', 'user.md', 'tools.md', 'memory.md', 'heartbeat.md'];
+      const files = ['agent.md', 'soul.md', 'user.md', 'memory.md', 'heartbeat.md'];
       for (const f of files) {
         fs.writeFileSync(path.join(tmpDir, f), `content of ${f}`);
       }
@@ -211,7 +206,6 @@ describe('workspace-loader', () => {
       expect(fs.existsSync(path.join(tmpDir, 'AGENTS.md'))).toBe(true);
       expect(fs.existsSync(path.join(tmpDir, 'SOUL.md'))).toBe(true);
       expect(fs.existsSync(path.join(tmpDir, 'USER.md'))).toBe(true);
-      expect(fs.existsSync(path.join(tmpDir, 'TOOLS.md'))).toBe(true);
       expect(fs.existsSync(path.join(tmpDir, 'MEMORY.md'))).toBe(true);
       expect(fs.existsSync(path.join(tmpDir, 'HEARTBEAT.md'))).toBe(true);
 

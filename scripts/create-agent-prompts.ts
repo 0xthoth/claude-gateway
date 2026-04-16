@@ -42,9 +42,7 @@ Rules:
 - IDENTITY.md (optional): agent name, emoji, avatar, creature, vibe. Omit if not needed.
 - SOUL.md: tone and personality only (not rules). Omit if no distinct style.
 - USER.md: target user profile. Omit if public/unknown.
-- TOOLS.md: available tools or capabilities. Omit if none specified.
 - HEARTBEAT.md: only if proactive/scheduled tasks were described. Use YAML tasks format.
-- BOOTSTRAP.md: only if a special first-run greeting is appropriate.
 - Keep each file under 500 words.
 - Omit files that are not relevant.
 - IMPORTANT: On the very FIRST line of your output (before any === markers), output a single emoji that best represents this agent's personality or role. Just the emoji alone on line 1, nothing else.`;

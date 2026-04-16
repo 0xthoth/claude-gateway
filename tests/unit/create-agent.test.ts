@@ -460,7 +460,6 @@ describe('T-CA-08: Workspace file creation', () => {
       ['AGENTS.md', 'agent content'],
       ['SOUL.md', 'soul content'],
       ['USER.md', 'user content'],
-      ['TOOLS.md', 'tools content'],
     ]);
 
     for (const [filename, content] of accepted) {
@@ -468,11 +467,10 @@ describe('T-CA-08: Workspace file creation', () => {
     }
 
     const written = fs.readdirSync(wsDir);
-    expect(written).toHaveLength(4);
+    expect(written).toHaveLength(3);
     expect(written).toContain('AGENTS.md');
     expect(written).toContain('SOUL.md');
     expect(written).toContain('USER.md');
-    expect(written).toContain('TOOLS.md');
   });
 });
 
@@ -549,7 +547,7 @@ describe('T-CA-09: createWorkspace creates blank stubs for standard files', () =
 
   it('creates empty stub files for missing standard files', () => {
     // Simulate what createWorkspace does after writing accepted files
-    const STANDARD_STUB_FILES = ['HEARTBEAT.md', 'MEMORY.md', 'SOUL.md', 'TOOLS.md', 'USER.md'];
+    const STANDARD_STUB_FILES = ['HEARTBEAT.md', 'MEMORY.md', 'SOUL.md', 'USER.md'];
     const acceptedFiles = new Map<string, string>([
       ['AGENTS.md', '# Agent: Test\nYou are Test.'],
       ['SOUL.md', 'Be helpful and kind.'],
@@ -580,9 +578,6 @@ describe('T-CA-09: createWorkspace creates blank stubs for standard files', () =
     expect(fs.existsSync(path.join(tmpDir, 'MEMORY.md'))).toBe(true);
     expect(fs.readFileSync(path.join(tmpDir, 'MEMORY.md'), 'utf8')).toBe('');
 
-    expect(fs.existsSync(path.join(tmpDir, 'TOOLS.md'))).toBe(true);
-    expect(fs.readFileSync(path.join(tmpDir, 'TOOLS.md'), 'utf8')).toBe('');
-
     expect(fs.existsSync(path.join(tmpDir, 'USER.md'))).toBe(true);
     expect(fs.readFileSync(path.join(tmpDir, 'USER.md'), 'utf8')).toBe('');
   });
@@ -607,11 +602,12 @@ describe('T-CA-09: createWorkspace creates blank stubs for standard files', () =
     expect(fs.readFileSync(stubPath, 'utf8')).toBe('Existing content');
   });
 
-  it('all 5 standard stub files are defined', () => {
-    const STANDARD_STUB_FILES = ['HEARTBEAT.md', 'MEMORY.md', 'SOUL.md', 'TOOLS.md', 'USER.md'];
-    expect(STANDARD_STUB_FILES).toHaveLength(5);
+  it('all 4 standard stub files are defined', () => {
+    const STANDARD_STUB_FILES = ['HEARTBEAT.md', 'MEMORY.md', 'SOUL.md', 'USER.md'];
+    expect(STANDARD_STUB_FILES).toHaveLength(4);
     expect(STANDARD_STUB_FILES).toContain('MEMORY.md');
     expect(STANDARD_STUB_FILES).not.toContain('BOOTSTRAP.md');
     expect(STANDARD_STUB_FILES).not.toContain('AGENTS.md');
+    expect(STANDARD_STUB_FILES).not.toContain('TOOLS.md');
   });
 });
