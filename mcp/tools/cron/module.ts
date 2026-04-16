@@ -58,8 +58,21 @@ export class CronModule implements ToolModule {
             prompt: { type: 'string', description: 'Agent prompt (type=agent)' },
             telegram: { type: 'string', description: 'Telegram chat_id for response' },
             timeout_ms: { type: 'number', description: 'Timeout in milliseconds' },
+            scheduleKind: {
+              type: 'string',
+              enum: ['cron', 'at'],
+              description: 'Schedule type: "cron" for recurring (default), "at" for one-shot at a specific ISO datetime',
+            },
+            scheduleAt: {
+              type: 'string',
+              description: 'ISO 8601 datetime for one-shot execution (required when scheduleKind=at)',
+            },
+            deleteAfterRun: {
+              type: 'boolean',
+              description: 'Delete the job after it runs once. Defaults to true for scheduleKind=at, false for cron',
+            },
           },
-          required: ['name', 'schedule', 'type'],
+          required: ['name', 'type'],
           additionalProperties: false,
         },
       },
@@ -112,7 +125,13 @@ export class CronModule implements ToolModule {
           return { content: [{ type: 'text', text: JSON.stringify(jobs, null, 2) }] };
         }
         case 'cron_create': {
-          const job = await client.create(args);
+          // Fix 3: Default deleteAfterRun=true for at-type one-shot jobs so they are
+          // automatically cleaned up after firing, preventing re-fire on gateway restart.
+          const scheduleKind = (args.scheduleKind as string | undefined) ?? 'cron';
+          const deleteAfterRun = args.deleteAfterRun !== undefined
+            ? args.deleteAfterRun
+            : scheduleKind === 'at';
+          const job = await client.create({ ...args, scheduleKind, deleteAfterRun });
           return { content: [{ type: 'text', text: JSON.stringify(job, null, 2) }] };
         }
         case 'cron_delete': {

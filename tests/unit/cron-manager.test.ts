@@ -384,3 +384,267 @@ describe('T11-T13: Telegram delivery', () => {
     manager.stop();
   });
 });
+
+// ─── Fix 1 regression tests ──────────────────────────────────────────────────
+
+describe('Fix 1: at-job does not re-fire when lastRunAt is already set', () => {
+  function writeStore(storePath: string, job: Record<string, unknown>) {
+    fs.writeFileSync(storePath, JSON.stringify({ version: 1, jobs: [job] }, null, 2));
+  }
+
+  function makeAtJobStore(overrides: Record<string, unknown>) {
+    const pastTs = new Date(Date.now() - 5000).toISOString();
+    return {
+      id: 'test-at-' + Math.random().toString(36).slice(2),
+      agentId: 'test-agent',
+      name: 'test-at-job',
+      scheduleKind: 'at',
+      scheduleAt: pastTs,
+      command: 'echo hi',
+      type: 'command',
+      enabled: true,
+      deleteAfterRun: false,
+      createdAt: Date.now() - 10000,
+      updatedAt: Date.now() - 10000,
+      state: {
+        lastRunAt: null,
+        lastStatus: null,
+        lastError: null,
+        runCount: 0,
+        consecutiveErrors: 0,
+      },
+      ...overrides,
+    };
+  }
+
+  it('Fix1-1: at job with lastRunAt set should not re-fire on start', async () => {
+    const tmpDir = makeTmpDir();
+    const storePath = path.join(tmpDir, 'crons.json');
+    const runsDir = path.join(tmpDir, 'runs');
+    const signalFile = path.join(tmpDir, 'refire.txt');
+
+    const jobBase = makeAtJobStore({
+      command: `touch "${signalFile}"`,
+      state: {
+        lastRunAt: Date.now() - 5000,
+        lastStatus: 'ok',
+        lastError: null,
+        runCount: 1,
+        consecutiveErrors: 0,
+      },
+    });
+    writeStore(storePath, jobBase);
+
+    const logger = makeLogger();
+    const agentRunners = new Map<string, any>();
+    const agentConfigs = new Map<string, AgentConfig>();
+    agentConfigs.set('test-agent', makeAgentConfig('test-agent'));
+    const manager = new CronManager({ storePath, runsDir }, agentRunners, agentConfigs, logger);
+
+    await manager.start();
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(fs.existsSync(signalFile)).toBe(false);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining('already ran'),
+      expect.anything()
+    );
+
+    manager.stop();
+  });
+
+  it('Fix1-2: at job with lastRunAt set should be disabled after cleanup on start', async () => {
+    const tmpDir = makeTmpDir();
+    const storePath = path.join(tmpDir, 'crons.json');
+    const runsDir = path.join(tmpDir, 'runs');
+
+    const jobBase = makeAtJobStore({
+      state: {
+        lastRunAt: Date.now() - 5000,
+        lastStatus: 'ok',
+        lastError: null,
+        runCount: 1,
+        consecutiveErrors: 0,
+      },
+    });
+    writeStore(storePath, jobBase);
+
+    const agentRunners = new Map<string, any>();
+    const agentConfigs = new Map<string, AgentConfig>();
+    agentConfigs.set('test-agent', makeAgentConfig('test-agent'));
+    const manager = new CronManager({ storePath, runsDir }, agentRunners, agentConfigs, makeLogger());
+
+    await manager.start();
+    await new Promise((r) => setTimeout(r, 300));
+
+    const job = manager.get(jobBase.id as string);
+    expect(job?.enabled).toBe(false);
+
+    manager.stop();
+  });
+
+  it('Fix1-3: at job with lastRunAt=null and past scheduleAt fires normally', async () => {
+    const tmpDir = makeTmpDir();
+    const storePath = path.join(tmpDir, 'crons.json');
+    const runsDir = path.join(tmpDir, 'runs');
+    const signalFile = path.join(tmpDir, 'ran.txt');
+
+    const jobBase = makeAtJobStore({
+      command: `touch "${signalFile}"`,
+      state: {
+        lastRunAt: null,
+        lastStatus: null,
+        lastError: null,
+        runCount: 0,
+        consecutiveErrors: 0,
+      },
+    });
+    writeStore(storePath, jobBase);
+
+    const agentRunners = new Map<string, any>();
+    const agentConfigs = new Map<string, AgentConfig>();
+    agentConfigs.set('test-agent', makeAgentConfig('test-agent'));
+    const manager = new CronManager({ storePath, runsDir }, agentRunners, agentConfigs, makeLogger());
+
+    await manager.start();
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && !fs.existsSync(signalFile)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    expect(fs.existsSync(signalFile)).toBe(true);
+
+    manager.stop();
+  }, 10000);
+});
+
+// ─── Fix 2 regression tests ──────────────────────────────────────────────────
+
+describe('Fix 2: catchUpMissedJobs uses cron-parser to detect genuine missed ticks', () => {
+  function writeCronStore(storePath: string, job: Record<string, unknown>) {
+    fs.writeFileSync(storePath, JSON.stringify({ version: 1, jobs: [job] }, null, 2));
+  }
+
+  function makeCronJobStore(overrides: Record<string, unknown>) {
+    return {
+      id: 'test-cron-' + Math.random().toString(36).slice(2),
+      agentId: 'test-agent',
+      name: 'test-cron-job',
+      scheduleKind: 'cron',
+      schedule: '* * * * *',
+      command: 'echo hi',
+      type: 'command',
+      enabled: true,
+      deleteAfterRun: false,
+      createdAt: Date.now() - 200000,
+      updatedAt: Date.now() - 200000,
+      state: {
+        lastRunAt: null,
+        lastStatus: null,
+        lastError: null,
+        runCount: 0,
+        consecutiveErrors: 0,
+      },
+      ...overrides,
+    };
+  }
+
+  it('Fix2-1: cron job with lastRunAt before last expected tick triggers catch-up', async () => {
+    const tmpDir = makeTmpDir();
+    const storePath = path.join(tmpDir, 'crons.json');
+    const runsDir = path.join(tmpDir, 'runs');
+    const signalFile = path.join(tmpDir, 'caught-up.txt');
+
+    const twoMinAgo = Date.now() - 2 * 60 * 1000;
+    const jobBase = makeCronJobStore({
+      command: `touch "${signalFile}"`,
+      state: {
+        lastRunAt: twoMinAgo,
+        lastStatus: 'ok',
+        lastError: null,
+        runCount: 5,
+        consecutiveErrors: 0,
+      },
+    });
+    writeCronStore(storePath, jobBase);
+
+    const agentRunners = new Map<string, any>();
+    const agentConfigs = new Map<string, AgentConfig>();
+    agentConfigs.set('test-agent', makeAgentConfig('test-agent'));
+    const manager = new CronManager({ storePath, runsDir }, agentRunners, agentConfigs, makeLogger());
+
+    await manager.start();
+
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && !fs.existsSync(signalFile)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    expect(fs.existsSync(signalFile)).toBe(true);
+
+    manager.stop();
+  }, 15000);
+
+  it('Fix2-2: cron job with lastRunAt after last expected tick does not catch up', async () => {
+    const tmpDir = makeTmpDir();
+    const storePath = path.join(tmpDir, 'crons.json');
+    const runsDir = path.join(tmpDir, 'runs');
+    const signalFile = path.join(tmpDir, 'no-catchup.txt');
+
+    const jobBase = makeCronJobStore({
+      command: `touch "${signalFile}"`,
+      state: {
+        lastRunAt: Date.now(),
+        lastStatus: 'ok',
+        lastError: null,
+        runCount: 10,
+        consecutiveErrors: 0,
+      },
+    });
+    writeCronStore(storePath, jobBase);
+
+    const agentRunners = new Map<string, any>();
+    const agentConfigs = new Map<string, AgentConfig>();
+    agentConfigs.set('test-agent', makeAgentConfig('test-agent'));
+    const manager = new CronManager({ storePath, runsDir }, agentRunners, agentConfigs, makeLogger());
+
+    await manager.start();
+    await new Promise((r) => setTimeout(r, 500));
+
+    expect(fs.existsSync(signalFile)).toBe(false);
+
+    manager.stop();
+  });
+
+  it('Fix2-3: cron job that never ran (lastRunAt=null) does not trigger catch-up', async () => {
+    const tmpDir = makeTmpDir();
+    const storePath = path.join(tmpDir, 'crons.json');
+    const runsDir = path.join(tmpDir, 'runs');
+    const signalFile = path.join(tmpDir, 'never-ran.txt');
+
+    const jobBase = makeCronJobStore({
+      command: `touch "${signalFile}"`,
+      state: {
+        lastRunAt: null,
+        lastStatus: null,
+        lastError: null,
+        runCount: 0,
+        consecutiveErrors: 0,
+      },
+    });
+    writeCronStore(storePath, jobBase);
+
+    const agentRunners = new Map<string, any>();
+    const agentConfigs = new Map<string, AgentConfig>();
+    agentConfigs.set('test-agent', makeAgentConfig('test-agent'));
+    const manager = new CronManager({ storePath, runsDir }, agentRunners, agentConfigs, makeLogger());
+
+    await manager.start();
+    await new Promise((r) => setTimeout(r, 500));
+
+    expect(fs.existsSync(signalFile)).toBe(false);
+
+    manager.stop();
+  });
+});

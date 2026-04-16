@@ -58,8 +58,13 @@ describe('CronModule', () => {
 
       const schema = create.inputSchema as any;
       expect(schema.required).toContain('name');
-      expect(schema.required).toContain('schedule');
       expect(schema.required).toContain('type');
+      // schedule is optional (at-type jobs use scheduleAt instead)
+      expect(schema.required).not.toContain('schedule');
+      // new fields from Fix 3 are present
+      expect(schema.properties).toHaveProperty('scheduleKind');
+      expect(schema.properties).toHaveProperty('scheduleAt');
+      expect(schema.properties).toHaveProperty('deleteAfterRun');
     });
 
     // CR2: cron_list tool exists
@@ -100,6 +105,91 @@ describe('CronModule', () => {
       const mod = new CronModule();
       expect(mod.id).toBe('cron');
       expect(mod.toolVisibility).toBe('all-configured');
+    });
+  });
+
+  // ─── Fix 3 regression tests ────────────────────────────────────────────────
+
+  describe('Fix 3: deleteAfterRun defaults for at-type jobs', () => {
+    let originalFetch: typeof global.fetch;
+
+    beforeEach(() => {
+      originalFetch = global.fetch;
+      process.env.GATEWAY_API_URL = 'http://localhost:3000';
+      process.env.GATEWAY_AGENT_ID = 'test-agent';
+    });
+
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    function mockFetch(responseBody: unknown) {
+      return jest.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+        return new Response(JSON.stringify(responseBody), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    }
+
+    function capturedBody(mockFn: jest.Mock): Record<string, unknown> {
+      const [, init] = mockFn.mock.calls[0] as [string, RequestInit];
+      return JSON.parse(init.body as string);
+    }
+
+    it('Fix3-1: at-type job creation defaults deleteAfterRun to true', async () => {
+      const fetchMock = mockFetch({ id: 'j1', name: 'test' });
+      global.fetch = fetchMock;
+
+      const mod = new CronModule();
+      await mod.handleTool('cron_create', {
+        name: 'test-at-job',
+        type: 'agent',
+        scheduleKind: 'at',
+        scheduleAt: new Date(Date.now() + 60000).toISOString(),
+        prompt: 'do something',
+        telegram: 'PLACEHOLDER_CHAT_ID',
+      });
+
+      const body = capturedBody(fetchMock);
+      expect(body.deleteAfterRun).toBe(true);
+      expect(body.scheduleKind).toBe('at');
+    });
+
+    it('Fix3-2: cron-type job creation defaults deleteAfterRun to false', async () => {
+      const fetchMock = mockFetch({ id: 'j2', name: 'test' });
+      global.fetch = fetchMock;
+
+      const mod = new CronModule();
+      await mod.handleTool('cron_create', {
+        name: 'test-cron-job',
+        type: 'agent',
+        schedule: '* * * * *',
+        prompt: 'do something',
+        telegram: 'PLACEHOLDER_CHAT_ID',
+      });
+
+      const body = capturedBody(fetchMock);
+      expect(body.deleteAfterRun).toBe(false);
+      expect(body.scheduleKind).toBe('cron');
+    });
+
+    it('Fix3-3: explicit deleteAfterRun=false overrides at-type default', async () => {
+      const fetchMock = mockFetch({ id: 'j3', name: 'test' });
+      global.fetch = fetchMock;
+
+      const mod = new CronModule();
+      await mod.handleTool('cron_create', {
+        name: 'keep-at-job',
+        type: 'agent',
+        scheduleKind: 'at',
+        scheduleAt: new Date(Date.now() + 60000).toISOString(),
+        prompt: 'do something',
+        telegram: 'PLACEHOLDER_CHAT_ID',
+        deleteAfterRun: false,
+      });
+
+      const body = capturedBody(fetchMock);
+      expect(body.deleteAfterRun).toBe(false);
     });
   });
 });

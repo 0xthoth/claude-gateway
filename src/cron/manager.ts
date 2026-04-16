@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { exec } from 'child_process';
+import { CronExpressionParser } from 'cron-parser';
 import {
   CronJob,
   CronJobCreate,
@@ -303,6 +304,23 @@ export class CronManager extends EventEmitter {
       const targetMs = Date.parse(job.scheduleAt!);
       const delayMs = targetMs - Date.now();
 
+      // Fix 1: If the job already ran before a crash, skip re-fire and complete cleanup.
+      // executeJob() always persists lastRunAt before disableOrDeleteJob() runs, so
+      // lastRunAt !== null reliably indicates the job fired even if cleanup was interrupted.
+      if (job.state.lastRunAt !== null) {
+        this.logger.info(
+          `at-job "${job.name}" already ran (lastRunAt=${job.state.lastRunAt}), skipping re-fire — cleaning up`,
+          { id: job.id }
+        );
+        this.disableOrDeleteJob(job).catch((err) =>
+          this.logger.error(`Cleanup failed for at-job "${job.name}"`, {
+            id: job.id,
+            error: (err as Error).message,
+          })
+        );
+        return;
+      }
+
       const fireAt = async () => {
         try {
           this.scheduledTasks.delete(job.id);
@@ -498,16 +516,30 @@ export class CronManager extends EventEmitter {
       if (!job.enabled || caught >= MAX_CATCHUP) continue;
       const kind = job.scheduleKind ?? 'cron';
 
-      if (kind === 'at') {
-        // Already handled in scheduleJob (past at-jobs run immediately)
-        continue;
-      }
+      // at-jobs are handled in scheduleJob(); cron-parser is only meaningful for recurring crons
+      if (kind !== 'cron') continue;
 
+      // Never ran — let the normal cron schedule handle it
       if (!job.state.lastRunAt) continue;
 
-      const ageMs = Date.now() - job.state.lastRunAt;
-      if (ageMs > 30 * 60 * 1000) {
-        this.logger.info(`Catching up missed job "${job.name}"`, { id: job.id, ageMs });
+      // Fix 2: Compute the most recent scheduled tick before now.
+      // Only catch up if a new tick occurred after lastRunAt (genuine missed execution).
+      // This replaces the crude "age > 30 min" heuristic which re-fired any job that ran
+      // more than 30 minutes ago, regardless of whether the schedule produced a new tick.
+      let lastExpectedRun: Date;
+      try {
+        const interval = CronExpressionParser.parse(job.schedule!, { currentDate: new Date() });
+        lastExpectedRun = interval.prev().toDate();
+      } catch {
+        continue; // unparseable schedule — skip catch-up
+      }
+
+      if (lastExpectedRun.getTime() > job.state.lastRunAt) {
+        this.logger.info(`Catching up missed job "${job.name}"`, {
+          id: job.id,
+          lastRunAt: job.state.lastRunAt,
+          lastExpectedRun: lastExpectedRun.toISOString(),
+        });
         setTimeout(() => this.executeJob(job), caught * 5000);
         caught++;
       }
