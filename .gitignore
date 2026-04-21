@@ -40,3 +40,4 @@ research*.md
 restart.sh
 stop.sh
 .skills
+.claude-gateway

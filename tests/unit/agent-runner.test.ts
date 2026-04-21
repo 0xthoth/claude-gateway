@@ -874,6 +874,72 @@ describe('AgentRunner — sendApiMessageStream', () => {
     expect((textDeltas[1] as { text: string }).text).toBe(' world');
   }, 15000);
 
+  // T-AR-STREAM-ALLOW-TOOLS-1: allowTools=false injects "Do NOT call any tools"
+  it('T-AR-STREAM-ALLOW-TOOLS-1: allowTools=false includes tool-restriction instruction', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    let capturedMessage = '';
+    runner.sendApiMessageStream(
+      'stream-at-1',
+      'hello',
+      { onChunk: () => {}, onDone: () => {}, onError: () => {} },
+      { timeoutMs: 5000, allowTools: false },
+    );
+
+    await new Promise(r => setTimeout(r, 200));
+
+    const proc = allProcesses[allProcesses.length - 1];
+    const calls = (proc.stdin!.write as jest.Mock).mock.calls;
+    capturedMessage = calls.map((c: unknown[]) => String(c[0])).join('');
+
+    expect(capturedMessage).toContain('Do NOT call any tools');
+    expect(capturedMessage).not.toContain('You may use tools');
+  }, 15000);
+
+  // T-AR-STREAM-ALLOW-TOOLS-2: allowTools=true removes restriction, adds permission
+  it('T-AR-STREAM-ALLOW-TOOLS-2: allowTools=true omits tool-restriction instruction', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    runner.sendApiMessageStream(
+      'stream-at-2',
+      'run job',
+      { onChunk: () => {}, onDone: () => {}, onError: () => {} },
+      { timeoutMs: 5000, allowTools: true },
+    );
+
+    await new Promise(r => setTimeout(r, 200));
+
+    const proc = allProcesses[allProcesses.length - 1];
+    const calls = (proc.stdin!.write as jest.Mock).mock.calls;
+    const capturedMessage = calls.map((c: unknown[]) => String(c[0])).join('');
+
+    expect(capturedMessage).not.toContain('Do NOT call any tools');
+    expect(capturedMessage).toContain('You may use tools');
+  }, 15000);
+
+  // T-AR-STREAM-ALLOW-TOOLS-3: default (no allowTools) behaves like allowTools=false
+  it('T-AR-STREAM-ALLOW-TOOLS-3: omitting allowTools defaults to tool-restricted mode', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    runner.sendApiMessageStream(
+      'stream-at-3',
+      'hello',
+      { onChunk: () => {}, onDone: () => {}, onError: () => {} },
+      { timeoutMs: 5000 },
+    );
+
+    await new Promise(r => setTimeout(r, 200));
+
+    const proc = allProcesses[allProcesses.length - 1];
+    const calls = (proc.stdin!.write as jest.Mock).mock.calls;
+    const capturedMessage = calls.map((c: unknown[]) => String(c[0])).join('');
+
+    expect(capturedMessage).toContain('Do NOT call any tools');
+  }, 15000);
+
   // --------------------------------------------------------------------------
   // T-AR-STREAM-16: No duplicate text in buffer from partial messages
   // --------------------------------------------------------------------------
