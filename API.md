@@ -50,6 +50,12 @@ All API endpoints require an API key configured in `config.json`. Pass it via:
           "key": "admin-key-456",
           "description": "Admin — full access",
           "agents": "*"
+        },
+        {
+          "key": "automation-key-789",
+          "description": "Automation — may use tools",
+          "agents": ["alfred"],
+          "allow_tools": true
         }
       ]
     }
@@ -58,6 +64,8 @@ All API endpoints require an API key configured in `config.json`. Pass it via:
 ```
 
 `agents` can be an array of agent IDs or `"*"` for full access. Keys support `${ENV_VAR}` interpolation.
+
+`allow_tools` grants the key permission to send requests with `allow_tools: true` in the body. Without this, any request that sets `allow_tools: true` is rejected with `403`.
 
 **2. Restart the gateway**
 
@@ -93,7 +101,7 @@ Send a message to an agent. Returns a JSON response or SSE stream.
 | `message` | Yes | Message text (max 10,000 chars) |
 | `session_id` | No | Resume an existing session; omit to start a new one |
 | `stream` | No | `true` to enable SSE streaming (default `false`) |
-| `allow_tools` | No | `true` to allow the agent to call tools (Read, Bash, etc.). **Requires `stream: true`.** Default `false` — agent is conversational only |
+| `allow_tools` | No | `true` to allow the agent to call tools (Read, Bash, etc.). **Requires `stream: true` and the API key must have `allow_tools: true` in config.** Default `false` — agent is conversational only |
 | `timeout_ms` | No | Override the default response timeout in milliseconds (default 60000). Useful for long-running tool executions |
 
 **New session:**
@@ -132,7 +140,7 @@ curl -X POST \
 |--------|------|
 | 400 | Empty message, exceeds 10,000 characters, or `allow_tools: true` without `stream: true` |
 | 401 | Missing API key |
-| 403 | Invalid key or key has no access to that agent |
+| 403 | Invalid key, key has no access to that agent, or key lacks `allow_tools` permission |
 | 404 | Agent ID not found |
 | 409 | Session is busy processing another request |
 | 504 | Agent did not respond within timeout (default 60s) |
@@ -184,7 +192,9 @@ curl -N -X POST \
   http://localhost:3000/api/v1/agents/alfred/messages
 ```
 
-> `allow_tools` requires `stream: true` — sync mode + tool calls would block indefinitely, so the API rejects the combination with `400 Bad Request`.
+> **Two requirements for `allow_tools`:**
+> 1. `stream: true` must also be set (sync mode + tools would block indefinitely → `400`)
+> 2. The API key must have `allow_tools: true` in `config.json` (otherwise → `403`)
 
 **Event types:**
 

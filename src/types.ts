@@ -44,6 +44,7 @@ export interface ApiKey {
   key: string;
   description?: string;
   agents: string[] | '*'; // agent IDs this key can access, or '*' for all
+  allow_tools?: boolean;  // permit tool-enabled (allow_tools) requests for this key
 }
 
 export interface ModelConfig {
