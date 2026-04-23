@@ -1,9 +1,10 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, ModelConfig, StreamEvent } from '../types';
+import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess } from '../session/process';
 import { SessionStore } from '../session/store';
@@ -15,6 +16,8 @@ import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../s
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
+
+export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 
 const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
@@ -46,6 +49,12 @@ export class AgentRunner extends EventEmitter {
   private stopping = false;
   private callbackServer: http.Server | null = null;
   private callbackPort = 0;
+  private imageSizeSinceRestart: number = 0;
+  private needsRestart: boolean = false;
+  private statQueue: Promise<void> = Promise.resolve();
+
+  get imageSize(): number { return this.imageSizeSinceRestart; }
+  get restartPending(): boolean { return this.needsRestart; }
 
   // Session pool
   private readonly sessions = new Map<string, SessionProcess>();
@@ -59,6 +68,9 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks session IDs with an in-flight API request (prevents concurrent turns)
   private readonly pendingApiSessions = new Set<string>();
+
+  // Tracks pending image paths per chatId (queue) for size accumulation after each turn
+  private readonly pendingImagePaths = new Map<string, string[]>();
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
@@ -157,6 +169,17 @@ export class AgentRunner extends EventEmitter {
                 content,
                 ts: Date.now(),
               });
+              // Restart session before this turn if accumulated image size exceeded threshold
+              if (this.needsRestart) {
+                const existingSession = this.sessions.get(chatId);
+                if (existingSession) {
+                  await existingSession.stop();
+                  this.sessions.delete(chatId);
+                }
+                this.needsRestart = false;
+                this.imageSizeSinceRestart = 0;
+              }
+
               // Route to session process (map key = chatId, actual sessionId passed separately)
               const session = await this.getOrSpawnSession(chatId, channelSource, sessionId);
               let channelXml = AgentRunner.buildChannelXml(params);
@@ -170,6 +193,13 @@ export class AgentRunner extends EventEmitter {
                   args: skillInvocation.args,
                   chatId,
                 });
+              }
+
+              const imagePath = meta['image_path'];
+              if (imagePath) {
+                const queue = this.pendingImagePaths.get(chatId) ?? [];
+                queue.push(imagePath);
+                this.pendingImagePaths.set(chatId, queue);
               }
 
               session.setProcessing(true);
@@ -556,10 +586,29 @@ export class AgentRunner extends EventEmitter {
           }
           if (obj['type'] === 'result') {
             proc.setProcessing(false);
+            // Accumulate image file size for restart tracking
+            const queue = this.pendingImagePaths.get(mapKey);
+            const imgPath = queue?.shift();
+            if (queue?.length === 0) this.pendingImagePaths.delete(mapKey);
+            if (imgPath) {
+              this.statQueue = this.statQueue.then(async () => {
+                try {
+                  const stats = await fsPromises.stat(imgPath);
+                  this.imageSizeSinceRestart += stats.size;
+                  if (this.imageSizeSinceRestart >= MAX_IMAGE_SIZE_BYTES) {
+                    this.imageSizeSinceRestart = 0;
+                    void this.triggerSummaryAndRestart(mapKey, actualSessionId, proc);
+                  }
+                } catch (err: unknown) {
+                  this.logger.warn('Failed to stat image', { path: imgPath, error: err instanceof Error ? err.message : String(err) });
+                }
+              });
+            }
             // Always forward result text — it contains the agent's completion summary.
             // If the agent also called reply tool, this summary still reaches the user.
+            // Skip forwarding when session is in query mode (internal image summary request).
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
-            if (resultText.trim()) {
+            if (resultText.trim() && !proc.queryMode) {
               const text = resultText.trim();
               if (hasMarkdown(text)) {
                 this.writeAutoForward(mapKey, toTelegramHtml(text), 'html');
@@ -936,6 +985,33 @@ export class AgentRunner extends EventEmitter {
     } catch {
       // Non-fatal
     }
+  }
+
+  private async triggerSummaryAndRestart(
+    chatId: string,
+    sessionId: string,
+    session: SessionProcess,
+  ): Promise<void> {
+    const IMAGE_CONTEXT_MARKER = '[Image Context Summary]';
+    try {
+      const prompt = [
+        'Briefly summarize each image you have seen in this conversation.',
+        'Format: "Image N: [1-2 sentence description]"',
+        'List every image separately.',
+      ].join(' ');
+      const description = await session.query(prompt);
+      if (description) {
+        const msg: Message = {
+          role: 'system',
+          content: `${IMAGE_CONTEXT_MARKER}\n${description}`,
+          ts: Date.now(),
+        };
+        await this.sessionStore.appendTelegramMessage(this.agentConfig.id, chatId, sessionId, msg);
+      }
+    } catch (err) {
+      this.logger.warn('Image context summary failed', { error: err instanceof Error ? err.message : String(err) });
+    }
+    this.needsRestart = true;
   }
 
   private writeAutoForward(chatId: string, text: string, format: 'text' | 'html' = 'text'): void {

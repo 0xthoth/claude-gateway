@@ -48,7 +48,7 @@ jest.mock('child_process', () => ({
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-import { AgentRunner } from '../../src/agent/runner';
+import { AgentRunner, MAX_IMAGE_SIZE_BYTES } from '../../src/agent/runner';
 import { AgentConfig, GatewayConfig, StreamEvent } from '../../src/types';
 import { SessionProcess } from '../../src/session/process';
 
@@ -1416,5 +1416,602 @@ describe('AgentRunner — session command routing', () => {
     const spawnCountAfter = spawnMock.mock.calls.length;
     // spawn should NOT have been called for a session command
     expect(spawnCountAfter).toBe(spawnCountBefore);
+  }, 15000);
+});
+
+// ── Restart-before-turn tests (US-003) ───────────────────────────────────────
+
+describe('AgentRunner — restart before turn (US-003)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-restart-turn-'));
+    agentConfig = makeAgentConfig(path.join(tmpDir, 'workspace'));
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  // --------------------------------------------------------------------------
+  // US3-01: needsRestart=false → no session restart, same process reused
+  // --------------------------------------------------------------------------
+  it('US3-01: needsRestart=false — existing session is reused without restart', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    expect(runner.restartPending).toBe(false);
+
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:r01', 'first turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    const firstSession = getSessions(runner).get('chat:r01')!;
+    expect(firstSession).toBeDefined();
+    const spawnCount = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    // Send second turn — needsRestart is still false
+    await sendChannelPost(port, 'chat:r01', 'second turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    const secondSession = getSessions(runner).get('chat:r01')!;
+    // Same session object, no extra spawn
+    expect(secondSession).toBe(firstSession);
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBe(spawnCount);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US3-02: needsRestart=true → existing session stopped, new one spawned
+  // --------------------------------------------------------------------------
+  it('US3-02: needsRestart=true — session is stopped and a new one is spawned', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:r02', 'first turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    const firstSession = getSessions(runner).get('chat:r02')!;
+    expect(firstSession).toBeDefined();
+    const stopSpy = jest.spyOn(firstSession, 'stop');
+
+    // Trigger the restart flag
+    (runner as any).needsRestart = true;
+
+    const spawnCountBefore = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    await sendChannelPost(port, 'chat:r02', 'second turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    // Old session was stopped
+    expect(stopSpy).toHaveBeenCalled();
+    // A new session was spawned
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBeGreaterThan(spawnCountBefore);
+    // New session object is different
+    const newSession = getSessions(runner).get('chat:r02');
+    expect(newSession).toBeDefined();
+    expect(newSession).not.toBe(firstSession);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US3-03: needsRestart reset to false after restart
+  // --------------------------------------------------------------------------
+  it('US3-03: needsRestart is reset to false after restart', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:r03', 'first turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    (runner as any).needsRestart = true;
+
+    await sendChannelPost(port, 'chat:r03', 'second turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    expect(runner.restartPending).toBe(false);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US3-04: imageSizeSinceRestart reset to 0 after restart
+  // --------------------------------------------------------------------------
+  it('US3-04: imageSizeSinceRestart is reset to 0 after restart', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:r04', 'first turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    (runner as any).needsRestart = true;
+    (runner as any).imageSizeSinceRestart = MAX_IMAGE_SIZE_BYTES + 100;
+
+    await sendChannelPost(port, 'chat:r04', 'second turn');
+    await new Promise(r => setTimeout(r, 150));
+
+    expect(runner.imageSize).toBe(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US3-05: needsRestart=true with no existing session → no error, spawn fresh
+  // --------------------------------------------------------------------------
+  it('US3-05: needsRestart=true with no prior session — spawns fresh without error', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    (runner as any).needsRestart = true;
+    (runner as any).imageSizeSinceRestart = MAX_IMAGE_SIZE_BYTES + 1;
+
+    const port = getCallbackPort(runner);
+
+    // No prior session exists — should spawn cleanly
+    await sendChannelPost(port, 'chat:r05', 'first turn ever');
+    await new Promise(r => setTimeout(r, 150));
+
+    expect(getSessions(runner).has('chat:r05')).toBe(true);
+    expect(runner.restartPending).toBe(false);
+    expect(runner.imageSize).toBe(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US3-06: text turn can trigger restart (not just image turns)
+  // --------------------------------------------------------------------------
+  it('US3-06: a text-only turn can trigger restart when needsRestart=true', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:r06', 'initial message');
+    await new Promise(r => setTimeout(r, 150));
+
+    const firstSession = getSessions(runner).get('chat:r06')!;
+    const stopSpy = jest.spyOn(firstSession, 'stop');
+
+    (runner as any).needsRestart = true;
+
+    // Send a plain text turn (no image) — restart should still happen
+    await sendChannelPost(port, 'chat:r06', 'plain text follow-up');
+    await new Promise(r => setTimeout(r, 150));
+
+    expect(stopSpy).toHaveBeenCalled();
+    expect(runner.restartPending).toBe(false);
+  }, 15000);
+});
+
+// ── Image size edge cases (US-004) ────────────────────────────────────────────
+
+describe('AgentRunner — image size edge cases (US-004)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-us4-'));
+    agentConfig = makeAgentConfig(path.join(tmpDir, 'workspace'));
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  async function sendImageChannelPost(
+    port: number,
+    chatId: string,
+    imagePath: string,
+    content = '',
+  ): Promise<void> {
+    await fetch(`http://127.0.0.1:${port}/channel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content,
+        meta: {
+          chat_id: chatId,
+          message_id: '1',
+          user: 'testuser',
+          ts: new Date().toISOString(),
+          image_path: imagePath,
+        },
+      }),
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // US4-01: Error turn with image → accumulator still counts
+  // Binary was loaded into context before the error, so size must be tracked.
+  // --------------------------------------------------------------------------
+  it('US4-01: error result turn still accumulates image size', async () => {
+    const testImagePath = path.join(tmpDir, 'err-img.jpg');
+    const fileSize = 1024;
+    fs.writeFileSync(testImagePath, Buffer.alloc(fileSize));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:us4-01', testImagePath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:us4-01');
+    expect(session).toBeDefined();
+
+    // Emit an error result — binary was loaded into context before the error
+    session!.emit('output', JSON.stringify({ type: 'result', result: '', is_error: true }));
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(fileSize);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US4-02: Single image > MAX_IMAGE_SIZE_BYTES → summary triggered then needsRestart = true
+  // --------------------------------------------------------------------------
+  it('US4-02: single image larger than MAX_IMAGE_SIZE_BYTES triggers summary then sets needsRestart', async () => {
+    const testImagePath = path.join(tmpDir, 'large.jpg');
+    const fileSize = MAX_IMAGE_SIZE_BYTES + 1;
+    fs.writeFileSync(testImagePath, Buffer.alloc(fileSize));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:us4-02', testImagePath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:us4-02');
+    expect(session).toBeDefined();
+    jest.spyOn(session!, 'query').mockResolvedValue('Image 1: A large test image');
+    session!.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 200));
+
+    expect(runner.restartPending).toBe(true);
+    expect(runner.imageSize).toBe(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US4-03: Image sent after restart → accumulator starts from 0, not from old total
+  // --------------------------------------------------------------------------
+  it('US4-03: image sent after restart accumulates from zero, not from old session total', async () => {
+    const img1 = path.join(tmpDir, 'before-restart.jpg');
+    const img2 = path.join(tmpDir, 'after-restart.jpg');
+    const size1 = 3000;
+    const size2 = 512;
+    fs.writeFileSync(img1, Buffer.alloc(size1));
+    fs.writeFileSync(img2, Buffer.alloc(size2));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    // First image turn (pre-restart session)
+    await sendImageChannelPost(port, 'chat:us4-03', img1);
+    await new Promise(r => setTimeout(r, 150));
+    const session1 = getSessions(runner).get('chat:us4-03')!;
+    expect(session1).toBeDefined();
+    session1.emit('output', JSON.stringify({ type: 'result', result: 'done1' }));
+    await new Promise(r => setTimeout(r, 100));
+    expect(runner.imageSize).toBe(size1);
+
+    // Mark restart needed; next turn triggers the restart and resets accumulator to 0
+    (runner as any).needsRestart = true;
+    await sendChannelPost(port, 'chat:us4-03', 'text turn triggers restart');
+    await new Promise(r => setTimeout(r, 150));
+    expect(runner.imageSize).toBe(0);
+
+    // Image turn in the new session — must accumulate from zero
+    await sendImageChannelPost(port, 'chat:us4-03', img2);
+    await new Promise(r => setTimeout(r, 150));
+    const session2 = getSessions(runner).get('chat:us4-03')!;
+    expect(session2).toBeDefined();
+    session2.emit('output', JSON.stringify({ type: 'result', result: 'done2' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    // Only size2 should be in the accumulator — old total (size1) must not carry over
+    expect(runner.imageSize).toBe(size2);
+    expect(runner.restartPending).toBe(false);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US4-04: query() called with summary prompt when threshold is crossed
+  // --------------------------------------------------------------------------
+  it('US4-04: session.query() is called with summary prompt when threshold is crossed', async () => {
+    const testImagePath = path.join(tmpDir, 'us4-04.jpg');
+    fs.writeFileSync(testImagePath, Buffer.alloc(MAX_IMAGE_SIZE_BYTES + 1));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:us4-04', testImagePath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:us4-04')!;
+    const querySpy = jest.spyOn(session, 'query').mockResolvedValue('Image 1: A test image');
+
+    session.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 200));
+
+    expect(querySpy).toHaveBeenCalledTimes(1);
+    expect(querySpy.mock.calls[0][0]).toContain('summarize');
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US4-05: needsRestart = true even when query() fails
+  // --------------------------------------------------------------------------
+  it('US4-05: needsRestart is set to true even when query() rejects', async () => {
+    const testImagePath = path.join(tmpDir, 'us4-05.jpg');
+    fs.writeFileSync(testImagePath, Buffer.alloc(MAX_IMAGE_SIZE_BYTES + 1));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:us4-05', testImagePath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:us4-05')!;
+    jest.spyOn(session, 'query').mockRejectedValue(new Error('query failed'));
+
+    session.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 200));
+
+    expect(runner.restartPending).toBe(true);
+  }, 15000);
+});
+
+// ── Image size tracking tests (US-002) ────────────────────────────────────────
+
+describe('AgentRunner — image size tracking (US-002)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-imgsize-'));
+    agentConfig = makeAgentConfig(path.join(tmpDir, 'workspace'));
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  async function sendImageChannelPost(
+    port: number,
+    chatId: string,
+    imagePath: string,
+    content = '',
+  ): Promise<void> {
+    await fetch(`http://127.0.0.1:${port}/channel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content,
+        meta: {
+          chat_id: chatId,
+          message_id: '1',
+          user: 'testuser',
+          ts: new Date().toISOString(),
+          image_path: imagePath,
+        },
+      }),
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // US2-01: text-only turn does not change imageSizeSinceRestart
+  // --------------------------------------------------------------------------
+  it('US2-01: text-only turn leaves imageSizeSinceRestart at zero', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendChannelPost(port, 'chat:img01', 'hello world');
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:img01');
+    if (session) {
+      session.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    }
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(0);
+    expect(runner.restartPending).toBe(false);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US2-02: image turn accumulates file size in imageSizeSinceRestart
+  // --------------------------------------------------------------------------
+  it('US2-02: image turn accumulates file size in imageSizeSinceRestart', async () => {
+    const testImagePath = path.join(tmpDir, 'test.jpg');
+    const fileSize = 1024;
+    fs.writeFileSync(testImagePath, Buffer.alloc(fileSize));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:img02', testImagePath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:img02');
+    expect(session).toBeDefined();
+    session!.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(fileSize);
+    expect(runner.restartPending).toBe(false);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US2-03: crossing MAX_IMAGE_SIZE_BYTES triggers summary then sets needsRestart = true
+  // --------------------------------------------------------------------------
+  it('US2-03: crossing MAX_IMAGE_SIZE_BYTES threshold triggers summary and sets needsRestart', async () => {
+    const testImagePath = path.join(tmpDir, 'threshold.jpg');
+    const fileSize = 200;
+    fs.writeFileSync(testImagePath, Buffer.alloc(fileSize));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    // Pre-set accumulator so that adding fileSize bytes crosses the limit
+    (runner as any).imageSizeSinceRestart = MAX_IMAGE_SIZE_BYTES - fileSize + 1;
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:img03', testImagePath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:img03');
+    expect(session).toBeDefined();
+    jest.spyOn(session!, 'query').mockResolvedValue('Image 1: A test threshold image');
+    session!.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 200));
+
+    expect(runner.restartPending).toBe(true);
+    expect(runner.imageSize).toBe(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US2-04: fs.stat failure → log warning, accumulator unchanged, no crash
+  // --------------------------------------------------------------------------
+  it('US2-04: fs.stat failure does not change accumulator and does not crash', async () => {
+    const nonExistentPath = path.join(tmpDir, 'no-such-file.jpg');
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:img04', nonExistentPath);
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:img04');
+    expect(session).toBeDefined();
+    session!.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(0);
+    expect(runner.restartPending).toBe(false);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US2-05: image with caption counts size normally
+  // --------------------------------------------------------------------------
+  it('US2-05: image with caption counts file size normally', async () => {
+    const testImagePath = path.join(tmpDir, 'captioned.jpg');
+    const fileSize = 512;
+    fs.writeFileSync(testImagePath, Buffer.alloc(fileSize));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendImageChannelPost(port, 'chat:img05', testImagePath, 'look at this photo');
+    await new Promise(r => setTimeout(r, 150));
+
+    const session = getSessions(runner).get('chat:img05');
+    expect(session).toBeDefined();
+    session!.emit('output', JSON.stringify({ type: 'result', result: 'done' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(fileSize);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US2-06: multiple image turns from different sessions accumulate total size
+  // --------------------------------------------------------------------------
+  it('US2-06: multiple image turns accumulate total size across sessions', async () => {
+    const img1 = path.join(tmpDir, 'img1.jpg');
+    const img2 = path.join(tmpDir, 'img2.jpg');
+    fs.writeFileSync(img1, Buffer.alloc(300));
+    fs.writeFileSync(img2, Buffer.alloc(700));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    // First image turn
+    await sendImageChannelPost(port, 'chat:img06a', img1);
+    await new Promise(r => setTimeout(r, 150));
+    const sessA = getSessions(runner).get('chat:img06a')!;
+    expect(sessA).toBeDefined();
+    sessA.emit('output', JSON.stringify({ type: 'result', result: 'done 1' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(300);
+
+    // Second image turn on a different session
+    await sendImageChannelPost(port, 'chat:img06b', img2);
+    await new Promise(r => setTimeout(r, 150));
+    const sessB = getSessions(runner).get('chat:img06b')!;
+    expect(sessB).toBeDefined();
+    sessB.emit('output', JSON.stringify({ type: 'result', result: 'done 2' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(runner.imageSize).toBe(1000); // 300 + 700
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // US2-07: rapid-fire images on same chatId — all counted, not just last
+  // --------------------------------------------------------------------------
+  it('US2-07: multiple images sent rapidly on same chatId all accumulate via queue', async () => {
+    const img1 = path.join(tmpDir, 'rapid1.jpg');
+    const img2 = path.join(tmpDir, 'rapid2.jpg');
+    const img3 = path.join(tmpDir, 'rapid3.jpg');
+    fs.writeFileSync(img1, Buffer.alloc(100));
+    fs.writeFileSync(img2, Buffer.alloc(200));
+    fs.writeFileSync(img3, Buffer.alloc(300));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+
+    // Send 3 images before any result fires — all should be enqueued
+    await sendImageChannelPost(port, 'chat:img07', img1);
+    await sendImageChannelPost(port, 'chat:img07', img2);
+    await sendImageChannelPost(port, 'chat:img07', img3);
+    await new Promise(r => setTimeout(r, 200));
+
+    const session = getSessions(runner).get('chat:img07')!;
+    expect(session).toBeDefined();
+
+    // Fire 3 results — each dequeues one image path
+    session.emit('output', JSON.stringify({ type: 'result', result: 'turn1' }));
+    await new Promise(r => setTimeout(r, 100));
+    expect(runner.imageSize).toBe(100);
+
+    session.emit('output', JSON.stringify({ type: 'result', result: 'turn2' }));
+    await new Promise(r => setTimeout(r, 100));
+    expect(runner.imageSize).toBe(300); // 100 + 200
+
+    session.emit('output', JSON.stringify({ type: 'result', result: 'turn3' }));
+    await new Promise(r => setTimeout(r, 100));
+    expect(runner.imageSize).toBe(600); // 100 + 200 + 300
   }, 15000);
 });
