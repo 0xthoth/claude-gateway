@@ -65,9 +65,7 @@ function validateAgent(agent: Record<string, unknown>, index: number): string | 
   }
   const hasTelegram = agent.telegram && typeof agent.telegram === 'object';
   const hasDiscord = agent.discord && typeof agent.discord === 'object';
-  if (!hasTelegram && !hasDiscord) {
-    return `Agent "${agent.id}" must have at least one channel configured ("telegram" or "discord")`;
-  }
+  // Agents without channels are allowed (API-only agents accessed via HTTP API key)
   if (hasTelegram) {
     const telegram = agent.telegram as Record<string, unknown>;
     if (!telegram.botToken || typeof telegram.botToken !== 'string') {
