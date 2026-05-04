@@ -8,6 +8,7 @@ import { generateDashboardHtml } from '../ui/web-ui';
 import { createApiRouter } from './router';
 import { createCronRouter } from './cron-router';
 import { createWorkspaceRouter } from './workspace-router';
+import { createSkillsRouter } from './skills-router';
 
 export class GatewayRouter {
   private readonly agents: Map<string, AgentRunner>;
@@ -94,6 +95,15 @@ export class GatewayRouter {
         this.gatewayConfig.gateway.api.keys,
       );
       this.app.use('/api', workspaceRouter);
+    }
+
+    // Mount skills routes
+    if (this.gatewayConfig?.gateway?.api?.keys?.length) {
+      const skillsRouter = createSkillsRouter(
+        this.configs,
+        this.gatewayConfig.gateway.api.keys,
+      );
+      this.app.use('/api', skillsRouter);
     }
 
     // Mount cron manager routes with same API key auth as agent router
