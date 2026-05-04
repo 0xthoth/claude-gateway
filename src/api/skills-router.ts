@@ -153,14 +153,22 @@ export function createSkillsRouter(
 
     const scopeFilter = req.query['scope'] as string | undefined;
 
-    // Find skill by name, optionally filtered by scope
+    // Find skill by name, optionally filtered by scope.
+    // Module skills are keyed as "prefix:name" (e.g. "cron:cron") so a direct
+    // get(name) may miss them — fall back to a linear search by name+source.
     let skill = registry.skills.get(name);
     if (scopeFilter && skill && skill.source !== scopeFilter) {
-      // Try to find a matching skill with the requested scope
+      // Direct key hit has the wrong scope — search by name within the requested scope.
       const scopedMatch = [...registry.skills.values()].find(
         (s) => s.name === name && s.source === scopeFilter,
       );
       skill = scopedMatch ?? undefined;
+    }
+    if (!skill && scopeFilter) {
+      // Direct key miss — search by name+scope (covers module skills keyed as prefix:name).
+      skill = [...registry.skills.values()].find(
+        (s) => s.name === name && s.source === scopeFilter,
+      );
     }
 
     if (!skill) {
