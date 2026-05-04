@@ -7,6 +7,7 @@ import { CronManager } from '../cron/manager';
 import { generateDashboardHtml } from '../ui/web-ui';
 import { createApiRouter } from './router';
 import { createCronRouter } from './cron-router';
+import { createWorkspaceRouter } from './workspace-router';
 
 export class GatewayRouter {
   private readonly agents: Map<string, AgentRunner>;
@@ -84,6 +85,15 @@ export class GatewayRouter {
         this.gatewayConfig.gateway.api.keys,
       );
       this.app.use('/api', apiRouter);
+    }
+
+    // Mount workspace file routes
+    if (this.gatewayConfig?.gateway?.api?.keys?.length) {
+      const workspaceRouter = createWorkspaceRouter(
+        this.configs,
+        this.gatewayConfig.gateway.api.keys,
+      );
+      this.app.use('/api', workspaceRouter);
     }
 
     // Mount cron manager routes with same API key auth as agent router
@@ -165,9 +175,16 @@ export class GatewayRouter {
   }
 
   async start(port: number): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       this.server = this.app.listen(port, () => {
         resolve();
+      });
+      this.server.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          reject(new Error(`Port ${port} is already in use. Stop the existing process or set a different PORT env var.`));
+        } else {
+          reject(err);
+        }
       });
     });
   }
