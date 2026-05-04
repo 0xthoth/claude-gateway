@@ -38,17 +38,22 @@ export class GatewayRouter {
   /** Optional persistent cron manager */
   private readonly cronManager?: CronManager;
 
+  /** Path to config.json for agent CRUD operations */
+  private readonly configPath?: string;
+
   constructor(
     agents: Map<string, AgentRunner>,
     configs: Map<string, AgentConfig>,
     schedulers?: Map<string, CronScheduler>,
     gatewayConfig?: GatewayConfig,
     cronManager?: CronManager,
+    configPath?: string,
   ) {
     this.agents = agents;
     this.configs = configs;
     this.gatewayConfig = gatewayConfig;
     this.cronManager = cronManager;
+    this.configPath = configPath;
     this.app = express();
 
     // Initialise counters for all known agents
@@ -84,6 +89,7 @@ export class GatewayRouter {
         this.agents,
         this.configs,
         this.gatewayConfig.gateway.api.keys,
+        this.configPath,
       );
       this.app.use('/api', apiRouter);
     }
