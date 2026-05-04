@@ -1141,22 +1141,11 @@ export class AgentRunner extends EventEmitter {
 
     const systemNote = buildApiSystemNote(opts.allowTools ?? false);
 
-    // Detect skill commands (same as channel message path)
-    const skillInvocation = detectSkillCommand(message, this.skillRegistry);
-    if (skillInvocation) {
-      this.logger.info('Skill invoked via API', {
-        skill: skillInvocation.skillKey,
-        args: skillInvocation.args,
-        sessionId,
-      });
-    }
-
     const channelXml =
       `<channel source="api" session_id="${sessionId}" ts="${new Date().toISOString()}">\n` +
       `${message}\n\n` +
       `${systemNote}` +
-      `</channel>` +
-      (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
+      `</channel>`;
 
     return new Promise<string>((resolve, reject) => {
       const buffer: string[] = [];
@@ -1416,22 +1405,11 @@ export class AgentRunner extends EventEmitter {
 
     const systemNote = buildApiSystemNote(opts.allowTools ?? false);
 
-    // Detect skill commands (same as channel message path)
-    const skillInvocationStream = detectSkillCommand(message, this.skillRegistry);
-    if (skillInvocationStream) {
-      this.logger.info('Skill invoked via API stream', {
-        skill: skillInvocationStream.skillKey,
-        args: skillInvocationStream.args,
-        sessionId,
-      });
-    }
-
     const channelXml =
       `<channel source="api" session_id="${sessionId}" ts="${new Date().toISOString()}">\n` +
       `${message}\n\n` +
       systemNote +
-      `</channel>` +
-      (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
+      `</channel>`;
 
     session.setProcessing(true);
     session.sendMessage(channelXml);
