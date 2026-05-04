@@ -102,6 +102,7 @@ export class GatewayRouter {
       const skillsRouter = createSkillsRouter(
         this.configs,
         this.gatewayConfig.gateway.api.keys,
+        this.agents,
       );
       this.app.use('/api', skillsRouter);
     }

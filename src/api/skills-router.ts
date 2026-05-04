@@ -6,6 +6,7 @@ import { AgentConfig, ApiKey } from '../types';
 import { createApiAuthMiddleware, canAccessAgent } from './auth';
 import { loadSkills } from '../skills/loader';
 import { extractFrontmatter } from '../skills/parser';
+import type { AgentRunner } from '../agent/runner';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
@@ -63,9 +64,25 @@ function extractSourceUrl(filePath: string): string | null {
   }
 }
 
+function reloadRunnerRegistry(
+  agentId: string,
+  config: AgentConfig,
+  agents: Map<string, AgentRunner>,
+): void {
+  const runner = agents.get(agentId);
+  if (!runner) return;
+  const registry = loadSkills({
+    workspaceDir: config.workspace,
+    mcpToolsDir: MCP_TOOLS_DIR,
+    sharedSkillsDir: SHARED_SKILLS_DIR,
+  });
+  runner.setSkillRegistry(registry);
+}
+
 export function createSkillsRouter(
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
+  agents?: Map<string, AgentRunner>,
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
@@ -230,6 +247,7 @@ export function createSkillsRouter(
       const tmpFile = skillFile + '.tmp';
       fs.writeFileSync(tmpFile, skillMd, 'utf-8');
       fs.renameSync(tmpFile, skillFile);
+      if (agents) reloadRunnerRegistry(agentId, config, agents);
       res.status(201).json({
         key: name,
         name,
@@ -331,7 +349,7 @@ export function createSkillsRouter(
       const tmpFile = skillFile + '.tmp';
       fs.writeFileSync(tmpFile, content, 'utf-8');
       fs.renameSync(tmpFile, skillFile);
-
+      if (agents) reloadRunnerRegistry(agentId, config, agents);
       const description = typeof fm['description'] === 'string' ? fm['description'] : '(no description)';
       res.status(201).json({
         key: skillName,
@@ -380,6 +398,7 @@ export function createSkillsRouter(
 
     try {
       fs.rmSync(skillDir, { recursive: true, force: true });
+      if (agents) reloadRunnerRegistry(agentId, config, agents);
       res.json({ message: `Skill "${name}" deleted from ${scope}` });
     } catch (err: unknown) {
       res.status(500).json({ error: (err as Error).message });
