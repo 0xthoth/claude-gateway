@@ -40,6 +40,9 @@ export class SessionProcess extends EventEmitter {
   private _queryTimer?: ReturnType<typeof setTimeout>;
   private _querySettled = false;
 
+  /** Per-request model override (API sessions only). If set, overrides config model. */
+  private readonly modelOverride?: string;
+
   constructor(
     sessionId: string,
     source: 'telegram' | 'discord' | 'api',
@@ -47,6 +50,7 @@ export class SessionProcess extends EventEmitter {
     gatewayConfig: GatewayConfig,
     sessionStore: SessionStore,
     chatId?: string,  // for telegram/discord: actual chatId; for api: same as sessionId
+    modelOverride?: string,
   ) {
     super();
     this.sessionId = sessionId;
@@ -64,13 +68,16 @@ export class SessionProcess extends EventEmitter {
     this.configPath = path.resolve(agentConfig.workspace, '..', '..', '..', 'config.json');
     const stateSubDir = source === 'discord' ? '.discord-state' : '.telegram-state';
     this.restartSignalPath = path.join(agentConfig.workspace, stateSubDir, `restart-${sessionId}`);
+    this.modelOverride = modelOverride;
   }
 
   /**
    * Read model from config.json on disk so restarts pick up changes made after startup.
    * Falls back to the cached agentConfig.claude.model if config can't be read.
+   * If modelOverride is set (API per-request override), it always wins.
    */
   private readFreshModel(): string {
+    if (this.modelOverride) return this.modelOverride;
     try {
       const raw = fs.readFileSync(this.configPath, 'utf-8');
       const config = JSON.parse(raw) as { agents?: Array<{ id: string; claude?: { model?: string } }> };

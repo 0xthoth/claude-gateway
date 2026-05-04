@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, ApiKey } from '../types';
+import { AgentConfig, ApiKey, ModelConfig } from '../types';
 import { createApiAuthMiddleware, canAccessAgent } from './auth';
 
 const MAX_MESSAGE_LENGTH = 10_000;
@@ -13,6 +13,7 @@ export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
+  modelConfigs?: ModelConfig[],
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
@@ -43,8 +44,9 @@ export function createApiRouter(
       session_id?: unknown;
       stream?: unknown;
       timeout_ms?: unknown;
+      model?: unknown;
     };
-    const { message, session_id, stream, timeout_ms } = body;
+    const { message, session_id, stream, timeout_ms, model } = body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       res.status(400).json({ error: 'message is required and must be a non-empty string' });
@@ -57,6 +59,30 @@ export function createApiRouter(
     if (session_id !== undefined && typeof session_id !== 'string') {
       res.status(400).json({ error: 'session_id must be a string if provided' });
       return;
+    }
+
+    // Validate model override if provided
+    let resolvedModel: string | undefined;
+    if (model !== undefined) {
+      if (typeof model !== 'string' || !model.trim()) {
+        res.status(400).json({ error: 'model must be a non-empty string if provided' });
+        return;
+      }
+      if (modelConfigs && modelConfigs.length > 0) {
+        const allowed = modelConfigs.some(
+          m => m.id === model.trim() || m.alias === model.trim()
+        );
+        if (!allowed) {
+          const ids = modelConfigs.map(m => m.id).join(', ');
+          res.status(400).json({ error: `Unknown model "${model}". Allowed: ${ids}` });
+          return;
+        }
+        // Resolve alias to full model ID
+        const matched = modelConfigs.find(m => m.alias === model.trim());
+        resolvedModel = matched ? matched.id : model.trim();
+      } else {
+        resolvedModel = model.trim();
+      }
     }
 
     const requestId = randomUUID();
@@ -109,7 +135,7 @@ export function createApiRouter(
           sessionId,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools: !!apiKey.allow_tools },
+          { timeoutMs, allowTools: !!apiKey.allow_tools, model: resolvedModel },
         );
 
         // Client disconnect -> cleanup
@@ -135,6 +161,7 @@ export function createApiRouter(
         const response = await runner.sendApiMessage(sessionId, message.trim(), {
           timeoutMs,
           allowTools: !!apiKey.allow_tools,
+          model: resolvedModel,
         });
         res.json({
           request_id: requestId,

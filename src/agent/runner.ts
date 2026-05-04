@@ -517,6 +517,7 @@ export class AgentRunner extends EventEmitter {
     mapKey: string,              // Map lookup key (chatId for telegram/discord, sessionId for API)
     source: 'telegram' | 'discord' | 'api',
     sessionId?: string,          // actual session UUID (only for channel sessions; equals mapKey for API)
+    modelOverride?: string,      // per-request model override (API sessions only)
   ): Promise<SessionProcess> {
     const existing = this.sessions.get(mapKey);
     if (existing) return existing;
@@ -546,6 +547,7 @@ export class AgentRunner extends EventEmitter {
       this.gatewayConfig,
       this.sessionStore,
       chatId,
+      modelOverride,
     );
     await proc.start();
 
@@ -1115,7 +1117,7 @@ export class AgentRunner extends EventEmitter {
   async sendApiMessage(
     sessionId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; model?: string },
   ): Promise<string> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1125,7 +1127,7 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    const session = await this.getOrSpawnSession(sessionId, 'api');
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Persist user message
     await this.sessionStore
@@ -1253,7 +1255,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; model?: string },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1263,7 +1265,7 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    const session = await this.getOrSpawnSession(sessionId, 'api');
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Persist user message
     await this.sessionStore

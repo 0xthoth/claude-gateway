@@ -82,6 +82,7 @@ export class GatewayRouter {
         this.agents,
         this.configs,
         this.gatewayConfig.gateway.api.keys,
+        this.gatewayConfig.gateway.models,
       );
       this.app.use('/api', apiRouter);
     }
