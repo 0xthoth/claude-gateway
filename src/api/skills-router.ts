@@ -47,6 +47,22 @@ function toRawGitHubUrl(url: string): string {
   return url;
 }
 
+/**
+ * Extract source_url from a SKILL.md file's frontmatter (homepage field),
+ * or return null if not present.
+ */
+function extractSourceUrl(filePath: string): string | null {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    const extracted = extractFrontmatter(raw);
+    if (!extracted) return null;
+    const homepage = extracted.frontmatter['homepage'];
+    return typeof homepage === 'string' ? homepage : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createSkillsRouter(
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
@@ -87,9 +103,10 @@ export function createSkillsRouter(
       emoji: skill.emoji ?? null,
       userInvocable: skill.userInvocable,
       modulePrefix: skill.modulePrefix ?? null,
+      source_url: extractSourceUrl(skill.filePath),
     }));
 
-    res.json({ skills });
+    res.json(skills);
   });
 
   /**
@@ -117,9 +134,20 @@ export function createSkillsRouter(
       sharedSkillsDir: SHARED_SKILLS_DIR,
     });
 
-    const skill = registry.skills.get(name);
+    const scopeFilter = req.query['scope'] as string | undefined;
+
+    // Find skill by name, optionally filtered by scope
+    let skill = registry.skills.get(name);
+    if (scopeFilter && skill && skill.source !== scopeFilter) {
+      // Try to find a matching skill with the requested scope
+      const scopedMatch = [...registry.skills.values()].find(
+        (s) => s.name === name && s.source === scopeFilter,
+      );
+      skill = scopedMatch ?? undefined;
+    }
+
     if (!skill) {
-      res.status(404).json({ error: `Skill '${name}' not found` });
+      res.status(404).json({ error: `Skill '${name}' not found${scopeFilter ? ` in scope '${scopeFilter}'` : ''}` });
       return;
     }
 
@@ -137,6 +165,7 @@ export function createSkillsRouter(
       scope: skill.source,
       emoji: skill.emoji ?? null,
       content: rawContent,
+      source_url: extractSourceUrl(skill.filePath),
     });
   });
 
@@ -201,7 +230,17 @@ export function createSkillsRouter(
       const tmpFile = skillFile + '.tmp';
       fs.writeFileSync(tmpFile, skillMd, 'utf-8');
       fs.renameSync(tmpFile, skillFile);
-      res.status(201).json({ message: `Skill "${name}" created (scope: ${scope})` });
+      res.status(201).json({
+        key: name,
+        name,
+        description,
+        scope,
+        emoji: null,
+        userInvocable: true,
+        modulePrefix: null,
+        content: skillMd,
+        source_url: null,
+      });
     } catch (err: unknown) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -295,8 +334,15 @@ export function createSkillsRouter(
 
       const description = typeof fm['description'] === 'string' ? fm['description'] : '(no description)';
       res.status(201).json({
-        message: `Skill "${skillName}" installed from ${rawUrl} (scope: ${scope})`,
+        key: skillName,
+        name: skillName,
         description,
+        scope,
+        emoji: typeof fm['emoji'] === 'string' ? fm['emoji'] : null,
+        userInvocable: true,
+        modulePrefix: null,
+        content,
+        source_url: url,
       });
     } catch (err: unknown) {
       res.status(500).json({ error: (err as Error).message });
