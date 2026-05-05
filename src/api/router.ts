@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { AgentRunner } from '../agent/runner';
 import { AgentConfig, ApiKey } from '../types';
@@ -220,12 +221,13 @@ export function createApiRouter(
       return;
     }
 
-    const workspace = path.join(path.dirname(configPath), 'agents', id, 'workspace');
+    const workspace = path.join('~', '.claude-gateway', 'agents', id, 'workspace');
+    const workspaceAbs = path.join(os.homedir(), '.claude-gateway', 'agents', id, 'workspace');
     const newAgent: Record<string, unknown> = {
       id,
       description: description.trim(),
       workspace,
-      env: path.join(path.dirname(configPath), 'agents', id, 'workspace', '.env'),
+      env: path.join('~', '.claude-gateway', 'agents', id, 'workspace', '.env'),
       claude: {
         model: typeof model === 'string' && model.trim() ? model.trim() : 'claude-sonnet-4-6',
         dangerouslySkipPermissions: false,
@@ -235,8 +237,8 @@ export function createApiRouter(
 
     // Create workspace directory and required AGENTS.md so startAgent validation passes
     try {
-      fs.mkdirSync(workspace, { recursive: true });
-      const agentsMdPath = path.join(workspace, 'AGENTS.md');
+      fs.mkdirSync(workspaceAbs, { recursive: true });
+      const agentsMdPath = path.join(workspaceAbs, 'AGENTS.md');
       if (!fs.existsSync(agentsMdPath)) {
         fs.writeFileSync(agentsMdPath, `# Agent: ${id}\n\n${description.trim()}\n`, 'utf8');
       }
