@@ -59,6 +59,7 @@ export interface ModelConfig {
   label: string;
   alias: string;
   contextWindow: number;
+  multiplier?: number;
 }
 
 export interface GatewayConfig {

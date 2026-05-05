@@ -195,7 +195,7 @@ export function createApiRouter(
    */
   router.get('/v1/models', auth, (_req: Request, res: Response) => {
     const configModels = models ?? DEFAULT_MODELS;
-    res.json({ models: configModels.map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow })) });
+    res.json({ models: configModels.map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
   });
 
   /**
