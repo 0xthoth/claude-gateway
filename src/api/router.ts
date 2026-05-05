@@ -32,13 +32,6 @@ function writeAgentsToConfig(
   fs.renameSync(tmp, configPath);
 }
 
-const DEFAULT_MODELS: ModelConfig[] = [
-  { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6', alias: 'opus46', contextWindow: 1000000 },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku', contextWindow: 200000 },
-];
-
 export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
   agentConfigs: Map<string, AgentConfig>,
@@ -194,8 +187,7 @@ export function createApiRouter(
    * List all supported Claude models from gateway config (falls back to defaults).
    */
   router.get('/v1/models', auth, (_req: Request, res: Response) => {
-    const configModels = models ?? DEFAULT_MODELS;
-    res.json({ models: configModels.map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
+    res.json({ models: (models ?? []).map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
   });
 
   /**
