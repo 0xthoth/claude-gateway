@@ -233,11 +233,15 @@ export function createApiRouter(
       },
     };
 
-    // Create workspace directory so the agent can start immediately after config reload
+    // Create workspace directory and required AGENTS.md so startAgent validation passes
     try {
       fs.mkdirSync(workspace, { recursive: true });
+      const agentsMdPath = path.join(workspace, 'AGENTS.md');
+      if (!fs.existsSync(agentsMdPath)) {
+        fs.writeFileSync(agentsMdPath, `# Agent: ${id}\n\n${description.trim()}\n`, 'utf8');
+      }
     } catch (err) {
-      res.status(500).json({ error: `Failed to create workspace directory: ${(err as Error).message}` });
+      res.status(500).json({ error: `Failed to create workspace: ${(err as Error).message}` });
       return;
     }
 
