@@ -154,6 +154,17 @@ async function startAgent(
   const logger = createLogger(agentConfig.id, logDir);
   logger.info('Initialising agent', { id: agentConfig.id });
 
+  // Ensure workspace directory exists (may be absent for newly created agents)
+  try {
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+  } catch (err) {
+    const reason = (err as Error).message;
+    logger.error('Failed to create workspace directory', { error: reason });
+    console.log(JSON.stringify({ id: agentConfig.id, status: 'failed', reason }));
+    startupResults.push({ id: agentConfig.id, status: 'failed', workspace: agentConfig.workspace, reason });
+    return;
+  }
+
   // ── Migrate legacy lowercase workspace files (agent.md → AGENTS.md, etc.) ──
   if (fs.existsSync(agentConfig.workspace)) {
     try {
