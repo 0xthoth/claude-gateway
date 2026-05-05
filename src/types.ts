@@ -51,6 +51,7 @@ export interface ApiKey {
   description?: string;
   agents: string[] | '*'; // agent IDs this key can access, or '*' for all
   allow_tools?: boolean;  // permit tool-enabled (allow_tools) requests for this key
+  admin?: boolean;        // if true, bypasses all agent scope checks
 }
 
 export interface ModelConfig {
