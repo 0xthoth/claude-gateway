@@ -235,12 +235,20 @@ export function createApiRouter(
       },
     };
 
-    // Create workspace directory and required AGENTS.md so startAgent validation passes
+    // Create workspace directory and stub files matching UI WORKSPACE_FILES
+    const stubFiles: Record<string, string> = {
+      'AGENTS.md': `# Agent: ${id}\n\n${description.trim()}\n`,
+      'SOUL.md': `# Soul\n\n`,
+      'USER.md': `# User Profile\n\n`,
+      'MEMORY.md': `# Memory\n\n`,
+    };
     try {
       fs.mkdirSync(workspaceAbs, { recursive: true });
-      const agentsMdPath = path.join(workspaceAbs, 'AGENTS.md');
-      if (!fs.existsSync(agentsMdPath)) {
-        fs.writeFileSync(agentsMdPath, `# Agent: ${id}\n\n${description.trim()}\n`, 'utf8');
+      for (const [filename, stub] of Object.entries(stubFiles)) {
+        const filePath = path.join(workspaceAbs, filename);
+        if (!fs.existsSync(filePath)) {
+          fs.writeFileSync(filePath, stub, 'utf8');
+        }
       }
     } catch (err) {
       res.status(500).json({ error: `Failed to create workspace: ${(err as Error).message}` });
