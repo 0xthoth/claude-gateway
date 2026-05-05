@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, ApiKey } from '../types';
+import { AgentConfig, ApiKey, ModelConfig } from '../types';
 import { createApiAuthMiddleware, canAccessAgent } from './auth';
 
 const MAX_MESSAGE_LENGTH = 10_000;
@@ -37,6 +37,7 @@ export function createApiRouter(
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
   configPath?: string,
+  models?: ModelConfig[],
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
@@ -178,6 +179,15 @@ export function createApiRouter(
         }
       }
     }
+  });
+
+  /**
+   * GET /api/v1/models
+   *
+   * List all supported Claude models from gateway config (falls back to defaults).
+   */
+  router.get('/v1/models', auth, (_req: Request, res: Response) => {
+    res.json({ models: (models ?? []).map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
   });
 
   /**
