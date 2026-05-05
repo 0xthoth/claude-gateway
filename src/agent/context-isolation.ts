@@ -49,12 +49,14 @@ export class ContextIsolationGuard {
       }
       workspaces.set(ws, agent.id);
 
-      // Token check
+      // Token check — skip if token is empty (agent has no telegram channel configured)
       const token = agent.telegram?.botToken ?? '';
-      if (tokens.has(token)) {
-        throw new TokenConflictError([tokens.get(token)!, agent.id], token);
+      if (token) {
+        if (tokens.has(token)) {
+          throw new TokenConflictError([tokens.get(token)!, agent.id], token);
+        }
+        tokens.set(token, agent.id);
       }
-      tokens.set(token, agent.id);
 
       // Session dir: derived as <workspace>/../sessions (by convention),
       // but we also check the agent id-based session path if it were the same.
