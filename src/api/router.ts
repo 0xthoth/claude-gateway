@@ -233,6 +233,14 @@ export function createApiRouter(
       },
     };
 
+    // Create workspace directory so the agent can start immediately after config reload
+    try {
+      fs.mkdirSync(workspace, { recursive: true });
+    } catch (err) {
+      res.status(500).json({ error: `Failed to create workspace directory: ${(err as Error).message}` });
+      return;
+    }
+
     try {
       writeAgentsToConfig(configPath, (agents) => agents.push(newAgent), id);
     } catch (err) {
