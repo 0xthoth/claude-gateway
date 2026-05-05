@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, ApiKey } from '../types';
+import { AgentConfig, ApiKey, ModelConfig } from '../types';
 import { createApiAuthMiddleware, canAccessAgent } from './auth';
 
 const MAX_MESSAGE_LENGTH = 10_000;
@@ -32,11 +32,19 @@ function writeAgentsToConfig(
   fs.renameSync(tmp, configPath);
 }
 
+const DEFAULT_MODELS: ModelConfig[] = [
+  { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
+  { id: 'claude-opus-4-6', label: 'Opus 4.6', alias: 'opus46', contextWindow: 1000000 },
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku', contextWindow: 200000 },
+];
+
 export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
   configPath?: string,
+  models?: ModelConfig[],
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
@@ -183,16 +191,11 @@ export function createApiRouter(
   /**
    * GET /api/v1/models
    *
-   * List all supported Claude models.
+   * List all supported Claude models from gateway config (falls back to defaults).
    */
-  const SUPPORTED_MODELS = [
-    { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
-    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-    { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
-  ];
-
   router.get('/v1/models', auth, (_req: Request, res: Response) => {
-    res.json({ models: SUPPORTED_MODELS });
+    const configModels = models ?? DEFAULT_MODELS;
+    res.json({ models: configModels.map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow })) });
   });
 
   /**
