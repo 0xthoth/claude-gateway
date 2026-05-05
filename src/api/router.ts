@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { AgentRunner } from '../agent/runner';
 import { AgentConfig, ApiKey } from '../types';
 import { createApiAuthMiddleware, canAccessAgent } from './auth';
@@ -9,10 +11,23 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
+const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+
+/** Read config.json, mutate agents array, write back atomically. */
+function writeAgentsToConfig(configPath: string, mutate: (agents: unknown[]) => void): void {
+  const raw = fs.readFileSync(configPath, 'utf-8');
+  const config = JSON.parse(raw) as { agents: unknown[]; [k: string]: unknown };
+  mutate(config.agents);
+  const tmp = configPath + '.tmp.' + randomUUID();
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf-8');
+  fs.renameSync(tmp, configPath);
+}
+
 export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
+  configPath?: string,
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
@@ -159,14 +174,141 @@ export function createApiRouter(
   /**
    * GET /api/v1/agents
    *
-   * List agents accessible by the current API key.
+   * List all agents (no API-key scope filter — auth is handled by Go API).
    */
-  router.get('/v1/agents', auth, (req: Request, res: Response) => {
-    const apiKey = (req as AuthedRequest).apiKey;
-    const agents = [...agentConfigs.entries()]
-      .filter(([id]) => canAccessAgent(apiKey, id))
-      .map(([id, cfg]) => ({ id, description: cfg.description }));
+  router.get('/v1/agents', auth, (_req: Request, res: Response) => {
+    const agents = [...agentConfigs.entries()].map(([id, cfg]) => ({
+      id,
+      description: cfg.description,
+      model: cfg.claude?.model ?? null,
+    }));
     res.json({ agents });
+  });
+
+  /**
+   * POST /api/v1/agents
+   *
+   * Create a new agent entry in config.json.
+   * Body: { id, description, model? }
+   */
+  router.post('/v1/agents', auth, (req: Request, res: Response) => {
+    if (!configPath) {
+      res.status(501).json({ error: 'Agent management not available (no configPath)' });
+      return;
+    }
+    const body = req.body as { id?: unknown; description?: unknown; model?: unknown };
+    const { id, description, model } = body;
+
+    if (!id || typeof id !== 'string' || !AGENT_ID_RE.test(id)) {
+      res.status(400).json({ error: 'id must match pattern [a-z][a-z0-9_-]{1,31}' });
+      return;
+    }
+    if (!description || typeof description !== 'string' || !description.trim()) {
+      res.status(400).json({ error: 'description is required' });
+      return;
+    }
+    if (agentConfigs.has(id)) {
+      res.status(409).json({ error: `Agent '${id}' already exists` });
+      return;
+    }
+
+    const workspace = path.join(path.dirname(configPath), '..', 'agents', id, 'workspace');
+    const newAgent: Record<string, unknown> = {
+      id,
+      description: description.trim(),
+      workspace,
+      env: path.join(path.dirname(configPath), '..', 'agents', id, 'workspace', '.env'),
+      claude: {
+        model: typeof model === 'string' && model.trim() ? model.trim() : 'claude-sonnet-4-6',
+        dangerouslySkipPermissions: false,
+        extraFlags: [],
+      },
+    };
+
+    try {
+      writeAgentsToConfig(configPath, (agents) => agents.push(newAgent));
+    } catch (err) {
+      res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      return;
+    }
+
+    res.status(201).json({ agent: { id, description: newAgent.description, model: (newAgent.claude as Record<string, unknown>).model } });
+  });
+
+  /**
+   * PATCH /api/v1/agents/:agentId
+   *
+   * Update agent description and/or model.
+   * Body: { description?, model? }
+   */
+  router.patch('/v1/agents/:agentId', auth, (req: Request, res: Response) => {
+    if (!configPath) {
+      res.status(501).json({ error: 'Agent management not available (no configPath)' });
+      return;
+    }
+    const { agentId } = req.params as { agentId: string };
+    if (!agentConfigs.has(agentId)) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+
+    const body = req.body as { description?: unknown; model?: unknown };
+    const { description, model } = body;
+    if (description !== undefined && (typeof description !== 'string' || !description.trim())) {
+      res.status(400).json({ error: 'description must be a non-empty string' });
+      return;
+    }
+    if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
+      res.status(400).json({ error: 'model must be a non-empty string' });
+      return;
+    }
+
+    try {
+      writeAgentsToConfig(configPath, (agents) => {
+        const agent = (agents as Record<string, unknown>[]).find((a) => a.id === agentId);
+        if (!agent) return;
+        if (description !== undefined) agent.description = (description as string).trim();
+        if (model !== undefined) {
+          const claude = agent.claude as Record<string, unknown> | undefined;
+          if (claude) claude.model = (model as string).trim();
+        }
+      });
+    } catch (err) {
+      res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      return;
+    }
+
+    const cfg = agentConfigs.get(agentId)!;
+    res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model } });
+  });
+
+  /**
+   * DELETE /api/v1/agents/:agentId
+   *
+   * Remove agent from config.json.
+   */
+  router.delete('/v1/agents/:agentId', auth, (req: Request, res: Response) => {
+    if (!configPath) {
+      res.status(501).json({ error: 'Agent management not available (no configPath)' });
+      return;
+    }
+    const { agentId } = req.params as { agentId: string };
+    if (!agentConfigs.has(agentId)) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+
+    try {
+      writeAgentsToConfig(configPath, (agents) => {
+        const idx = (agents as Record<string, unknown>[]).findIndex((a) => a.id === agentId);
+        if (idx !== -1) agents.splice(idx, 1);
+      });
+    } catch (err) {
+      res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      return;
+    }
+
+    res.json({ success: true, id: agentId });
   });
 
   return router;

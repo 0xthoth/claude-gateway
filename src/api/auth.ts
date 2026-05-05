@@ -50,8 +50,10 @@ export function createApiAuthMiddleware(apiKeys: ApiKey[]) {
 
 /**
  * Returns true if the given API key is allowed to access the specified agent.
+ * Keys with `admin: true` bypass all agent scope checks.
  */
 export function canAccessAgent(apiKey: ApiKey, agentId: string): boolean {
+  if (apiKey.admin) return true;
   if (apiKey.agents === '*') return true;
   return (apiKey.agents as string[]).includes(agentId);
 }
