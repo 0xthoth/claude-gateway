@@ -181,6 +181,21 @@ export function createApiRouter(
   });
 
   /**
+   * GET /api/v1/models
+   *
+   * List all supported Claude models.
+   */
+  const SUPPORTED_MODELS = [
+    { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
+    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+    { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+  ];
+
+  router.get('/v1/models', auth, (_req: Request, res: Response) => {
+    res.json({ models: SUPPORTED_MODELS });
+  });
+
+  /**
    * GET /api/v1/agents
    *
    * List all agents (no API-key scope filter — auth is handled by Go API).
