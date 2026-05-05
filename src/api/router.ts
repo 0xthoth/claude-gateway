@@ -13,10 +13,18 @@ type AuthedRequest = Request & { apiKey: ApiKey };
 
 const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 
-/** Read config.json, mutate agents array, write back atomically. */
-function writeAgentsToConfig(configPath: string, mutate: (agents: unknown[]) => void): void {
+/** Read config.json, mutate agents array, write back atomically. Throws if duplicate id detected. */
+function writeAgentsToConfig(
+  configPath: string,
+  mutate: (agents: unknown[]) => void,
+  newId?: string,
+): void {
   const raw = fs.readFileSync(configPath, 'utf-8');
   const config = JSON.parse(raw) as { agents: unknown[]; [k: string]: unknown };
+  if (newId) {
+    const exists = (config.agents as Record<string, unknown>[]).some((a) => a.id === newId);
+    if (exists) throw Object.assign(new Error(`Agent '${newId}' already exists in config`), { code: 'DUPLICATE' });
+  }
   mutate(config.agents);
   const tmp = configPath + '.tmp.' + randomUUID();
   fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf-8');
@@ -212,12 +220,12 @@ export function createApiRouter(
       return;
     }
 
-    const workspace = path.join(path.dirname(configPath), '..', 'agents', id, 'workspace');
+    const workspace = path.join(path.dirname(configPath), 'agents', id, 'workspace');
     const newAgent: Record<string, unknown> = {
       id,
       description: description.trim(),
       workspace,
-      env: path.join(path.dirname(configPath), '..', 'agents', id, 'workspace', '.env'),
+      env: path.join(path.dirname(configPath), 'agents', id, 'workspace', '.env'),
       claude: {
         model: typeof model === 'string' && model.trim() ? model.trim() : 'claude-sonnet-4-6',
         dangerouslySkipPermissions: false,
@@ -226,9 +234,14 @@ export function createApiRouter(
     };
 
     try {
-      writeAgentsToConfig(configPath, (agents) => agents.push(newAgent));
+      writeAgentsToConfig(configPath, (agents) => agents.push(newAgent), id);
     } catch (err) {
-      res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      const code = (err as { code?: string }).code;
+      if (code === 'DUPLICATE') {
+        res.status(409).json({ error: `Agent '${id}' already exists` });
+      } else {
+        res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      }
       return;
     }
 
