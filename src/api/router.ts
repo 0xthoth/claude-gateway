@@ -333,7 +333,12 @@ export function createApiRouter(
       return;
     }
 
+    // Sync in-memory map with what was written to disk
     const cfg = agentConfigs.get(agentId)!;
+    if (description !== undefined) cfg.description = (description as string).trim();
+    if (model !== undefined && cfg.claude) cfg.claude.model = (model as string).trim();
+    if (allow_tools !== undefined) cfg.allow_tools = allow_tools;
+
     res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model, allow_tools: cfg.allow_tools ?? false } });
   });
 
