@@ -130,11 +130,13 @@ export function createApiRouter(
         res.flushHeaders();
         res.socket?.setNoDelay(true);
 
+        const agentCfg = agentConfigs.get(agentId)!;
+        const allowTools = agentCfg.allow_tools ?? !!apiKey.allow_tools;
         cleanup = await runner.sendApiMessageStream(
           sessionId,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools: !!apiKey.allow_tools },
+          { timeoutMs, allowTools },
         );
 
         // Client disconnect -> cleanup
@@ -157,9 +159,11 @@ export function createApiRouter(
     } else {
       // Synchronous mode (existing behavior)
       try {
+        const agentCfgSync = agentConfigs.get(agentId)!;
+        const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
         const response = await runner.sendApiMessage(sessionId, message.trim(), {
           timeoutMs,
-          allowTools: !!apiKey.allow_tools,
+          allowTools: allowToolsSync,
         });
         res.json({
           request_id: requestId,
@@ -200,6 +204,7 @@ export function createApiRouter(
       id,
       description: cfg.description,
       model: cfg.claude?.model ?? null,
+      allow_tools: cfg.allow_tools ?? false,
     }));
     res.json({ agents });
   });
@@ -297,14 +302,18 @@ export function createApiRouter(
       return;
     }
 
-    const body = req.body as { description?: unknown; model?: unknown };
-    const { description, model } = body;
+    const body = req.body as { description?: unknown; model?: unknown; allow_tools?: unknown };
+    const { description, model, allow_tools } = body;
     if (description !== undefined && (typeof description !== 'string' || !description.trim())) {
       res.status(400).json({ error: 'description must be a non-empty string' });
       return;
     }
     if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
       res.status(400).json({ error: 'model must be a non-empty string' });
+      return;
+    }
+    if (allow_tools !== undefined && typeof allow_tools !== 'boolean') {
+      res.status(400).json({ error: 'allow_tools must be a boolean' });
       return;
     }
 
@@ -317,6 +326,7 @@ export function createApiRouter(
           const claude = agent.claude as Record<string, unknown> | undefined;
           if (claude) claude.model = (model as string).trim();
         }
+        if (allow_tools !== undefined) agent.allow_tools = allow_tools;
       });
     } catch (err) {
       res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
@@ -324,7 +334,7 @@ export function createApiRouter(
     }
 
     const cfg = agentConfigs.get(agentId)!;
-    res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model } });
+    res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model, allow_tools: cfg.allow_tools ?? false } });
   });
 
   /**

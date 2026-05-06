@@ -32,6 +32,8 @@ export interface AgentConfig {
   session?: SessionConfig;
   /** Agent's signature emoji (used in greetings/sign-offs) */
   signatureEmoji?: string;
+  /** Allow tool calls when agent is accessed via API channel. Falls back to ApiKey.allow_tools if not set. */
+  allow_tools?: boolean;
 }
 
 export interface AgentStats {
