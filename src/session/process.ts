@@ -201,7 +201,7 @@ export class SessionProcess extends EventEmitter {
   }
 
   private writeMcpConfig(): string | null {
-    if (this.source === 'api') return null; // API sessions don't need gateway MCP
+    if (this.source === 'api' && !this.agentConfig.allow_tools) return null;
 
     const stateDir = path.join(this.agentConfig.workspace, '.telegram-state');
     const sessionDir = path.join(this.agentConfig.workspace, '.sessions', this.sessionId);
