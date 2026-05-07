@@ -284,7 +284,12 @@ export function createApiRouter(
     }
 
     // Update in-memory state immediately — file watcher is unreliable in Incus VMs
-    const resolvedConfig = newAgent as unknown as AgentConfig;
+    // Expand ~ so startAgent receives absolute paths (same as what index.ts does at startup)
+    const resolvedConfig = {
+      ...newAgent,
+      workspace: workspaceAbs,
+      env: path.join(workspaceAbs, '.env'),
+    } as unknown as AgentConfig;
     agentConfigs.set(id, resolvedConfig);
 
     // Start the agent runner so messages can be routed immediately
