@@ -430,7 +430,15 @@ async function main(): Promise<void> {
   printStartupTable(startupResults);
 
   // Start gateway router
-  const router = new GatewayRouter(agentRunners, agentConfigs, undefined, config, cronManager, CONFIG_PATH);
+  const router = new GatewayRouter(
+    agentRunners,
+    agentConfigs,
+    undefined,
+    config,
+    cronManager,
+    CONFIG_PATH,
+    (agentConfig) => startAgent(agentConfig, config, ctx),
+  );
   await router.start(PORT);
   console.log(`[gateway] Listening on port ${PORT}`);
 

@@ -38,6 +38,7 @@ export function createApiRouter(
   apiKeys: ApiKey[],
   configPath?: string,
   models?: ModelConfig[],
+  startAgentFn?: (agentConfig: AgentConfig) => Promise<void>,
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
@@ -283,7 +284,15 @@ export function createApiRouter(
     }
 
     // Update in-memory state immediately — file watcher is unreliable in Incus VMs
-    agentConfigs.set(id, newAgent as unknown as AgentConfig);
+    const resolvedConfig = newAgent as unknown as AgentConfig;
+    agentConfigs.set(id, resolvedConfig);
+
+    // Start the agent runner so messages can be routed immediately
+    if (startAgentFn) {
+      startAgentFn(resolvedConfig).catch((err: Error) => {
+        console.error(`Failed to start agent '${id}' after creation:`, err.message);
+      });
+    }
 
     res.status(201).json({ agent: { id, description: newAgent.description, model: (newAgent.claude as Record<string, unknown>).model } });
   });

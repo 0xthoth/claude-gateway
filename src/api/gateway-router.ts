@@ -41,6 +41,9 @@ export class GatewayRouter {
   /** Path to config.json for agent CRUD operations */
   private readonly configPath?: string;
 
+  /** Callback to start a new agent runner after CRUD creation */
+  private readonly startAgentFn?: (agentConfig: AgentConfig) => Promise<void>;
+
   constructor(
     agents: Map<string, AgentRunner>,
     configs: Map<string, AgentConfig>,
@@ -48,12 +51,14 @@ export class GatewayRouter {
     gatewayConfig?: GatewayConfig,
     cronManager?: CronManager,
     configPath?: string,
+    startAgentFn?: (agentConfig: AgentConfig) => Promise<void>,
   ) {
     this.agents = agents;
     this.configs = configs;
     this.gatewayConfig = gatewayConfig;
     this.cronManager = cronManager;
     this.configPath = configPath;
+    this.startAgentFn = startAgentFn;
     this.app = express();
 
     // Initialise counters for all known agents
@@ -91,6 +96,7 @@ export class GatewayRouter {
         this.gatewayConfig.gateway.api.keys,
         this.configPath,
         this.gatewayConfig.gateway.models,
+        this.startAgentFn,
       );
       this.app.use('/api', apiRouter);
     }
