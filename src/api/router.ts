@@ -282,6 +282,9 @@ export function createApiRouter(
       return;
     }
 
+    // Update in-memory state immediately — file watcher is unreliable in Incus VMs
+    agentConfigs.set(id, newAgent as unknown as AgentConfig);
+
     res.status(201).json({ agent: { id, description: newAgent.description, model: (newAgent.claude as Record<string, unknown>).model } });
   });
 
@@ -367,6 +370,10 @@ export function createApiRouter(
       res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
       return;
     }
+
+    // Update in-memory state immediately — file watcher is unreliable in Incus VMs
+    agentConfigs.delete(agentId);
+    agentRunners.delete(agentId);
 
     res.json({ success: true, id: agentId });
   });
