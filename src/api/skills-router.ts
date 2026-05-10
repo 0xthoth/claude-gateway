@@ -112,6 +112,7 @@ export function createSkillsRouter(
   /**
    * GET /api/v1/agents/:agentId/skills
    * List all skills (workspace + module + shared).
+   * Uses the runner's cached registry when available; falls back to a fresh load.
    */
   router.get('/v1/agents/:agentId/skills', auth, (req: Request, res: Response) => {
     const { agentId } = req.params as { agentId: string };
@@ -128,11 +129,10 @@ export function createSkillsRouter(
       return;
     }
 
-    const registry = loadSkills({
-      workspaceDir: config.workspace,
-      mcpToolsDir: MCP_TOOLS_DIR,
-      sharedSkillsDir: SHARED_SKILLS_DIR,
-    });
+    const runner = agents?.get(agentId);
+    const registry = runner
+      ? runner.getSkillRegistry()
+      : loadSkills({ workspaceDir: config.workspace, mcpToolsDir: MCP_TOOLS_DIR, sharedSkillsDir: SHARED_SKILLS_DIR });
 
     const skills = [...registry.skills.entries()].map(([key, skill]) => ({
       key,
@@ -151,6 +151,7 @@ export function createSkillsRouter(
   /**
    * GET /api/v1/agents/:agentId/skills/:name
    * Get a single skill's content.
+   * Uses the runner's cached registry when available; falls back to a fresh load.
    */
   router.get('/v1/agents/:agentId/skills/:name', auth, (req: Request, res: Response) => {
     const { agentId, name } = req.params as { agentId: string; name: string };
@@ -167,11 +168,10 @@ export function createSkillsRouter(
       return;
     }
 
-    const registry = loadSkills({
-      workspaceDir: config.workspace,
-      mcpToolsDir: MCP_TOOLS_DIR,
-      sharedSkillsDir: SHARED_SKILLS_DIR,
-    });
+    const runner = agents?.get(agentId);
+    const registry = runner
+      ? runner.getSkillRegistry()
+      : loadSkills({ workspaceDir: config.workspace, mcpToolsDir: MCP_TOOLS_DIR, sharedSkillsDir: SHARED_SKILLS_DIR });
 
     const scopeFilter = req.query['scope'] as string | undefined;
 

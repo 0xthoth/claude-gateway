@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { AgentRunner } from '../agent/runner';
@@ -14,30 +15,6 @@ type AuthedRequest = Request & { apiKey: ApiKey };
 
 const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 
-let _configWriteLock: Promise<void> = Promise.resolve();
-
-/** Read config.json, mutate agents array, write back atomically under an in-process lock. */
-function writeAgentsToConfig(
-  configPath: string,
-  mutate: (agents: unknown[]) => void,
-  newId?: string,
-): Promise<void> {
-  const next = _configWriteLock.catch(() => {}).then(() => {
-    const raw = fs.readFileSync(configPath, 'utf-8');
-    const config = JSON.parse(raw) as { agents: unknown[]; [k: string]: unknown };
-    if (newId) {
-      const exists = (config.agents as Record<string, unknown>[]).some((a) => a.id === newId);
-      if (exists) throw Object.assign(new Error(`Agent '${newId}' already exists in config`), { code: 'DUPLICATE' });
-    }
-    mutate(config.agents);
-    const tmp = configPath + '.tmp.' + randomUUID();
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), 'utf-8');
-    fs.renameSync(tmp, configPath);
-  });
-  _configWriteLock = next.catch(() => {});
-  return next;
-}
-
 export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
   agentConfigs: Map<string, AgentConfig>,
@@ -47,6 +24,36 @@ export function createApiRouter(
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
+
+  // Closure-scoped lock: serialises concurrent writes to config.json within this router instance.
+  let configWriteLock: Promise<void> = Promise.resolve();
+
+  async function writeAgentsToConfigImpl(
+    cfgPath: string,
+    mutate: (agents: unknown[]) => void,
+    newId?: string,
+  ): Promise<void> {
+    const raw = await fsp.readFile(cfgPath, 'utf-8');
+    const config = JSON.parse(raw) as { agents: unknown[]; [k: string]: unknown };
+    if (newId) {
+      const exists = (config.agents as Record<string, unknown>[]).some((a) => a.id === newId);
+      if (exists) throw Object.assign(new Error(`Agent '${newId}' already exists in config`), { code: 'DUPLICATE' });
+    }
+    mutate(config.agents);
+    const tmp = cfgPath + '.tmp.' + randomUUID();
+    await fsp.writeFile(tmp, JSON.stringify(config, null, 2), 'utf-8');
+    await fsp.rename(tmp, cfgPath);
+  }
+
+  function writeAgentsToConfig(
+    cfgPath: string,
+    mutate: (agents: unknown[]) => void,
+    newId?: string,
+  ): Promise<void> {
+    const next = configWriteLock.catch(() => {}).then(() => writeAgentsToConfigImpl(cfgPath, mutate, newId));
+    configWriteLock = next.catch(() => {});
+    return next;
+  }
 
   /**
    * POST /api/v1/agents/:agentId/messages
@@ -254,7 +261,7 @@ export function createApiRouter(
     const workspaceAbs = path.join(os.homedir(), '.claude-gateway', 'agents', id, 'workspace');
     const newAgent: Record<string, unknown> = {
       id,
-      description: description.trim(),
+      description: (description as string).trim(),
       workspace,
       env: path.join('~', '.claude-gateway', 'agents', id, 'workspace', '.env'),
       claude: {
@@ -264,9 +271,22 @@ export function createApiRouter(
       },
     };
 
-    // Create workspace directory and stub files matching UI WORKSPACE_FILES
+    // Write config first — if this fails, no workspace is created (avoids orphaned directories).
+    try {
+      await writeAgentsToConfig(configPath, (agents) => agents.push(newAgent), id);
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === 'DUPLICATE') {
+        res.status(409).json({ error: `Agent '${id}' already exists` });
+      } else {
+        res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      }
+      return;
+    }
+
+    // Config written successfully — now create workspace directory and stub files.
     const stubFiles: Record<string, string> = {
-      'AGENTS.md': `# Agent: ${id}\n\n${description.trim()}\n`,
+      'AGENTS.md': `# Agent: ${id}\n\n${(description as string).trim()}\n`,
       'SOUL.md': `# Soul\n\n`,
       'USER.md': `# User Profile\n\n`,
       'MEMORY.md': `# Memory\n\n`,
@@ -280,20 +300,9 @@ export function createApiRouter(
         }
       }
     } catch (err) {
-      res.status(500).json({ error: `Failed to create workspace: ${(err as Error).message}` });
-      return;
-    }
-
-    try {
-      await writeAgentsToConfig(configPath, (agents) => agents.push(newAgent), id);
-    } catch (err) {
-      const code = (err as { code?: string }).code;
-      if (code === 'DUPLICATE') {
-        res.status(409).json({ error: `Agent '${id}' already exists` });
-      } else {
-        res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
-      }
-      return;
+      // Config was already written — log the workspace failure but still return 201.
+      // The agent is valid; workspace will be auto-created on next gateway start.
+      console.error(`[api] Warning: agent '${id}' created in config but workspace setup failed: ${(err as Error).message}`);
     }
 
     res.status(201).json({ agent: { id, description: newAgent.description, model: (newAgent.claude as Record<string, unknown>).model } });
@@ -364,7 +373,7 @@ export function createApiRouter(
   /**
    * DELETE /api/v1/agents/:agentId
    *
-   * Remove agent from config.json. Requires admin key.
+   * Remove agent from config.json and stop the running runner. Requires admin key.
    */
   router.delete('/v1/agents/:agentId', auth, async (req: Request, res: Response) => {
     const apiKey = (req as AuthedRequest).apiKey;
@@ -391,6 +400,14 @@ export function createApiRouter(
       res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
       return;
     }
+
+    // Stop and remove the running runner so the agent no longer responds after deletion.
+    const runner = agentRunners.get(agentId);
+    if (runner) {
+      try { await runner.stop(); } catch { /* ignore stop errors */ }
+      agentRunners.delete(agentId);
+    }
+    agentConfigs.delete(agentId);
 
     res.json({ success: true, id: agentId });
   });

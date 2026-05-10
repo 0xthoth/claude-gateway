@@ -44,3 +44,4 @@ stop.sh
 tasks/
 .ralph-tui/
 CLAUDE.md
+tests/e2e/pr58-api-e2e.sh

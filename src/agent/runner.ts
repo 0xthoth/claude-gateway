@@ -106,6 +106,10 @@ export class AgentRunner extends EventEmitter {
     this.skillRegistry = registry;
   }
 
+  getSkillRegistry(): SkillRegistry {
+    return this.skillRegistry;
+  }
+
   /**
    * Bind a local HTTP server that receives POST /channel from TelegramReceiver.
    * Each payload is routed to the appropriate SessionProcess by chat_id.
