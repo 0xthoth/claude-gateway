@@ -20,6 +20,8 @@ A self-hosted multi-agent gateway for Claude Code. Connect Claude agents to Tele
 - **Streaming API** — SSE (Server-Sent Events) endpoint for real-time response streaming
 - **Auto-forward** — agent text output automatically forwarded to Telegram even without explicit reply tool calls
 - **Heartbeat / scheduled tasks** — cron-based proactive messages and recurring tasks via HEARTBEAT.md + REST API; agent jobs deliver output to Telegram, Discord, or both
+- **Persistent chat history** — two-layer storage: session context (`.jsonl`) + permanent SQLite DB with FTS5 full-text search; survives `/compact` and session eviction
+- **Auto-cleanup** — configurable retention policy prunes messages and media files older than N days on a daily schedule
 - **Long-term memory** — persistent memory system across sessions
 - **Config auto-migration** — automatic schema migration when config format changes
 - **Access control** — allowlist, open, or pairing-based Telegram access policies
@@ -160,6 +162,40 @@ Config lives at `~/.claude-gateway/config.json` (or set `GATEWAY_CONFIG` env var
 |-------|---------|-------------|
 | `idleTimeoutMinutes` | `30` | Kill idle session subprocess after N minutes of inactivity |
 | `maxConcurrent` | `20` | Max simultaneous active sessions per agent; oldest idle is evicted when exceeded |
+
+### `gateway.history` (optional)
+
+Global default retention policy. Can be overridden per-agent with an `history` key inside the agent config.
+
+```json
+{
+  "gateway": {
+    "history": {
+      "retentionDays": 90,
+      "cleanupHour": 3,
+      "cleanupTimezone": "Asia/Bangkok"
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `retentionDays` | `null` (keep forever) | Delete messages older than N days on each cleanup cycle |
+| `cleanupHour` | `3` | Hour of day to run cleanup (24h, in `cleanupTimezone`) |
+| `cleanupTimezone` | `"UTC"` | IANA timezone for the cleanup schedule |
+
+Per-agent override example:
+```json
+{
+  "agents": [
+    {
+      "id": "alfred",
+      "history": { "retentionDays": 30 }
+    }
+  ]
+}
+```
 
 ### `dmPolicy`
 
@@ -310,6 +346,14 @@ Pass API key via `X-Api-Key: <key>` or `Authorization: Bearer <key>` header.
 | `DELETE` | `/api/v1/crons/:id` | Delete a job |
 | `POST` | `/api/v1/crons/:id/run` | Trigger a job manually |
 | `GET` | `/api/v1/crons/:id/runs` | Get run history |
+| `GET` | `/api/v1/agents/sessions` | List all sessions across all agents (admin key) |
+| `GET` | `/api/v1/agents/:agentId/chats` | List chats for an agent |
+| `DELETE` | `/api/v1/agents/:agentId/chats/:chatId` | Delete a chat and all its messages |
+| `GET` | `/api/v1/agents/:agentId/chats/:chatId/sessions` | List sessions for a specific chat |
+| `GET` | `/api/v1/agents/:agentId/chats/:chatId/messages` | Paginated message history (cursor-based) |
+| `POST` | `/api/v1/agents/:agentId/chats/:chatId/sessions/:sessionId/messages` | Inject a message into an existing session |
+| `POST` | `/api/v1/agents/:agentId/media` | Upload a media file (image or PDF) |
+| `GET` | `/api/v1/agents/:agentId/media/*` | Serve a media file by path |
 
 See **[API.md](./API.md)** for full reference with request/response schemas and curl examples.
 
@@ -368,6 +412,12 @@ claude-gateway/
 │   │   ├── loader.ts                   ← load skills from directories, build registry
 │   │   ├── invoker.ts                  ← detect /skill-name in messages, inject context
 │   │   └── watcher.ts                  ← hot-reload skills on file changes (chokidar)
+│   │
+│   ├── history/                        ← Persistent chat history (Layer 2)
+│   │   ├── db.ts                       ← SQLite WAL + FTS5 history DB (pruneOlderThan, listChats, search)
+│   │   ├── cleanup.ts                  ← daily retention scheduler (scheduleCleanup, resolveRetentionDays)
+│   │   ├── media-store.ts              ← media file store with MIME allowlist and path traversal guard
+│   │   └── types.ts                    ← HistoryMessage, ChatSummary, SessionSummary types
 │   │
 │   ├── memory/                         ← Long-term memory
 │   │   └── manager.ts                  ← memory persistence
@@ -430,6 +480,9 @@ claude-gateway/
         ├── .env                        ← bot token (auto-created by wizard)
         ├── sessions/
         │   └── <chat_id>.jsonl         ← conversation history (SessionStore)
+        ├── history.db                  ← SQLite chat history (Layer 2 — survives /compact)
+        ├── history-cleanup.log         ← cleanup run log (max 1 MB, auto-rotated)
+        ├── media/                      ← uploaded media files (served via /api/v1/agents/:id/media/*)
         └── workspace/
             ├── CLAUDE.md               ← auto-generated from workspace files, do not edit
             ├── AGENTS.md               ← agent identity, rules, capabilities
