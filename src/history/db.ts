@@ -11,6 +11,7 @@ import {
   SearchOpts,
   SearchPage,
   SearchResult,
+  SessionSummary,
 } from './types';
 
 const MAX_LIMIT = 200;
@@ -48,8 +49,23 @@ export class HistoryDB {
     return cache.get(key)!;
   }
 
+  // Used by AgentRunner: agentDir is workspace/.., so DB lives at agentDir/history.db
+  // which equals agentsBaseDir/agentId/history.db without requiring workspace to be nested correctly.
+  static forDir(agentDir: string, agentId: string): HistoryDB {
+    const key = `dir::${agentDir}::${agentId}`;
+    if (!cache.has(key)) {
+      const dbPath = path.join(agentDir, 'history.db');
+      cache.set(key, new HistoryDB(dbPath, agentId));
+    }
+    return cache.get(key)!;
+  }
+
   static evict(agentsBaseDir: string, agentId: string): void {
     cache.delete(`${agentsBaseDir}::${agentId}`);
+  }
+
+  static evictDir(agentDir: string, agentId: string): void {
+    cache.delete(`dir::${agentDir}::${agentId}`);
   }
 
   private _initSchema(): void {
@@ -239,8 +255,69 @@ export class HistoryDB {
     }
   }
 
+  listSessions(): SessionSummary[] {
+    const rows = this.db.prepare(`
+      SELECT
+        chat_id,
+        session_id,
+        source,
+        COUNT(*) AS message_count,
+        MIN(ts)   AS created_at,
+        MAX(ts)   AS last_activity,
+        (SELECT content FROM messages m2
+         WHERE m2.session_id = m.session_id
+         ORDER BY ts DESC LIMIT 1) AS last_message
+      FROM messages m
+      GROUP BY session_id
+      ORDER BY last_activity DESC
+    `).all() as Array<{
+      chat_id: string;
+      session_id: string;
+      source: string;
+      message_count: number;
+      created_at: number;
+      last_activity: number;
+      last_message: string | null;
+    }>;
+
+    return rows.map((row) => ({
+      chatId: row.chat_id || null,
+      sessionId: row.session_id,
+      source: row.source as HistorySource,
+      messageCount: row.message_count,
+      createdAt: row.created_at,
+      lastActivity: row.last_activity,
+      lastMessage: row.last_message ?? null,
+    }));
+  }
+
   clearChat(chatId: string): void {
     this.db.prepare('DELETE FROM messages WHERE chat_id = ?').run(chatId);
+  }
+
+  /**
+   * Delete all messages older than cutoffMs (Unix ms timestamp).
+   * Returns relative media_files paths from deleted rows for disk cleanup.
+   * FTS5 index stays consistent via the AFTER DELETE trigger.
+   */
+  pruneOlderThan(cutoffMs: number): string[] {
+    const rows = this.db.prepare(
+      `SELECT media_files FROM messages WHERE ts < ? AND media_files IS NOT NULL`,
+    ).all(cutoffMs) as Array<{ media_files: string }>;
+
+    const mediaPaths: string[] = [];
+    for (const row of rows) {
+      try {
+        const paths = JSON.parse(row.media_files) as string[];
+        mediaPaths.push(...paths);
+      } catch {
+        // malformed JSON — skip
+      }
+    }
+
+    this.db.prepare(`DELETE FROM messages WHERE ts < ?`).run(cutoffMs);
+
+    return mediaPaths;
   }
 
   private _rowToMessage(r: Record<string, unknown>): HistoryMessage {

@@ -9,6 +9,7 @@ import { AgentConfig, ApiKey, ModelConfig } from '../types';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { MediaStore } from '../history/media-store';
 import { HistoryDB } from '../history/db';
+import type { AgentSessionSummary } from '../history/types';
 
 const MAX_MESSAGE_LENGTH = 10_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -228,6 +229,29 @@ export function createApiRouter(
   });
 
   /**
+   * GET /api/v1/agents/sessions
+   *
+   * List all sessions across all agents. Admin only.
+   * Queries each agent's history DB sequentially and returns a nested agents → sessions structure.
+   */
+  router.get('/v1/agents/sessions', auth, (req: Request, res: Response) => {
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!isAdmin(apiKey)) {
+      res.status(403).json({ error: 'Admin key required' });
+      return;
+    }
+    const agents: AgentSessionSummary[] = [...agentRunners.entries()].map(([agentId, runner]) => {
+      const cfg = agentConfigs.get(agentId);
+      return {
+        agentId,
+        description: cfg?.description ?? '',
+        sessions: runner.getHistoryDb().listSessions(),
+      };
+    });
+    res.json({ agents });
+  });
+
+  /**
    * POST /api/v1/agents
    *
    * Create a new agent entry in config.json. Requires admin key.
@@ -408,7 +432,7 @@ export function createApiRouter(
     if (runner) {
       try { await runner.stop(); } catch { /* ignore stop errors */ }
       agentRunners.delete(agentId);
-      HistoryDB.evict(runner.getAgentsBaseDir(), agentId);
+      HistoryDB.evictDir(runner.getAgentDir(), agentId);
     }
     agentConfigs.delete(agentId);
 
