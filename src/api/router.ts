@@ -1,21 +1,59 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'crypto';
+import * as fs from 'fs';
+import * as fsp from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, ApiKey } from '../types';
-import { createApiAuthMiddleware, canAccessAgent } from './auth';
+import { AgentConfig, ApiKey, ModelConfig } from '../types';
+import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 
 const MAX_MESSAGE_LENGTH = 10_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
+const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+
 export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
   agentConfigs: Map<string, AgentConfig>,
   apiKeys: ApiKey[],
+  configPath?: string,
+  models?: ModelConfig[],
 ): Router {
   const router = Router();
   const auth = createApiAuthMiddleware(apiKeys);
+
+  // Closure-scoped lock: serialises concurrent writes to config.json within this router instance.
+  let configWriteLock: Promise<void> = Promise.resolve();
+
+  async function writeAgentsToConfigImpl(
+    cfgPath: string,
+    mutate: (agents: unknown[]) => void,
+    newId?: string,
+  ): Promise<void> {
+    const raw = await fsp.readFile(cfgPath, 'utf-8');
+    const config = JSON.parse(raw) as { agents: unknown[]; [k: string]: unknown };
+    if (newId) {
+      const exists = (config.agents as Record<string, unknown>[]).some((a) => a.id === newId);
+      if (exists) throw Object.assign(new Error(`Agent '${newId}' already exists in config`), { code: 'DUPLICATE' });
+    }
+    mutate(config.agents);
+    const tmp = cfgPath + '.tmp.' + randomUUID();
+    await fsp.writeFile(tmp, JSON.stringify(config, null, 2), 'utf-8');
+    await fsp.rename(tmp, cfgPath);
+  }
+
+  function writeAgentsToConfig(
+    cfgPath: string,
+    mutate: (agents: unknown[]) => void,
+    newId?: string,
+  ): Promise<void> {
+    const next = configWriteLock.catch(() => {}).then(() => writeAgentsToConfigImpl(cfgPath, mutate, newId));
+    configWriteLock = next.catch(() => {});
+    return next;
+  }
 
   /**
    * POST /api/v1/agents/:agentId/messages
@@ -105,11 +143,13 @@ export function createApiRouter(
         res.flushHeaders();
         res.socket?.setNoDelay(true);
 
+        const agentCfg = agentConfigs.get(agentId)!;
+        const allowTools = agentCfg.allow_tools ?? !!apiKey.allow_tools;
         cleanup = await runner.sendApiMessageStream(
           sessionId,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools: !!apiKey.allow_tools },
+          { timeoutMs, allowTools },
         );
 
         // Client disconnect -> cleanup
@@ -132,9 +172,11 @@ export function createApiRouter(
     } else {
       // Synchronous mode (existing behavior)
       try {
+        const agentCfgSync = agentConfigs.get(agentId)!;
+        const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
         const response = await runner.sendApiMessage(sessionId, message.trim(), {
           timeoutMs,
-          allowTools: !!apiKey.allow_tools,
+          allowTools: allowToolsSync,
         });
         res.json({
           request_id: requestId,
@@ -157,16 +199,217 @@ export function createApiRouter(
   });
 
   /**
+   * GET /api/v1/models
+   *
+   * List all supported Claude models from gateway config (falls back to defaults).
+   */
+  router.get('/v1/models', auth, (_req: Request, res: Response) => {
+    res.json({ models: (models ?? []).map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
+  });
+
+  /**
    * GET /api/v1/agents
    *
-   * List agents accessible by the current API key.
+   * List agents scoped to the API key. Admin keys see all agents.
    */
   router.get('/v1/agents', auth, (req: Request, res: Response) => {
     const apiKey = (req as AuthedRequest).apiKey;
     const agents = [...agentConfigs.entries()]
       .filter(([id]) => canAccessAgent(apiKey, id))
-      .map(([id, cfg]) => ({ id, description: cfg.description }));
+      .map(([id, cfg]) => ({
+        id,
+        description: cfg.description,
+        model: cfg.claude?.model ?? null,
+        allow_tools: cfg.allow_tools ?? false,
+      }));
     res.json({ agents });
+  });
+
+  /**
+   * POST /api/v1/agents
+   *
+   * Create a new agent entry in config.json. Requires admin key.
+   * Body: { id, description, model? }
+   */
+  router.post('/v1/agents', auth, async (req: Request, res: Response) => {
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!isAdmin(apiKey)) {
+      res.status(403).json({ error: 'Admin key required to create agents' });
+      return;
+    }
+    if (!configPath) {
+      res.status(501).json({ error: 'Agent management not available (no configPath)' });
+      return;
+    }
+    const body = req.body as { id?: unknown; description?: unknown; model?: unknown };
+    const { id, description, model } = body;
+
+    if (!id || typeof id !== 'string' || !AGENT_ID_RE.test(id)) {
+      res.status(400).json({ error: 'id must match pattern [a-z][a-z0-9_-]{1,31}' });
+      return;
+    }
+    if (!description || typeof description !== 'string' || !description.trim()) {
+      res.status(400).json({ error: 'description is required' });
+      return;
+    }
+    if (agentConfigs.has(id)) {
+      res.status(409).json({ error: `Agent '${id}' already exists` });
+      return;
+    }
+
+    const workspace = path.join('~', '.claude-gateway', 'agents', id, 'workspace');
+    const workspaceAbs = path.join(os.homedir(), '.claude-gateway', 'agents', id, 'workspace');
+    const newAgent: Record<string, unknown> = {
+      id,
+      description: (description as string).trim(),
+      workspace,
+      env: path.join('~', '.claude-gateway', 'agents', id, 'workspace', '.env'),
+      claude: {
+        model: typeof model === 'string' && model.trim() ? model.trim() : 'claude-sonnet-4-6',
+        dangerouslySkipPermissions: false,
+        extraFlags: [],
+      },
+    };
+
+    // Write config first — if this fails, no workspace is created (avoids orphaned directories).
+    try {
+      await writeAgentsToConfig(configPath, (agents) => agents.push(newAgent), id);
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === 'DUPLICATE') {
+        res.status(409).json({ error: `Agent '${id}' already exists` });
+      } else {
+        res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      }
+      return;
+    }
+
+    // Config written successfully — now create workspace directory and stub files.
+    const stubFiles: Record<string, string> = {
+      'AGENTS.md': `# Agent: ${id}\n\n${(description as string).trim()}\n`,
+      'SOUL.md': `# Soul\n\n`,
+      'USER.md': `# User Profile\n\n`,
+      'MEMORY.md': `# Memory\n\n`,
+    };
+    try {
+      fs.mkdirSync(workspaceAbs, { recursive: true });
+      for (const [filename, stub] of Object.entries(stubFiles)) {
+        const filePath = path.join(workspaceAbs, filename);
+        if (!fs.existsSync(filePath)) {
+          fs.writeFileSync(filePath, stub, 'utf8');
+        }
+      }
+    } catch (err) {
+      // Config was already written — log the workspace failure but still return 201.
+      // The agent is valid; workspace will be auto-created on next gateway start.
+      console.error(`[api] Warning: agent '${id}' created in config but workspace setup failed: ${(err as Error).message}`);
+    }
+
+    res.status(201).json({ agent: { id, description: newAgent.description, model: (newAgent.claude as Record<string, unknown>).model } });
+  });
+
+  /**
+   * PATCH /api/v1/agents/:agentId
+   *
+   * Update agent description and/or model. Requires write access to the agent.
+   * Body: { description?, model? }
+   */
+  router.patch('/v1/agents/:agentId', auth, async (req: Request, res: Response) => {
+    const apiKey = (req as AuthedRequest).apiKey;
+    const { agentId } = req.params as { agentId: string };
+    if (!canWriteAgent(apiKey, agentId)) {
+      res.status(403).json({ error: 'Write permission required' });
+      return;
+    }
+    if (!configPath) {
+      res.status(501).json({ error: 'Agent management not available (no configPath)' });
+      return;
+    }
+    if (!agentConfigs.has(agentId)) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+
+    const body = req.body as { description?: unknown; model?: unknown; allow_tools?: unknown };
+    const { description, model, allow_tools } = body;
+    if (description !== undefined && (typeof description !== 'string' || !description.trim())) {
+      res.status(400).json({ error: 'description must be a non-empty string' });
+      return;
+    }
+    if (model !== undefined && (typeof model !== 'string' || !model.trim())) {
+      res.status(400).json({ error: 'model must be a non-empty string' });
+      return;
+    }
+    if (allow_tools !== undefined && typeof allow_tools !== 'boolean') {
+      res.status(400).json({ error: 'allow_tools must be a boolean' });
+      return;
+    }
+
+    try {
+      await writeAgentsToConfig(configPath, (agents) => {
+        const agent = (agents as Record<string, unknown>[]).find((a) => a.id === agentId);
+        if (!agent) return;
+        if (description !== undefined) agent.description = (description as string).trim();
+        if (model !== undefined) {
+          const claude = agent.claude as Record<string, unknown> | undefined;
+          if (claude) claude.model = (model as string).trim();
+        }
+        if (allow_tools !== undefined) agent.allow_tools = allow_tools;
+      });
+    } catch (err) {
+      res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      return;
+    }
+
+    // Sync in-memory map with what was written to disk
+    const cfg = agentConfigs.get(agentId)!;
+    if (description !== undefined) cfg.description = (description as string).trim();
+    if (model !== undefined && cfg.claude) cfg.claude.model = (model as string).trim();
+    if (allow_tools !== undefined) cfg.allow_tools = allow_tools;
+
+    res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model, allow_tools: cfg.allow_tools ?? false } });
+  });
+
+  /**
+   * DELETE /api/v1/agents/:agentId
+   *
+   * Remove agent from config.json and stop the running runner. Requires admin key.
+   */
+  router.delete('/v1/agents/:agentId', auth, async (req: Request, res: Response) => {
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!isAdmin(apiKey)) {
+      res.status(403).json({ error: 'Admin key required' });
+      return;
+    }
+    if (!configPath) {
+      res.status(501).json({ error: 'Agent management not available (no configPath)' });
+      return;
+    }
+    const { agentId } = req.params as { agentId: string };
+    if (!agentConfigs.has(agentId)) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+
+    try {
+      await writeAgentsToConfig(configPath, (agents) => {
+        const idx = (agents as Record<string, unknown>[]).findIndex((a) => a.id === agentId);
+        if (idx !== -1) agents.splice(idx, 1);
+      });
+    } catch (err) {
+      res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
+      return;
+    }
+
+    // Stop and remove the running runner so the agent no longer responds after deletion.
+    const runner = agentRunners.get(agentId);
+    if (runner) {
+      try { await runner.stop(); } catch { /* ignore stop errors */ }
+      agentRunners.delete(agentId);
+    }
+    agentConfigs.delete(agentId);
+
+    res.json({ success: true, id: agentId });
   });
 
   return router;

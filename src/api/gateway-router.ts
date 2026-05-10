@@ -7,6 +7,8 @@ import { CronManager } from '../cron/manager';
 import { generateDashboardHtml } from '../ui/web-ui';
 import { createApiRouter } from './router';
 import { createCronRouter } from './cron-router';
+import { createWorkspaceRouter } from './workspace-router';
+import { createSkillsRouter } from './skills-router';
 
 export class GatewayRouter {
   private readonly agents: Map<string, AgentRunner>;
@@ -36,17 +38,22 @@ export class GatewayRouter {
   /** Optional persistent cron manager */
   private readonly cronManager?: CronManager;
 
+  /** Path to config.json for agent CRUD operations */
+  private readonly configPath?: string;
+
   constructor(
     agents: Map<string, AgentRunner>,
     configs: Map<string, AgentConfig>,
     schedulers?: Map<string, CronScheduler>,
     gatewayConfig?: GatewayConfig,
     cronManager?: CronManager,
+    configPath?: string,
   ) {
     this.agents = agents;
     this.configs = configs;
     this.gatewayConfig = gatewayConfig;
     this.cronManager = cronManager;
+    this.configPath = configPath;
     this.app = express();
 
     // Initialise counters for all known agents
@@ -82,8 +89,29 @@ export class GatewayRouter {
         this.agents,
         this.configs,
         this.gatewayConfig.gateway.api.keys,
+        this.configPath,
+        this.gatewayConfig.gateway.models,
       );
       this.app.use('/api', apiRouter);
+    }
+
+    // Mount workspace file routes
+    if (this.gatewayConfig?.gateway?.api?.keys?.length) {
+      const workspaceRouter = createWorkspaceRouter(
+        this.configs,
+        this.gatewayConfig.gateway.api.keys,
+      );
+      this.app.use('/api', workspaceRouter);
+    }
+
+    // Mount skills routes
+    if (this.gatewayConfig?.gateway?.api?.keys?.length) {
+      const skillsRouter = createSkillsRouter(
+        this.configs,
+        this.gatewayConfig.gateway.api.keys,
+        this.agents,
+      );
+      this.app.use('/api', skillsRouter);
     }
 
     // Mount cron manager routes with same API key auth as agent router
@@ -165,9 +193,16 @@ export class GatewayRouter {
   }
 
   async start(port: number): Promise<void> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       this.server = this.app.listen(port, () => {
         resolve();
+      });
+      this.server.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          reject(new Error(`Port ${port} is already in use. Stop the existing process or set a different PORT env var.`));
+        } else {
+          reject(err);
+        }
       });
     });
   }

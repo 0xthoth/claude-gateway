@@ -32,6 +32,8 @@ export interface AgentConfig {
   session?: SessionConfig;
   /** Agent's signature emoji (used in greetings/sign-offs) */
   signatureEmoji?: string;
+  /** Allow tool calls when agent is accessed via API channel. Falls back to ApiKey.allow_tools if not set. */
+  allow_tools?: boolean;
 }
 
 export interface AgentStats {
@@ -51,6 +53,8 @@ export interface ApiKey {
   description?: string;
   agents: string[] | '*'; // agent IDs this key can access, or '*' for all
   allow_tools?: boolean;  // permit tool-enabled (allow_tools) requests for this key
+  write?: boolean;        // allow write ops for scoped agents (files, skills, PATCH agent)
+  admin?: boolean;        // bypass scope + destructive ops (agent CRUD, shared skills, install)
 }
 
 export interface ModelConfig {
@@ -58,6 +62,7 @@ export interface ModelConfig {
   label: string;
   alias: string;
   contextWindow: number;
+  multiplier?: number;
 }
 
 export interface GatewayConfig {
