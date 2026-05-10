@@ -3,7 +3,7 @@ export
 
 .DEFAULT_GOAL := help
 
-.PHONY: help start create-agent update-agent pair mcp-install
+.PHONY: help start stop create-agent update-agent pair mcp-install
 
 help: ## Show this help message
 	@echo "----------------------------------------"
@@ -14,6 +14,17 @@ help: ## Show this help message
 
 start: ## Build and start the gateway
 	npm run build && npm start
+
+stop: ## Stop claude-gateway (node dist/index.js) and all spawned children
+	@echo "Stopping claude-gateway..."
+	-@pkill -f "[n]ode dist/index\.js" 2>/dev/null || true
+	@sleep 2
+	-@pkill -9 -f "[n]ode dist/index\.js" 2>/dev/null || true
+	-@pkill -9 -f "[b]un .*/claude-gateway/mcp/" 2>/dev/null || true
+	-@pkill -9 -f "[c]laude .*--mcp-config .*/claude-gateway/" 2>/dev/null || true
+	@pgrep -af "[n]ode dist/index\.js|[b]un .*/claude-gateway/mcp/|[c]laude .*--mcp-config .*/claude-gateway/" >/dev/null \
+		&& { echo "WARNING: some processes still alive:"; pgrep -af "[n]ode dist/index\.js|[b]un .*/claude-gateway/mcp/|[c]laude .*--mcp-config .*/claude-gateway/"; exit 1; } \
+		|| echo "Stopped"
 
 create-agent: ## Run the interactive wizard to create a new agent
 	./node_modules/.bin/ts-node scripts/create-agent.ts
