@@ -653,13 +653,26 @@ export class AgentRunner extends EventEmitter {
             typingDoneTimer = null;
           }
 
-          // Track reply tool calls
+          // Track reply tool calls and persist assistant messages to history
           if (obj['type'] === 'assistant') {
-            const msg = obj['message'] as { content?: Array<{ type: string; name?: string }> } | undefined;
+            const msg = obj['message'] as { content?: Array<{ type: string; name?: string; input?: Record<string, unknown> }> } | undefined;
             if (Array.isArray(msg?.content)) {
               for (const block of msg!.content) {
                 if (block.type === 'tool_use' && block.name === replyToolName) {
                   replyCalled = true;
+                  // Persist the reply text to history so it appears in chat history API
+                  const replyText = typeof block.input?.['text'] === 'string' ? block.input['text'].trim() : '';
+                  if (replyText) {
+                    const channelSrc = this.channelSourceMap.get(mapKey) ?? 'telegram';
+                    this.historyDb.insertMessage({
+                      chatId: `${channelSrc}-${mapKey}`,
+                      sessionId: actualSessionId,
+                      source: channelSrc as HistorySource,
+                      role: 'assistant',
+                      content: replyText,
+                      ts: Date.now(),
+                    });
+                  }
                 }
               }
             }
