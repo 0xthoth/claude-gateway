@@ -35,6 +35,27 @@ const PROTECTED_WORKSPACE_FILES = [
   'IDENTITY.md', 'USER.md', 'HEARTBEAT.md',
 ];
 
+type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+const MAX_API_IMAGES = 5;
+
+function buildImageBlocks(agentsBaseDir: string, agentId: string, mediaFiles: string[]): ImageBlock[] {
+  const blocks: ImageBlock[] = [];
+  for (const relPath of mediaFiles) {
+    try {
+      const absPath = MediaStore.resolvePath(agentsBaseDir, agentId, relPath);
+      const data = fs.readFileSync(absPath);
+      const ext = path.extname(absPath).toLowerCase().slice(1);
+      const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
+      const media_type = mimeMap[ext] ?? 'image/jpeg';
+      blocks.push({ type: 'image', source: { type: 'base64', media_type, data: data.toString('base64') } });
+    } catch {
+      // Skip invalid paths silently
+    }
+  }
+  return blocks;
+}
+
 function buildApiSystemNote(allowTools: boolean): string {
   const memoryOverride =
     `Memory Rule Override: Do NOT create or update ${PROTECTED_WORKSPACE_FILES.join(', ')} ` +
@@ -1212,7 +1233,7 @@ export class AgentRunner extends EventEmitter {
   async sendApiMessage(
     sessionId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
   ): Promise<string> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1223,6 +1244,11 @@ export class AgentRunner extends EventEmitter {
     }
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Build image blocks from validated media paths
+    const imageBlocks = opts.mediaFiles?.length
+      ? buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles)
+      : [];
 
     // Persist user message
     const apiUserTs = Date.now();
@@ -1239,6 +1265,7 @@ export class AgentRunner extends EventEmitter {
       source: 'api',
       role: 'user',
       content: message,
+      mediaFiles: opts.mediaFiles?.length ? opts.mediaFiles : undefined,
       ts: apiUserTs,
     });
 
@@ -1358,7 +1385,7 @@ export class AgentRunner extends EventEmitter {
 
       session.on('output', onOutput);
       session.setProcessing(true);
-      session.sendMessage(channelXml);
+      session.sendMessage(channelXml, imageBlocks.length ? imageBlocks : undefined);
       // Do NOT call resetQuiet() here — the quiet timer should only start
       // after the first output line arrives, otherwise it fires before the
       // subprocess has had time to respond (especially on first turn).
@@ -1379,7 +1406,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1390,6 +1417,11 @@ export class AgentRunner extends EventEmitter {
     }
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Build image blocks from validated media paths
+    const imageBlocksStream = opts.mediaFiles?.length
+      ? buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles)
+      : [];
 
     // Persist user message
     const streamUserTs = Date.now();
@@ -1406,6 +1438,7 @@ export class AgentRunner extends EventEmitter {
       source: 'api',
       role: 'user',
       content: message,
+      mediaFiles: opts.mediaFiles?.length ? opts.mediaFiles : undefined,
       ts: streamUserTs,
     });
 
@@ -1567,7 +1600,7 @@ export class AgentRunner extends EventEmitter {
       (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
 
     session.setProcessing(true);
-    session.sendMessage(channelXml);
+    session.sendMessage(channelXml, imageBlocksStream.length ? imageBlocksStream : undefined);
 
     // Return cleanup function for client disconnect
     return () => {
