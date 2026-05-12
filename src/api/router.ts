@@ -211,6 +211,81 @@ export function createApiRouter(
   });
 
   /**
+   * PUT /api/v1/models
+   *
+   * Replace the gateway.models list. Admin key required.
+   * Body: { models: Array<{ id, label, alias, contextWindow, multiplier? }> }
+   */
+  router.put('/v1/models', auth, async (req: Request, res: Response) => {
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!isAdmin(apiKey)) {
+      res.status(403).json({ error: 'Admin API key required' });
+      return;
+    }
+    if (!configPath) {
+      res.status(503).json({ error: 'Config path not available' });
+      return;
+    }
+
+    const body = req.body as { models?: unknown };
+    if (!Array.isArray(body.models) || body.models.length === 0) {
+      res.status(400).json({ error: 'body.models must be a non-empty array' });
+      return;
+    }
+
+    // Validate each model entry
+    const newModels: ModelConfig[] = [];
+    for (const m of body.models) {
+      const entry = m as Record<string, unknown>;
+      if (typeof entry.id !== 'string' || !entry.id.trim()) {
+        res.status(400).json({ error: 'Each model must have a non-empty string id' });
+        return;
+      }
+      if (typeof entry.label !== 'string' || !entry.label.trim()) {
+        res.status(400).json({ error: `Model '${entry.id}' must have a non-empty string label` });
+        return;
+      }
+      if (typeof entry.alias !== 'string' || !entry.alias.trim()) {
+        res.status(400).json({ error: `Model '${entry.id}' must have a non-empty string alias` });
+        return;
+      }
+      if (typeof entry.contextWindow !== 'number' || entry.contextWindow <= 0) {
+        res.status(400).json({ error: `Model '${entry.id}' must have a positive number contextWindow` });
+        return;
+      }
+      newModels.push({
+        id: entry.id.trim(),
+        label: entry.label.trim(),
+        alias: entry.alias.trim(),
+        contextWindow: entry.contextWindow,
+        multiplier: typeof entry.multiplier === 'number' ? entry.multiplier : undefined,
+      });
+    }
+
+    try {
+      // Atomic write to config.json
+      await configWriteLock.catch(() => {}).then(async () => {
+        const raw = await fsp.readFile(configPath, 'utf-8');
+        const config = JSON.parse(raw) as { gateway?: { models?: unknown[] }; [k: string]: unknown };
+        if (!config.gateway) config.gateway = {};
+        config.gateway.models = newModels;
+        const tmp = configPath + '.tmp.' + randomUUID();
+        await fsp.writeFile(tmp, JSON.stringify(config, null, 2), 'utf-8');
+        await fsp.rename(tmp, configPath);
+      });
+
+      // Update in-memory models immediately (mutate in-place so GET reflects changes)
+      if (models) {
+        models.splice(0, models.length, ...newModels);
+      }
+
+      res.json({ models: newModels.map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
+    } catch {
+      res.status(500).json({ error: 'Failed to write config' });
+    }
+  });
+
+  /**
    * GET /api/v1/agents
    *
    * List agents scoped to the API key. Admin keys see all agents.
