@@ -84,8 +84,9 @@ export function createApiRouter(
       session_id?: unknown;
       stream?: unknown;
       timeout_ms?: unknown;
+      media_files?: unknown;
     };
-    const { message, session_id, stream, timeout_ms } = body;
+    const { message, session_id, stream, timeout_ms, media_files } = body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       res.status(400).json({ error: 'message is required and must be a non-empty string' });
@@ -98,6 +99,30 @@ export function createApiRouter(
     if (session_id !== undefined && typeof session_id !== 'string') {
       res.status(400).json({ error: 'session_id must be a string if provided' });
       return;
+    }
+
+    // Validate media_files
+    let validatedMediaFiles: string[] | undefined;
+    if (media_files !== undefined) {
+      if (!Array.isArray(media_files) || media_files.some((f) => typeof f !== 'string')) {
+        res.status(400).json({ error: 'media_files must be an array of strings' });
+        return;
+      }
+      if (media_files.length > 5) {
+        res.status(400).json({ error: 'media_files exceeds maximum of 5 images per message' });
+        return;
+      }
+      // Validate each path is within agent media root (path traversal guard)
+      const routerAgentsBaseDir = runner.getAgentsBaseDir();
+      for (const f of media_files as string[]) {
+        try {
+          MediaStore.resolvePath(routerAgentsBaseDir, agentId, f);
+        } catch {
+          res.status(400).json({ error: `Invalid media path: ${f}` });
+          return;
+        }
+      }
+      validatedMediaFiles = media_files as string[];
     }
 
     const requestId = randomUUID();
@@ -152,7 +177,7 @@ export function createApiRouter(
           sessionId,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools },
+          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles },
         );
 
         // Client disconnect -> cleanup
@@ -180,6 +205,7 @@ export function createApiRouter(
         const response = await runner.sendApiMessage(sessionId, message.trim(), {
           timeoutMs,
           allowTools: allowToolsSync,
+          mediaFiles: validatedMediaFiles,
         });
         res.json({
           request_id: requestId,
