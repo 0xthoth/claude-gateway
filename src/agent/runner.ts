@@ -39,6 +39,34 @@ type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string;
 
 const MAX_API_IMAGES = 5;
 
+/**
+ * Move UI-uploaded files from staging (ui-upload/) to permanent per-session storage
+ * (media/api-{sessionId}/), matching the same pattern Telegram uses.
+ * Returns updated relative paths; falls back to original path on error.
+ */
+async function promoteUiUploads(
+  agentsBaseDir: string,
+  agentId: string,
+  sessionId: string,
+  mediaFiles: string[],
+  logger: Logger,
+): Promise<string[]> {
+  return Promise.all(
+    mediaFiles.map(async (relPath) => {
+      if (!relPath.startsWith('media/ui-upload/')) return relPath;
+      try {
+        const srcAbs = MediaStore.resolvePath(agentsBaseDir, agentId, relPath);
+        const newRelPath = MediaStore.copyToMedia(agentsBaseDir, agentId, `api-${sessionId}`, srcAbs);
+        await fsPromises.unlink(srcAbs).catch(() => {});
+        return newRelPath;
+      } catch (err) {
+        logger.warn('Failed to promote ui-upload to session storage', { relPath, err });
+        return relPath;
+      }
+    }),
+  );
+}
+
 async function buildImageBlocks(agentsBaseDir: string, agentId: string, mediaFiles: string[], logger: Logger): Promise<ImageBlock[]> {
   const blocks: ImageBlock[] = [];
   for (const relPath of mediaFiles.slice(0, MAX_API_IMAGES)) {
@@ -1259,9 +1287,14 @@ export class AgentRunner extends EventEmitter {
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
 
-    // Build image blocks from validated media paths
-    const imageBlocks = opts.mediaFiles?.length
-      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles, this.logger)
+    // Promote UI-uploaded files from staging to permanent per-session storage
+    const finalMediaFiles = opts.mediaFiles?.length
+      ? await promoteUiUploads(this.agentsBaseDir, this.agentConfig.id, sessionId, opts.mediaFiles, this.logger)
+      : undefined;
+
+    // Build image blocks from (now-permanent) media paths
+    const imageBlocks = finalMediaFiles?.length
+      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, finalMediaFiles, this.logger)
       : [];
 
     // Persist user message
@@ -1279,7 +1312,7 @@ export class AgentRunner extends EventEmitter {
       source: 'api',
       role: 'user',
       content: message,
-      mediaFiles: opts.mediaFiles?.length ? opts.mediaFiles : undefined,
+      mediaFiles: finalMediaFiles?.length ? finalMediaFiles : undefined,
       ts: apiUserTs,
     });
 
@@ -1432,9 +1465,14 @@ export class AgentRunner extends EventEmitter {
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
 
-    // Build image blocks from validated media paths
-    const imageBlocksStream = opts.mediaFiles?.length
-      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles, this.logger)
+    // Promote UI-uploaded files from staging to permanent per-session storage
+    const finalMediaFilesStream = opts.mediaFiles?.length
+      ? await promoteUiUploads(this.agentsBaseDir, this.agentConfig.id, sessionId, opts.mediaFiles, this.logger)
+      : undefined;
+
+    // Build image blocks from (now-permanent) media paths
+    const imageBlocksStream = finalMediaFilesStream?.length
+      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, finalMediaFilesStream, this.logger)
       : [];
 
     // Persist user message
@@ -1452,7 +1490,7 @@ export class AgentRunner extends EventEmitter {
       source: 'api',
       role: 'user',
       content: message,
-      mediaFiles: opts.mediaFiles?.length ? opts.mediaFiles : undefined,
+      mediaFiles: finalMediaFilesStream?.length ? finalMediaFilesStream : undefined,
       ts: streamUserTs,
     });
 
