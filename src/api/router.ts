@@ -795,14 +795,11 @@ export function createApiRouter(
       const originalName = (req.headers['x-filename'] as string | undefined) ?? `upload`;
       const safeExt = path.extname(originalName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10);
       const ext = safeExt || (mimeType.includes('pdf') ? '.pdf' : '.bin');
-      const rawSessionId = (req.headers['x-session-id'] as string | undefined) ?? '';
-      const safeSessionId = rawSessionId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-      const uploadDir = safeSessionId ? `ui-upload/${safeSessionId}` : 'ui-upload';
       const tmpFile = path.join(os.tmpdir(), `gw-${Date.now()}${ext}`);
       try {
         await fsp.writeFile(tmpFile, buf);
         const agentsBaseDir = runner.getAgentsBaseDir();
-        const mediaPath = MediaStore.copyToMedia(agentsBaseDir, agentId, uploadDir, tmpFile);
+        const mediaPath = MediaStore.copyToMedia(agentsBaseDir, agentId, 'ui-upload', tmpFile);
         res.json({ mediaPath });
       } catch (err) {
         res.status(500).json({ error: `Upload failed: ${(err as Error).message}` });
