@@ -266,7 +266,10 @@ export class HistoryDB {
         MAX(ts)   AS last_activity,
         (SELECT content FROM messages m2
          WHERE m2.session_id = m.session_id
-         ORDER BY ts DESC LIMIT 1) AS last_message
+         ORDER BY ts DESC LIMIT 1) AS last_message,
+        (SELECT content FROM messages m3
+         WHERE m3.session_id = m.session_id AND m3.role = 'user'
+         ORDER BY ts ASC LIMIT 1) AS first_message
       FROM messages m
       GROUP BY session_id
       ORDER BY last_activity DESC
@@ -278,6 +281,7 @@ export class HistoryDB {
       created_at: number;
       last_activity: number;
       last_message: string | null;
+      first_message: string | null;
     }>;
 
     return rows.map((row) => ({
@@ -288,6 +292,7 @@ export class HistoryDB {
       createdAt: row.created_at,
       lastActivity: row.last_activity,
       lastMessage: row.last_message ?? null,
+      firstMessage: row.first_message ?? null,
     }));
   }
 
