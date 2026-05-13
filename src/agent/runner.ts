@@ -641,7 +641,7 @@ export class AgentRunner extends EventEmitter {
       let replyCalled = false;
       let typingDoneTimer: ReturnType<typeof setTimeout> | null = null;
       const TYPING_DONE_DELAY_MS = 3000;
-      const replyToolName = source === 'discord' ? 'mcp__gateway__discord_reply' : 'mcp__telegram__reply';
+      const replyToolName = source === 'discord' ? 'mcp__gateway__discord_reply' : 'mcp__gateway__telegram_reply';
 
       proc.on('output', (line: string) => {
         try {
