@@ -803,6 +803,8 @@ export function createApiRouter(
       res.status(404).json({ error: 'Not found' });
       return;
     }
+    // Cache media files for 7 days — content is immutable once written
+    res.setHeader('Cache-Control', 'private, max-age=604800, immutable');
     res.sendFile(absPath);
   });
 
