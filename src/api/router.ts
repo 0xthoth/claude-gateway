@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
@@ -17,6 +17,32 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 type AuthedRequest = Request & { apiKey: ApiKey };
 
 const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+const SAFE_FILENAME_RE = /^[a-zA-Z0-9._\-() ]+$/;
+
+// ---------------------------------------------------------------------------
+// In-memory rate limiter for media uploads (per API key)
+// ---------------------------------------------------------------------------
+const UPLOAD_RATE_LIMIT = 20;          // max uploads
+const UPLOAD_RATE_WINDOW_MS = 60_000;  // per 60 seconds
+
+const uploadRateMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkUploadRateLimit(apiKeyValue: string): boolean {
+  const now = Date.now();
+  const entry = uploadRateMap.get(apiKeyValue);
+  if (!entry || now >= entry.resetAt) {
+    uploadRateMap.set(apiKeyValue, { count: 1, resetAt: now + UPLOAD_RATE_WINDOW_MS });
+    return true;
+  }
+  if (entry.count >= UPLOAD_RATE_LIMIT) return false;
+  entry.count++;
+  return true;
+}
+
+/** Derive a stable short ID from an API key value (never log the raw key). */
+function apiKeyId(key: string): string {
+  return createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
 
 export function createApiRouter(
   agentRunners: Map<string, AgentRunner>,
@@ -711,20 +737,37 @@ export function createApiRouter(
         res.status(404).json({ error: `Agent '${agentId}' not found` });
         return;
       }
+      // Rate limit: max 20 uploads/min per API key
+      if (!checkUploadRateLimit(apiKey.key)) {
+        res.status(429).json({ error: 'Too many uploads. Limit: 20 per minute.' });
+        return;
+      }
+
       const buf = (req as Request & { rawFileBuffer?: Buffer }).rawFileBuffer;
       const mimeType = (req as Request & { rawFileMime?: string }).rawFileMime ?? '';
       if (!buf || buf.length === 0) {
         res.status(400).json({ error: 'No file body received' });
         return;
       }
-      const originalName = (req.headers['x-filename'] as string | undefined) ?? `upload`;
-      const safeExt = path.extname(originalName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10);
-      const ext = safeExt || (mimeType.includes('pdf') ? '.pdf' : '.bin');
+
+      // X-Filename: validate length, strip to basename, allow only safe characters
+      const rawFilename = (req.headers['x-filename'] as string | undefined) ?? 'upload';
+      if (rawFilename.length > 255) {
+        res.status(400).json({ error: 'X-Filename too long (max 255 chars)' });
+        return;
+      }
+      const baseName = path.basename(rawFilename).replace(/\s+/g, '_');
+      const safeBaseName = SAFE_FILENAME_RE.test(baseName) ? baseName : 'upload';
+      const rawExt = path.extname(safeBaseName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10);
+      const ext = rawExt || (mimeType.includes('pdf') ? '.pdf' : '.bin');
+
       const tmpFile = path.join(os.tmpdir(), `gw-${Date.now()}${ext}`);
       try {
         await fsp.writeFile(tmpFile, buf);
         const agentsBaseDir = runner.getAgentsBaseDir();
-        const mediaPath = MediaStore.copyToMedia(agentsBaseDir, agentId, 'ui-upload', tmpFile);
+        // Store under ui-upload/{keyId}/ so each API key's uploads are isolated
+        const keySubdir = `ui-upload/${apiKeyId(apiKey.key)}`;
+        const mediaPath = MediaStore.copyToMedia(agentsBaseDir, agentId, keySubdir, tmpFile);
         res.json({ mediaPath });
       } catch (err) {
         res.status(500).json({ error: `Upload failed: ${(err as Error).message}` });
@@ -740,6 +783,10 @@ export function createApiRouter(
    */
   router.delete('/v1/agents/:agentId/media/*', auth, (req: Request, res: Response) => {
     const { agentId } = req.params as { agentId: string };
+    if (!AGENT_ID_RE.test(agentId)) {
+      res.status(400).json({ error: 'Invalid agentId' });
+      return;
+    }
     const apiKey = (req as AuthedRequest).apiKey;
     if (!canAccessAgent(apiKey, agentId)) {
       res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
@@ -759,10 +806,14 @@ export function createApiRouter(
       res.status(400).json({ error: 'Invalid path' });
       return;
     }
-    // Only allow deleting files under ui-upload/ (user-uploaded staging area)
-    const uiUploadRoot = path.join(MediaStore.agentMediaRoot(agentsBaseDir, agentId), 'ui-upload');
-    if (!absPath.startsWith(uiUploadRoot + path.sep) && absPath !== uiUploadRoot) {
-      res.status(403).json({ error: 'Can only delete files from the ui-upload staging area' });
+    // Only allow deleting files under the caller's own ui-upload/{keyId}/ subdir
+    const keySubdir = path.join(
+      MediaStore.agentMediaRoot(agentsBaseDir, agentId),
+      'ui-upload',
+      apiKeyId(apiKey.key),
+    );
+    if (!absPath.startsWith(keySubdir + path.sep) && absPath !== keySubdir) {
+      res.status(403).json({ error: 'Can only delete your own uploaded files' });
       return;
     }
     try {
@@ -805,8 +856,18 @@ export function createApiRouter(
     }
     // Cache media files for 7 days — content is immutable once written
     res.setHeader('Cache-Control', 'private, max-age=604800, immutable');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
     res.sendFile(absPath);
   });
+
+  // Schedule hourly cleanup of stale staging uploads (files older than 24h)
+  setInterval(() => {
+    const firstRunner = agentRunners.values().next().value as AgentRunner | undefined;
+    if (firstRunner) {
+      try { MediaStore.cleanupStaging(firstRunner.getAgentsBaseDir()); } catch { /* non-critical */ }
+    }
+  }, 60 * 60 * 1000).unref(); // unref so cleanup timer doesn't keep process alive
 
   return router;
 }
