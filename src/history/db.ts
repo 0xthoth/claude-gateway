@@ -106,6 +106,11 @@ export class HistoryDB {
         VALUES ('delete', old.id, old.content, old.sender_name);
       END;
 
+      CREATE TABLE IF NOT EXISTS session_metadata (
+        session_id TEXT PRIMARY KEY,
+        title      TEXT NOT NULL
+      );
+
     `);
   }
 
@@ -258,20 +263,22 @@ export class HistoryDB {
   listSessions(): SessionSummary[] {
     const rows = this.db.prepare(`
       SELECT
-        chat_id,
-        session_id,
-        source,
+        m.chat_id,
+        m.session_id,
+        m.source,
         COUNT(*) AS message_count,
-        MIN(ts)   AS created_at,
-        MAX(ts)   AS last_activity,
+        MIN(m.ts) AS created_at,
+        MAX(m.ts) AS last_activity,
         (SELECT content FROM messages m2
          WHERE m2.session_id = m.session_id
          ORDER BY ts DESC LIMIT 1) AS last_message,
         (SELECT content FROM messages m3
          WHERE m3.session_id = m.session_id AND m3.role = 'user'
-         ORDER BY ts ASC LIMIT 1) AS first_message
+         ORDER BY ts ASC LIMIT 1) AS first_message,
+        sm.title AS title_override
       FROM messages m
-      GROUP BY session_id
+      LEFT JOIN session_metadata sm ON sm.session_id = m.session_id
+      GROUP BY m.session_id
       ORDER BY last_activity DESC
     `).all() as Array<{
       chat_id: string;
@@ -282,6 +289,7 @@ export class HistoryDB {
       last_activity: number;
       last_message: string | null;
       first_message: string | null;
+      title_override: string | null;
     }>;
 
     return rows.map((row) => ({
@@ -293,7 +301,15 @@ export class HistoryDB {
       lastActivity: row.last_activity,
       lastMessage: row.last_message ?? null,
       firstMessage: row.first_message ?? null,
+      title: row.title_override ?? row.first_message ?? '',
     }));
+  }
+
+  updateSessionTitle(sessionId: string, title: string): void {
+    this.db.prepare(`
+      INSERT INTO session_metadata (session_id, title) VALUES (?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET title = excluded.title
+    `).run(sessionId, title);
   }
 
   clearChat(chatId: string): void {

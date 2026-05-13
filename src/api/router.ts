@@ -619,6 +619,33 @@ export function createApiRouter(
   });
 
   /**
+   * PATCH /api/v1/agents/:agentId/sessions/:sessionId
+   * Update session title override.
+   * Body: { title: string }
+   */
+  router.patch('/v1/agents/:agentId/sessions/:sessionId', auth, (req: Request, res: Response) => {
+    const { agentId, sessionId } = req.params as { agentId: string; sessionId: string };
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!canAccessAgent(apiKey, agentId)) {
+      res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+      return;
+    }
+    const runner = agentRunners.get(agentId);
+    if (!runner) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+    const body = req.body as { title?: unknown };
+    const { title } = body;
+    if (!title || typeof title !== 'string' || !title.trim()) {
+      res.status(400).json({ error: 'title is required and must be a non-empty string' });
+      return;
+    }
+    runner.getHistoryDb().updateSessionTitle(sessionId, title.trim());
+    res.json({ sessionId, title: title.trim() });
+  });
+
+  /**
    * GET /api/v1/agents/:agentId/chats/:chatId/messages
    * Paginated message history (cursor-based).
    * Query: limit, before (ts ms), after (ts ms), session_id

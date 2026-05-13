@@ -61,6 +61,7 @@ export interface SessionSummary {
   lastActivity: number;
   lastMessage: string | null;
   firstMessage: string | null;
+  title: string;
 }
 
 export interface AgentSessionSummary {
