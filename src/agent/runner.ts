@@ -22,7 +22,6 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
-const MIME_MAP: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
 
 const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
@@ -560,6 +559,18 @@ export class AgentRunner extends EventEmitter {
 
   private static escapeXmlAttr(value: string): string {
     return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  private resolveMediaPaths(mediaFiles: string[]): string[] {
+    const paths: string[] = [];
+    for (const relPath of mediaFiles.slice(0, MAX_API_IMAGES)) {
+      try {
+        paths.push(MediaStore.resolvePath(this.agentsBaseDir, this.agentConfig.id, relPath));
+      } catch (err) {
+        this.logger.warn('Failed to resolve media path', { relPath, err });
+      }
+    }
+    return paths;
   }
 
   private static buildChannelXml(params: {
@@ -1287,16 +1298,7 @@ export class AgentRunner extends EventEmitter {
 
     // Resolve media files to absolute paths for file-path based image passing
     // (same pattern as Telegram — Claude Code reads files via Read tool instead of base64 inline)
-    const imagePaths: string[] = [];
-    if (finalMediaFiles?.length) {
-      for (const relPath of finalMediaFiles.slice(0, MAX_API_IMAGES)) {
-        try {
-          imagePaths.push(MediaStore.resolvePath(this.agentsBaseDir, this.agentConfig.id, relPath));
-        } catch (err) {
-          this.logger.warn('Failed to resolve media path', { relPath, err });
-        }
-      }
-    }
+    const imagePaths = finalMediaFiles?.length ? this.resolveMediaPaths(finalMediaFiles) : [];
 
     // Persist user message
     const apiUserTs = Date.now();
@@ -1320,7 +1322,13 @@ export class AgentRunner extends EventEmitter {
     this.pendingApiSessions.add(sessionId);
     session.touch();
 
-    const systemNote = buildApiSystemNote(opts.allowTools ?? false, imagePaths.length ? imagePaths : undefined);
+    // Image paths only work when allowTools:true — Claude needs the Read tool to access them
+    const allowTools = opts.allowTools ?? false;
+    if (!allowTools && imagePaths.length) {
+      this.logger.warn('Images ignored: allowTools is false, Claude cannot use Read tool', { sessionId, imageCount: imagePaths.length });
+    }
+    const effectiveImagePaths = allowTools ? imagePaths : [];
+    const systemNote = buildApiSystemNote(allowTools, effectiveImagePaths.length ? effectiveImagePaths : undefined);
 
     // Detect skill commands (same as channel message path)
     const skillInvocation = detectSkillCommand(message, this.skillRegistry);
@@ -1333,7 +1341,7 @@ export class AgentRunner extends EventEmitter {
     }
 
     // Build channel XML with image_path attribute (like Telegram) for first image
-    const imageAttr = imagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(imagePaths[0]!)}"` : '';
+    const imageAttr = effectiveImagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePaths[0]!)}"` : '';
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
       `${message}\n\n` +
@@ -1481,16 +1489,7 @@ export class AgentRunner extends EventEmitter {
       : undefined;
 
     // Resolve media files to absolute paths for file-path based image passing
-    const imagePathsStream: string[] = [];
-    if (finalMediaFilesStream?.length) {
-      for (const relPath of finalMediaFilesStream.slice(0, MAX_API_IMAGES)) {
-        try {
-          imagePathsStream.push(MediaStore.resolvePath(this.agentsBaseDir, this.agentConfig.id, relPath));
-        } catch (err) {
-          this.logger.warn('Failed to resolve media path', { relPath, err });
-        }
-      }
-    }
+    const imagePathsStream = finalMediaFilesStream?.length ? this.resolveMediaPaths(finalMediaFilesStream) : [];
 
     // Persist user message
     const streamUserTs = Date.now();
@@ -1649,7 +1648,13 @@ export class AgentRunner extends EventEmitter {
 
     session.on('output', onOutput);
 
-    const systemNote = buildApiSystemNote(opts.allowTools ?? false, imagePathsStream.length ? imagePathsStream : undefined);
+    // Image paths only work when allowTools:true — Claude needs the Read tool to access them
+    const allowToolsStream = opts.allowTools ?? false;
+    if (!allowToolsStream && imagePathsStream.length) {
+      this.logger.warn('Images ignored: allowTools is false, Claude cannot use Read tool', { sessionId, imageCount: imagePathsStream.length });
+    }
+    const effectiveImagePathsStream = allowToolsStream ? imagePathsStream : [];
+    const systemNote = buildApiSystemNote(allowToolsStream, effectiveImagePathsStream.length ? effectiveImagePathsStream : undefined);
 
     // Detect skill commands (same as channel message path)
     const skillInvocationStream = detectSkillCommand(message, this.skillRegistry);
@@ -1662,7 +1667,7 @@ export class AgentRunner extends EventEmitter {
     }
 
     // Build channel XML with image_path attribute (like Telegram) for first image
-    const imageAttrStream = imagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(imagePathsStream[0]!)}"` : '';
+    const imageAttrStream = effectiveImagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePathsStream[0]!)}"` : '';
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
       `${message}\n\n` +
