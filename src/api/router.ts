@@ -39,6 +39,14 @@ function checkUploadRateLimit(apiKeyValue: string): boolean {
   return true;
 }
 
+// Periodically evict expired entries so uploadRateMap doesn't grow indefinitely
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of uploadRateMap) {
+    if (now >= entry.resetAt) uploadRateMap.delete(key);
+  }
+}, UPLOAD_RATE_WINDOW_MS).unref();
+
 /** Derive a stable short ID from an API key value (never log the raw key). */
 function apiKeyId(key: string): string {
   return createHash('sha256').update(key).digest('hex').slice(0, 16);
@@ -781,7 +789,7 @@ export function createApiRouter(
    * DELETE /api/v1/agents/:agentId/media/*filepath
    * Delete a media file by relative path. Only files under media/ui-upload/ can be deleted this way.
    */
-  router.delete('/v1/agents/:agentId/media/*', auth, (req: Request, res: Response) => {
+  router.delete('/v1/agents/:agentId/media/*', auth, async (req: Request, res: Response) => {
     const { agentId } = req.params as { agentId: string };
     if (!AGENT_ID_RE.test(agentId)) {
       res.status(400).json({ error: 'Invalid agentId' });
@@ -817,10 +825,12 @@ export function createApiRouter(
       return;
     }
     try {
-      fs.unlinkSync(absPath);
+      await fsp.unlink(absPath);
       res.json({ deleted: true });
-    } catch {
-      res.status(404).json({ error: 'Not found' });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') res.status(404).json({ error: 'Not found' });
+      else res.status(500).json({ error: 'Delete failed' });
     }
   });
 

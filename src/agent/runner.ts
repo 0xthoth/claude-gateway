@@ -39,18 +39,18 @@ type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string;
 
 const MAX_API_IMAGES = 5;
 
-function buildImageBlocks(agentsBaseDir: string, agentId: string, mediaFiles: string[]): ImageBlock[] {
+async function buildImageBlocks(agentsBaseDir: string, agentId: string, mediaFiles: string[], logger: Logger): Promise<ImageBlock[]> {
   const blocks: ImageBlock[] = [];
-  for (const relPath of mediaFiles) {
+  for (const relPath of mediaFiles.slice(0, MAX_API_IMAGES)) {
     try {
       const absPath = MediaStore.resolvePath(agentsBaseDir, agentId, relPath);
-      const data = fs.readFileSync(absPath);
+      const data = await fsPromises.readFile(absPath);
       const ext = path.extname(absPath).toLowerCase().slice(1);
       const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
       const media_type = mimeMap[ext] ?? 'image/jpeg';
       blocks.push({ type: 'image', source: { type: 'base64', media_type, data: data.toString('base64') } });
-    } catch {
-      // Skip invalid paths silently
+    } catch (err) {
+      logger.warn('Failed to build image block', { relPath, err });
     }
   }
   return blocks;
@@ -1261,7 +1261,7 @@ export class AgentRunner extends EventEmitter {
 
     // Build image blocks from validated media paths
     const imageBlocks = opts.mediaFiles?.length
-      ? buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles)
+      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles, this.logger)
       : [];
 
     // Persist user message
@@ -1434,7 +1434,7 @@ export class AgentRunner extends EventEmitter {
 
     // Build image blocks from validated media paths
     const imageBlocksStream = opts.mediaFiles?.length
-      ? buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles)
+      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, opts.mediaFiles, this.logger)
       : [];
 
     // Persist user message
