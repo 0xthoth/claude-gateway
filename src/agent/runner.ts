@@ -699,11 +699,12 @@ export class AgentRunner extends EventEmitter {
                 }
               });
             }
-            // Always forward result text — it contains the agent's completion summary.
-            // If the agent also called reply tool, this summary still reaches the user.
+            // Forward result text when agent did NOT call reply tool (fallback path).
+            // If the agent already called the reply tool, skip result forwarding to avoid
+            // sending a duplicate message to the channel.
             // Skip forwarding when session is in query mode (internal image summary request).
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
-            if (resultText.trim() && !proc.queryMode) {
+            if (resultText.trim() && !proc.queryMode && !replyCalled) {
               const text = resultText.trim();
               const channelSrcForResult = this.channelSourceMap.get(mapKey) ?? 'telegram';
               // Persist assistant reply to permanent history DB
