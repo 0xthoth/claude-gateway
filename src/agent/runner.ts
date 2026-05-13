@@ -22,7 +22,6 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
-const MIME_MAP: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
 
 const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
@@ -1325,6 +1324,9 @@ export class AgentRunner extends EventEmitter {
 
     // Image paths only work when allowTools:true — Claude needs the Read tool to access them
     const allowTools = opts.allowTools ?? false;
+    if (!allowTools && imagePaths.length) {
+      this.logger.warn('Images ignored: allowTools is false, Claude cannot use Read tool', { sessionId, imageCount: imagePaths.length });
+    }
     const effectiveImagePaths = allowTools ? imagePaths : [];
     const systemNote = buildApiSystemNote(allowTools, effectiveImagePaths.length ? effectiveImagePaths : undefined);
 
@@ -1648,6 +1650,9 @@ export class AgentRunner extends EventEmitter {
 
     // Image paths only work when allowTools:true — Claude needs the Read tool to access them
     const allowToolsStream = opts.allowTools ?? false;
+    if (!allowToolsStream && imagePathsStream.length) {
+      this.logger.warn('Images ignored: allowTools is false, Claude cannot use Read tool', { sessionId, imageCount: imagePathsStream.length });
+    }
     const effectiveImagePathsStream = allowToolsStream ? imagePathsStream : [];
     const systemNote = buildApiSystemNote(allowToolsStream, effectiveImagePathsStream.length ? effectiveImagePathsStream : undefined);
 
