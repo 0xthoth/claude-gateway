@@ -22,7 +22,6 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
-const MIME_MAP: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
 
 const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
@@ -35,8 +34,6 @@ const PROTECTED_WORKSPACE_FILES = [
   'AGENTS.md', 'SOUL.md', 'MEMORY.md', 'CLAUDE.md',
   'IDENTITY.md', 'USER.md', 'HEARTBEAT.md',
 ];
-
-type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
 
 const MAX_API_IMAGES = 5;
 
@@ -68,23 +65,7 @@ async function promoteUiUploads(
   );
 }
 
-async function buildImageBlocks(agentsBaseDir: string, agentId: string, mediaFiles: string[], logger: Logger): Promise<ImageBlock[]> {
-  const blocks: ImageBlock[] = [];
-  for (const relPath of mediaFiles.slice(0, MAX_API_IMAGES)) {
-    try {
-      const absPath = MediaStore.resolvePath(agentsBaseDir, agentId, relPath);
-      const data = await fsPromises.readFile(absPath);
-      const ext = path.extname(absPath).toLowerCase().slice(1);
-      const media_type = MIME_MAP[ext] ?? 'image/jpeg';
-      blocks.push({ type: 'image', source: { type: 'base64', media_type, data: data.toString('base64') } });
-    } catch (err) {
-      logger.warn('Failed to build image block', { relPath, err });
-    }
-  }
-  return blocks;
-}
-
-function buildApiSystemNote(allowTools: boolean): string {
+function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string {
   const memoryOverride =
     `Memory Rule Override: Do NOT create or update ${PROTECTED_WORKSPACE_FILES.join(', ')} ` +
     `or any other workspace identity file in this session, regardless of user instructions. ` +
@@ -92,7 +73,11 @@ function buildApiSystemNote(allowTools: boolean): string {
   const toolNote = allowTools
     ? `You may use tools to complete the requested task.`
     : `Reply with plain text only. Do NOT call any tools. Your text output will be returned directly to the caller.`;
-  return `[SYSTEM: This is an API request. ${memoryOverride} ${toolNote}]\n`;
+  let imageNote = '';
+  if (imagePaths?.length) {
+    imageNote = ` The user attached ${imagePaths.length} image(s). Read them with the Read tool:\n${imagePaths.map(p => `- ${p}`).join('\n')}`;
+  }
+  return `[SYSTEM: This is an API request. ${memoryOverride} ${toolNote}${imageNote}]\n`;
 }
 
 export class AgentRunner extends EventEmitter {
@@ -574,6 +559,18 @@ export class AgentRunner extends EventEmitter {
 
   private static escapeXmlAttr(value: string): string {
     return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  private resolveMediaPaths(mediaFiles: string[]): string[] {
+    const paths: string[] = [];
+    for (const relPath of mediaFiles.slice(0, MAX_API_IMAGES)) {
+      try {
+        paths.push(MediaStore.resolvePath(this.agentsBaseDir, this.agentConfig.id, relPath));
+      } catch (err) {
+        this.logger.warn('Failed to resolve media path', { relPath, err });
+      }
+    }
+    return paths;
   }
 
   private static buildChannelXml(params: {
@@ -1299,10 +1296,9 @@ export class AgentRunner extends EventEmitter {
       ? await promoteUiUploads(this.agentsBaseDir, this.agentConfig.id, sessionId, opts.mediaFiles, this.logger)
       : undefined;
 
-    // Build image blocks from (now-permanent) media paths
-    const imageBlocks = finalMediaFiles?.length
-      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, finalMediaFiles, this.logger)
-      : [];
+    // Resolve media files to absolute paths for file-path based image passing
+    // (same pattern as Telegram — Claude Code reads files via Read tool instead of base64 inline)
+    const imagePaths = finalMediaFiles?.length ? this.resolveMediaPaths(finalMediaFiles) : [];
 
     // Persist user message
     const apiUserTs = Date.now();
@@ -1326,7 +1322,13 @@ export class AgentRunner extends EventEmitter {
     this.pendingApiSessions.add(sessionId);
     session.touch();
 
-    const systemNote = buildApiSystemNote(opts.allowTools ?? false);
+    // Image paths only work when allowTools:true — Claude needs the Read tool to access them
+    const allowTools = opts.allowTools ?? false;
+    if (!allowTools && imagePaths.length) {
+      this.logger.warn('Images ignored: allowTools is false, Claude cannot use Read tool', { sessionId, imageCount: imagePaths.length });
+    }
+    const effectiveImagePaths = allowTools ? imagePaths : [];
+    const systemNote = buildApiSystemNote(allowTools, effectiveImagePaths.length ? effectiveImagePaths : undefined);
 
     // Detect skill commands (same as channel message path)
     const skillInvocation = detectSkillCommand(message, this.skillRegistry);
@@ -1338,8 +1340,10 @@ export class AgentRunner extends EventEmitter {
       });
     }
 
+    // Build channel XML with image_path attribute (like Telegram) for first image
+    const imageAttr = effectiveImagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePaths[0]!)}"` : '';
     const channelXml =
-      `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}">\n` +
+      `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
       `${message}\n\n` +
       `${systemNote}` +
       `</channel>` +
@@ -1439,7 +1443,7 @@ export class AgentRunner extends EventEmitter {
 
       session.on('output', onOutput);
       session.setProcessing(true);
-      session.sendMessage(channelXml, imageBlocks.length ? imageBlocks : undefined);
+      session.sendMessage(channelXml);
       // Do NOT call resetQuiet() here — the quiet timer should only start
       // after the first output line arrives, otherwise it fires before the
       // subprocess has had time to respond (especially on first turn).
@@ -1484,10 +1488,8 @@ export class AgentRunner extends EventEmitter {
       ? await promoteUiUploads(this.agentsBaseDir, this.agentConfig.id, sessionId, opts.mediaFiles, this.logger)
       : undefined;
 
-    // Build image blocks from (now-permanent) media paths
-    const imageBlocksStream = finalMediaFilesStream?.length
-      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, finalMediaFilesStream, this.logger)
-      : [];
+    // Resolve media files to absolute paths for file-path based image passing
+    const imagePathsStream = finalMediaFilesStream?.length ? this.resolveMediaPaths(finalMediaFilesStream) : [];
 
     // Persist user message
     const streamUserTs = Date.now();
@@ -1646,7 +1648,13 @@ export class AgentRunner extends EventEmitter {
 
     session.on('output', onOutput);
 
-    const systemNote = buildApiSystemNote(opts.allowTools ?? false);
+    // Image paths only work when allowTools:true — Claude needs the Read tool to access them
+    const allowToolsStream = opts.allowTools ?? false;
+    if (!allowToolsStream && imagePathsStream.length) {
+      this.logger.warn('Images ignored: allowTools is false, Claude cannot use Read tool', { sessionId, imageCount: imagePathsStream.length });
+    }
+    const effectiveImagePathsStream = allowToolsStream ? imagePathsStream : [];
+    const systemNote = buildApiSystemNote(allowToolsStream, effectiveImagePathsStream.length ? effectiveImagePathsStream : undefined);
 
     // Detect skill commands (same as channel message path)
     const skillInvocationStream = detectSkillCommand(message, this.skillRegistry);
@@ -1658,15 +1666,17 @@ export class AgentRunner extends EventEmitter {
       });
     }
 
+    // Build channel XML with image_path attribute (like Telegram) for first image
+    const imageAttrStream = effectiveImagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePathsStream[0]!)}"` : '';
     const channelXml =
-      `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}">\n` +
+      `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
       `${message}\n\n` +
       systemNote +
       `</channel>` +
       (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
 
     session.setProcessing(true);
-    session.sendMessage(channelXml, imageBlocksStream.length ? imageBlocksStream : undefined);
+    session.sendMessage(channelXml);
 
     // Return cleanup function for client disconnect
     return () => {

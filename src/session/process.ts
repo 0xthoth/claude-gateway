@@ -293,18 +293,10 @@ export class SessionProcess extends EventEmitter {
     // NOTE: NO --channels flag — messages arrive via stdin injection, not Telegram channels
   }
 
-  private static toStreamJsonTurn(
-    text: string,
-    imageBlocks?: Array<{ type: 'image'; source: { type: 'base64'; media_type: string; data: string } }>,
-  ): string {
-    const content: Array<Record<string, unknown>> = [];
-    if (imageBlocks?.length) {
-      for (const block of imageBlocks) content.push(block);
-    }
-    content.push({ type: 'text', text });
+  private static toStreamJsonTurn(text: string): string {
     return JSON.stringify({
       type: 'user',
-      message: { role: 'user', content },
+      message: { role: 'user', content: [{ type: 'text', text }] },
     });
   }
 
@@ -636,10 +628,7 @@ export class SessionProcess extends EventEmitter {
     }, AUTO_RESTART_DELAY_MS);
   }
 
-  sendMessage(
-    text: string,
-    imageBlocks?: Array<{ type: 'image'; source: { type: 'base64'; media_type: string; data: string } }>,
-  ): void {
+  sendMessage(text: string): void {
     if (!this.process?.stdin?.writable) {
       this.logger.warn('Cannot send message: subprocess not running', {
         sessionId: this.sessionId,
@@ -657,7 +646,7 @@ export class SessionProcess extends EventEmitter {
       );
       try { fs.writeFileSync(statusPath, 'queued') } catch {}
     }
-    this.process.stdin.write(SessionProcess.toStreamJsonTurn(text, imageBlocks) + '\n');
+    this.process.stdin.write(SessionProcess.toStreamJsonTurn(text) + '\n');
   }
 
   query(prompt: string, timeoutMs = 60_000): Promise<string> {
