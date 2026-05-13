@@ -735,6 +735,45 @@ export function createApiRouter(
   );
 
   /**
+   * DELETE /api/v1/agents/:agentId/media/*filepath
+   * Delete a media file by relative path. Only files under media/ui-upload/ can be deleted this way.
+   */
+  router.delete('/v1/agents/:agentId/media/*', auth, (req: Request, res: Response) => {
+    const { agentId } = req.params as { agentId: string };
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!canAccessAgent(apiKey, agentId)) {
+      res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+      return;
+    }
+    const runner = agentRunners.get(agentId);
+    if (!runner) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+    const wildcardParam = (req.params as Record<string, string>)['0'] ?? '';
+    const agentsBaseDir = runner.getAgentsBaseDir();
+    let absPath: string;
+    try {
+      absPath = MediaStore.resolvePath(agentsBaseDir, agentId, wildcardParam);
+    } catch {
+      res.status(400).json({ error: 'Invalid path' });
+      return;
+    }
+    // Only allow deleting files under ui-upload/ (user-uploaded staging area)
+    const uiUploadRoot = path.join(MediaStore.agentMediaRoot(agentsBaseDir, agentId), 'ui-upload');
+    if (!absPath.startsWith(uiUploadRoot + path.sep) && absPath !== uiUploadRoot) {
+      res.status(403).json({ error: 'Can only delete files from the ui-upload staging area' });
+      return;
+    }
+    try {
+      fs.unlinkSync(absPath);
+      res.json({ deleted: true });
+    } catch {
+      res.status(404).json({ error: 'Not found' });
+    }
+  });
+
+  /**
    * GET /api/v1/agents/:agentId/media/*filepath
    * Serve a media file. Validates path stays within agent's media directory.
    */
