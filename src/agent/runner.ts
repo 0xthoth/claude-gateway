@@ -22,6 +22,7 @@ const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
+const MIME_MAP: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
 
 const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
@@ -683,7 +684,7 @@ export class AgentRunner extends EventEmitter {
             const msg = obj['message'] as { content?: Array<{ type: string; name?: string; input?: Record<string, unknown> }> } | undefined;
             if (Array.isArray(msg?.content)) {
               for (const block of msg!.content) {
-                if (block.type === 'tool_use' && block.name === replyToolName) {
+                if (block.type === 'tool_use' && block.name === replyToolName && !replyCalled) {
                   replyCalled = true;
                   // Persist the reply text to history so it appears in chat history API
                   const replyText = typeof block.input?.['text'] === 'string' ? block.input['text'].trim() : '';
@@ -1271,6 +1272,7 @@ export class AgentRunner extends EventEmitter {
    */
   async sendApiMessage(
     sessionId: string,
+    chatId: string,
     message: string,
     opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
   ): Promise<string> {
@@ -1283,6 +1285,12 @@ export class AgentRunner extends EventEmitter {
     }
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Register session in api-{chatId} index.json on first use
+    const internalChatIdForSession = `api-${chatId}`;
+    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdForSession, sessionId).catch((err: unknown) => {
+      this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
+    });
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFiles = opts.mediaFiles?.length
@@ -1303,7 +1311,7 @@ export class AgentRunner extends EventEmitter {
       })
       .catch(() => {});
     this.historyDb.insertMessage({
-      chatId: `api-${sessionId}`,
+      chatId: `api-${chatId}`,
       sessionId,
       source: 'api',
       role: 'user',
@@ -1333,7 +1341,7 @@ export class AgentRunner extends EventEmitter {
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttr = effectiveImagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePaths[0]!)}"` : '';
     const channelXml =
-      `<channel source="api" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
+      `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
       `${message}\n\n` +
       `${systemNote}` +
       `</channel>` +
@@ -1358,7 +1366,7 @@ export class AgentRunner extends EventEmitter {
             })
             .catch(() => {});
           this.historyDb.insertMessage({
-            chatId: `api-${sessionId}`,
+            chatId: `api-${chatId}`,
             sessionId,
             source: 'api',
             role: 'assistant',
@@ -1448,6 +1456,7 @@ export class AgentRunner extends EventEmitter {
    */
   async sendApiMessageStream(
     sessionId: string,
+    chatId: string,
     message: string,
     callbacks: {
       onChunk: (event: StreamEvent) => void;
@@ -1465,6 +1474,12 @@ export class AgentRunner extends EventEmitter {
     }
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Register session in api-{chatId} index.json on first use
+    const internalChatIdStream = `api-${chatId}`;
+    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdStream, sessionId).catch((err: unknown) => {
+      this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
+    });
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFilesStream = opts.mediaFiles?.length
@@ -1484,7 +1499,7 @@ export class AgentRunner extends EventEmitter {
       })
       .catch(() => {});
     this.historyDb.insertMessage({
-      chatId: `api-${sessionId}`,
+      chatId: `api-${chatId}`,
       sessionId,
       source: 'api',
       role: 'user',
@@ -1516,7 +1531,7 @@ export class AgentRunner extends EventEmitter {
           })
           .catch(() => {});
         this.historyDb.insertMessage({
-          chatId: `api-${sessionId}`,
+          chatId: `api-${chatId}`,
           sessionId,
           source: 'api',
           role: 'assistant',
@@ -1649,7 +1664,7 @@ export class AgentRunner extends EventEmitter {
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttrStream = effectiveImagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePathsStream[0]!)}"` : '';
     const channelXml =
-      `<channel source="api" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
+      `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
       `${message}\n\n` +
       systemNote +
       `</channel>` +
@@ -1686,8 +1701,146 @@ export class AgentRunner extends EventEmitter {
     return this.historyDb;
   }
 
+  getAllSessionNames(): Promise<Map<string, string>> {
+    return this.sessionStore.getAllSessionNames(this.agentConfig.id);
+  }
+
   async listSessionsForChat(chatId: string, channel: 'telegram' | 'discord'): Promise<import('../types').SessionIndex> {
     return this.sessionStore.listSessions(this.agentConfig.id, chatId, channel);
+  }
+
+  async executeApiCommand(sessionId: string, chatId: string, command: string): Promise<Record<string, unknown>> {
+    const agentId = this.agentConfig.id;
+    const internalChatId = `api-${chatId}`;
+
+    if (command === '/model') {
+      return { model: this.agentConfig.claude.model };
+    }
+
+    if (command === '/stop') {
+      const session = this.sessions.get(sessionId);
+      const stopped = session ? session.interrupt() : false;
+      return { stopped };
+    }
+
+    if (command === '/restart') {
+      this.restartProcess(sessionId).catch(() => {});
+      return { restarting: true };
+    }
+
+    if (command === '/session') {
+      const index = await this.sessionStore.listSessions(agentId, internalChatId, 'api').catch(() => null);
+      const meta = index?.sessions.find((s) => s.id === sessionId);
+      if (!meta) return { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: this.agentConfig.claude.model };
+      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+      const modelConfig = availableModels.find((m) => m.id === this.agentConfig.claude.model);
+      const contextWindow = modelConfig?.contextWindow ?? 200000;
+      const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
+      return {
+        sessionId,
+        sessionName: meta.name,
+        messageCount: meta.messageCount,
+        archivedCount: meta.archivedCount ?? 0,
+        contextUsedPct,
+        model: this.agentConfig.claude.model,
+      };
+    }
+
+    if (command === '/clear') {
+      const ch = 'api' as const;
+      await this.sessionStore.clearTelegramSessionHistory(agentId, internalChatId, sessionId, ch);
+      await this.sessionStore.updateSessionMeta(agentId, internalChatId, sessionId, {
+        totalTokensUsed: 0,
+        lastInputTokens: 0,
+        archivedCount: 0,
+        loadedAtSpawn: undefined,
+        messageCountAtSpawn: undefined,
+      }, ch);
+      const mediaPaths = this.historyDb.clearSession(internalChatId, sessionId);
+      MediaStore.deleteMediaFiles(this.agentsBaseDir, agentId, mediaPaths);
+      this.restartProcess(sessionId).catch(() => {});
+      return { success: true };
+    }
+
+    if (command === '/compact') {
+      const ch = 'api' as const;
+      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+      const modelConfig = availableModels.find((m) => m.id === this.agentConfig.claude.model);
+      const contextWindow = modelConfig?.contextWindow ?? 200000;
+      const compactor = new SessionCompactor(this.sessionStore);
+      const result = await compactor.compact(agentId, internalChatId, sessionId, this.agentConfig.claude.model, contextWindow, ch);
+      await this.sessionStore.updateSessionMeta(agentId, internalChatId, sessionId, {
+        loadedAtSpawn: undefined,
+        archivedCount: undefined,
+        messageCountAtSpawn: undefined,
+      }, ch);
+      await this.restartProcess(sessionId);
+      return { success: true, keptMessages: result.afterMessages, archivedMessages: result.beforeMessages - result.afterMessages };
+    }
+
+    throw new Error(`Unknown command: ${command}`);
+  }
+
+  async setModel(newModel: string): Promise<void> {
+    const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+    if (!availableModels.find((m) => m.id === newModel)) {
+      throw Object.assign(new Error(`Unknown model: ${newModel}`), { code: 'UNKNOWN_MODEL' });
+    }
+    this.agentConfig.claude.model = newModel;
+    try { this.persistModelToConfig(newModel); } catch (err) {
+      this.logger.error('Failed to persist model to config', { error: (err as Error).message });
+    }
+  }
+
+  async listApiSessions(chatId: string): Promise<import('../types').SessionIndex> {
+    return this.sessionStore.listSessions(this.agentConfig.id, `api-${chatId}`, 'api');
+  }
+
+  async createApiSession(chatId: string, prompt?: string, name?: string): Promise<import('../types').SessionMeta> {
+    let sessionName = name;
+    if (!sessionName && prompt) {
+      try {
+        const { execFile } = await import('child_process');
+        const { promisify } = await import('util');
+        const execFileAsync = promisify(execFile);
+        const titlePrompt = `Summarise in 3-5 words as a session title (no punctuation, no quotes): ${prompt}`;
+        const { stdout } = await execFileAsync(
+          'claude',
+          ['-p', titlePrompt, '--output-format', 'text', '--model', 'claude-haiku-4-5-20251001'],
+          { timeout: 15000, encoding: 'utf-8' },
+        );
+        sessionName = stdout.trim().slice(0, 60) || undefined;
+      } catch {
+        sessionName = undefined;
+      }
+    }
+    return this.sessionStore.createTelegramSession(this.agentConfig.id, `api-${chatId}`, sessionName, 'api');
+  }
+
+  async getApiSessionInfo(chatId: string, sessionId: string): Promise<Record<string, unknown> | null> {
+    const index = await this.sessionStore.listSessions(this.agentConfig.id, `api-${chatId}`, 'api').catch(() => null);
+    const meta = index?.sessions.find((s) => s.id === sessionId);
+    if (!meta) return null;
+    const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+    const modelConfig = availableModels.find((m) => m.id === this.agentConfig.claude.model);
+    const contextWindow = modelConfig?.contextWindow ?? 200000;
+    const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
+    return {
+      sessionId: meta.id,
+      sessionName: meta.name,
+      messageCount: meta.messageCount,
+      archivedCount: meta.archivedCount ?? 0,
+      contextUsedPct,
+      model: this.agentConfig.claude.model,
+    };
+  }
+
+  async renameApiSession(chatId: string, sessionId: string, sessionName: string): Promise<void> {
+    await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, { name: sessionName }, 'api');
+  }
+
+  async deleteApiSession(chatId: string, sessionId: string): Promise<void> {
+    await this.sessionStore.deleteTelegramSession(this.agentConfig.id, `api-${chatId}`, sessionId, 'api');
   }
 
   /**
