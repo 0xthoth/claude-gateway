@@ -35,6 +35,55 @@ const PROTECTED_WORKSPACE_FILES = [
   'IDENTITY.md', 'USER.md', 'HEARTBEAT.md',
 ];
 
+type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
+const MAX_API_IMAGES = 5;
+
+/**
+ * Move UI-uploaded files from staging (ui-upload/) to permanent per-session storage
+ * (media/api-{sessionId}/), matching the same pattern Telegram uses.
+ * Returns updated relative paths; falls back to original path on error.
+ */
+async function promoteUiUploads(
+  agentsBaseDir: string,
+  agentId: string,
+  sessionId: string,
+  mediaFiles: string[],
+  logger: Logger,
+): Promise<string[]> {
+  return Promise.all(
+    mediaFiles.map(async (relPath) => {
+      if (!relPath.startsWith('media/ui-upload/')) return relPath;
+      try {
+        const srcAbs = MediaStore.resolvePath(agentsBaseDir, agentId, relPath);
+        const newRelPath = MediaStore.copyToMedia(agentsBaseDir, agentId, `api-${sessionId}`, srcAbs);
+        await fsPromises.unlink(srcAbs).catch(() => {});
+        return newRelPath;
+      } catch (err) {
+        logger.warn('Failed to promote ui-upload to session storage', { relPath, err });
+        return relPath;
+      }
+    }),
+  );
+}
+
+async function buildImageBlocks(agentsBaseDir: string, agentId: string, mediaFiles: string[], logger: Logger): Promise<ImageBlock[]> {
+  const blocks: ImageBlock[] = [];
+  for (const relPath of mediaFiles.slice(0, MAX_API_IMAGES)) {
+    try {
+      const absPath = MediaStore.resolvePath(agentsBaseDir, agentId, relPath);
+      const data = await fsPromises.readFile(absPath);
+      const ext = path.extname(absPath).toLowerCase().slice(1);
+      const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
+      const media_type = mimeMap[ext] ?? 'image/jpeg';
+      blocks.push({ type: 'image', source: { type: 'base64', media_type, data: data.toString('base64') } });
+    } catch (err) {
+      logger.warn('Failed to build image block', { relPath, err });
+    }
+  }
+  return blocks;
+}
+
 function buildApiSystemNote(allowTools: boolean): string {
   const memoryOverride =
     `Memory Rule Override: Do NOT create or update ${PROTECTED_WORKSPACE_FILES.join(', ')} ` +
@@ -620,7 +669,7 @@ export class AgentRunner extends EventEmitter {
       let replyCalled = false;
       let typingDoneTimer: ReturnType<typeof setTimeout> | null = null;
       const TYPING_DONE_DELAY_MS = 3000;
-      const replyToolName = source === 'discord' ? 'mcp__gateway__discord_reply' : 'mcp__telegram__reply';
+      const replyToolName = source === 'discord' ? 'mcp__gateway__discord_reply' : 'mcp__gateway__telegram_reply';
 
       proc.on('output', (line: string) => {
         try {
@@ -632,13 +681,26 @@ export class AgentRunner extends EventEmitter {
             typingDoneTimer = null;
           }
 
-          // Track reply tool calls
+          // Track reply tool calls and persist assistant messages to history
           if (obj['type'] === 'assistant') {
-            const msg = obj['message'] as { content?: Array<{ type: string; name?: string }> } | undefined;
+            const msg = obj['message'] as { content?: Array<{ type: string; name?: string; input?: Record<string, unknown> }> } | undefined;
             if (Array.isArray(msg?.content)) {
               for (const block of msg!.content) {
                 if (block.type === 'tool_use' && block.name === replyToolName) {
                   replyCalled = true;
+                  // Persist the reply text to history so it appears in chat history API
+                  const replyText = typeof block.input?.['text'] === 'string' ? block.input['text'].trim() : '';
+                  if (replyText) {
+                    const channelSrc = this.channelSourceMap.get(mapKey) ?? 'telegram';
+                    this.historyDb.insertMessage({
+                      chatId: `${channelSrc}-${mapKey}`,
+                      sessionId: actualSessionId,
+                      source: channelSrc as HistorySource,
+                      role: 'assistant',
+                      content: replyText,
+                      ts: Date.now(),
+                    });
+                  }
                 }
               }
             }
@@ -665,11 +727,12 @@ export class AgentRunner extends EventEmitter {
                 }
               });
             }
-            // Always forward result text — it contains the agent's completion summary.
-            // If the agent also called reply tool, this summary still reaches the user.
+            // Forward result text when agent did NOT call reply tool (fallback path).
+            // If the agent already called the reply tool, skip result forwarding to avoid
+            // sending a duplicate message to the channel.
             // Skip forwarding when session is in query mode (internal image summary request).
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
-            if (resultText.trim() && !proc.queryMode) {
+            if (resultText.trim() && !proc.queryMode && !replyCalled) {
               const text = resultText.trim();
               const channelSrcForResult = this.channelSourceMap.get(mapKey) ?? 'telegram';
               // Persist assistant reply to permanent history DB
@@ -1212,7 +1275,7 @@ export class AgentRunner extends EventEmitter {
   async sendApiMessage(
     sessionId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
   ): Promise<string> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1223,6 +1286,16 @@ export class AgentRunner extends EventEmitter {
     }
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Promote UI-uploaded files from staging to permanent per-session storage
+    const finalMediaFiles = opts.mediaFiles?.length
+      ? await promoteUiUploads(this.agentsBaseDir, this.agentConfig.id, sessionId, opts.mediaFiles, this.logger)
+      : undefined;
+
+    // Build image blocks from (now-permanent) media paths
+    const imageBlocks = finalMediaFiles?.length
+      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, finalMediaFiles, this.logger)
+      : [];
 
     // Persist user message
     const apiUserTs = Date.now();
@@ -1239,6 +1312,7 @@ export class AgentRunner extends EventEmitter {
       source: 'api',
       role: 'user',
       content: message,
+      mediaFiles: finalMediaFiles?.length ? finalMediaFiles : undefined,
       ts: apiUserTs,
     });
 
@@ -1358,7 +1432,7 @@ export class AgentRunner extends EventEmitter {
 
       session.on('output', onOutput);
       session.setProcessing(true);
-      session.sendMessage(channelXml);
+      session.sendMessage(channelXml, imageBlocks.length ? imageBlocks : undefined);
       // Do NOT call resetQuiet() here — the quiet timer should only start
       // after the first output line arrives, otherwise it fires before the
       // subprocess has had time to respond (especially on first turn).
@@ -1379,7 +1453,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1390,6 +1464,16 @@ export class AgentRunner extends EventEmitter {
     }
 
     const session = await this.getOrSpawnSession(sessionId, 'api');
+
+    // Promote UI-uploaded files from staging to permanent per-session storage
+    const finalMediaFilesStream = opts.mediaFiles?.length
+      ? await promoteUiUploads(this.agentsBaseDir, this.agentConfig.id, sessionId, opts.mediaFiles, this.logger)
+      : undefined;
+
+    // Build image blocks from (now-permanent) media paths
+    const imageBlocksStream = finalMediaFilesStream?.length
+      ? await buildImageBlocks(this.agentsBaseDir, this.agentConfig.id, finalMediaFilesStream, this.logger)
+      : [];
 
     // Persist user message
     const streamUserTs = Date.now();
@@ -1406,6 +1490,7 @@ export class AgentRunner extends EventEmitter {
       source: 'api',
       role: 'user',
       content: message,
+      mediaFiles: finalMediaFilesStream?.length ? finalMediaFilesStream : undefined,
       ts: streamUserTs,
     });
 
@@ -1567,7 +1652,7 @@ export class AgentRunner extends EventEmitter {
       (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
 
     session.setProcessing(true);
-    session.sendMessage(channelXml);
+    session.sendMessage(channelXml, imageBlocksStream.length ? imageBlocksStream : undefined);
 
     // Return cleanup function for client disconnect
     return () => {
