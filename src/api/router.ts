@@ -19,6 +19,17 @@ type AuthedRequest = Request & { apiKey: ApiKey };
 const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 const SAFE_FILENAME_RE = /^[a-zA-Z0-9._\-() ]+$/;
 
+/** Detect MIME type from file magic bytes (first 12 bytes). */
+function detectMimeFromMagic(header: Buffer): string | null {
+  if (header[0] === 0xFF && header[1] === 0xD8 && header[2] === 0xFF) return 'image/jpeg';
+  if (header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4E && header[3] === 0x47) return 'image/png';
+  if (header[0] === 0x47 && header[1] === 0x49 && header[2] === 0x46) return 'image/gif';
+  if (header[0] === 0x52 && header[1] === 0x49 && header[2] === 0x46 && header[3] === 0x46 &&
+      header[8] === 0x57 && header[9] === 0x45 && header[10] === 0x42 && header[11] === 0x50) return 'image/webp';
+  if (header[0] === 0x25 && header[1] === 0x50 && header[2] === 0x44 && header[3] === 0x46) return 'application/pdf';
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // In-memory rate limiter for media uploads (per API key)
 // ---------------------------------------------------------------------------
@@ -866,6 +877,19 @@ export function createApiRouter(
     res.setHeader('Cache-Control', 'private, max-age=604800, immutable');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
+
+    // For .bin files (legacy uploads without extension), detect content-type from magic bytes
+    const ext = path.extname(absPath).toLowerCase();
+    if (ext === '.bin' || ext === '') {
+      try {
+        const fd = fs.openSync(absPath, 'r');
+        const header = Buffer.alloc(12);
+        fs.readSync(fd, header, 0, 12, 0);
+        fs.closeSync(fd);
+        const mime = detectMimeFromMagic(header);
+        if (mime) res.setHeader('Content-Type', mime);
+      } catch { /* fall through to sendFile default */ }
+    }
     res.sendFile(absPath);
   });
 
