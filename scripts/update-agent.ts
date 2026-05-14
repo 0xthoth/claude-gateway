@@ -538,7 +538,9 @@ async function main(): Promise<void> {
   console.log('\nDone! Restart the gateway to apply changes.');
 }
 
-main().catch((err) => {
-  console.error('\nFatal error:', (err as Error).message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('\nFatal error:', (err as Error).message);
+    process.exit(1);
+  });
+}
