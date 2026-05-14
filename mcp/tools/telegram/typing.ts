@@ -165,6 +165,13 @@ export function createWorkingStateManager(
       fsApi.rmSync(forwardPath, { force: true })
     }
     fsApi.rmSync(repliedPath, { force: true })
+    // Read signal file timestamp before deleting — process.ts overwrites it with a newer
+    // timestamp when a queued turn is injected; if newer than this turn's startedAt it means
+    // another turn is waiting and the loop must be restarted after cleanup.
+    let signalRaw: string | null = null
+    try { signalRaw = fsApi.readFileSync(typingFilePath(chatId), 'utf8').trim() } catch {}
+    const signalTs = signalRaw ? parseInt(signalRaw, 10) : 0
+    const hasQueuedTurn = signalTs > state.startedAt
     fsApi.rmSync(typingFilePath(chatId), { force: true })
     fsApi.rmSync(errorFilePath(chatId), { force: true })
     fsApi.rmSync(heartbeatFilePath(chatId), { force: true })
@@ -174,6 +181,10 @@ export function createWorkingStateManager(
       await botApi.deleteMessage(chatId, state.statusMessageId).catch(() => {})
     }
     states.delete(chatId)
+
+    if (hasQueuedTurn) {
+      start(chatId)
+    }
   }
 
   async function notifyError(chatId: string, code: string): Promise<void> {
