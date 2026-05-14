@@ -611,7 +611,17 @@ export class AgentRunner extends EventEmitter {
     modelOverride?: string,      // per-session model override from SessionMeta
   ): Promise<SessionProcess> {
     const existing = this.sessions.get(mapKey);
-    if (existing) return existing;
+    if (existing) {
+      // If model changed, restart the session with the new model
+      if (modelOverride && existing.modelOverride !== modelOverride) {
+        this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: modelOverride });
+        await existing.stop();
+        this.sessions.delete(mapKey);
+        // Fall through to spawn a new session with updated model
+      } else {
+        return existing;
+      }
+    }
 
     // Evict oldest idle session if at capacity
     if (this.sessions.size >= this.maxConcurrent) {
