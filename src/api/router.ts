@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { AgentRunner } from '../agent/runner';
+import { AgentRunner, DEFAULT_MODELS } from '../agent/runner';
 import { AgentConfig, ApiKey, ModelConfig } from '../types';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { MediaStore } from '../history/media-store';
@@ -18,6 +18,17 @@ type AuthedRequest = Request & { apiKey: ApiKey };
 
 const AGENT_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 const SAFE_FILENAME_RE = /^[a-zA-Z0-9._\-() ]+$/;
+
+/** Detect MIME type from file magic bytes (first 12 bytes). */
+function detectMimeFromMagic(header: Buffer): string | null {
+  if (header[0] === 0xFF && header[1] === 0xD8 && header[2] === 0xFF) return 'image/jpeg';
+  if (header[0] === 0x89 && header[1] === 0x50 && header[2] === 0x4E && header[3] === 0x47) return 'image/png';
+  if (header[0] === 0x47 && header[1] === 0x49 && header[2] === 0x46) return 'image/gif';
+  if (header[0] === 0x52 && header[1] === 0x49 && header[2] === 0x46 && header[3] === 0x46 &&
+      header[8] === 0x57 && header[9] === 0x45 && header[10] === 0x42 && header[11] === 0x50) return 'image/webp';
+  if (header[0] === 0x25 && header[1] === 0x50 && header[2] === 0x44 && header[3] === 0x46) return 'application/pdf';
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // In-memory rate limiter for media uploads (per API key)
@@ -138,8 +149,9 @@ export function createApiRouter(
       stream?: unknown;
       timeout_ms?: unknown;
       media_files?: unknown;
+      model?: unknown;
     };
-    const { message, chat_id, session_id, stream, timeout_ms, media_files } = body;
+    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel } = body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       res.status(400).json({ error: 'message is required and must be a non-empty string' });
@@ -184,6 +196,16 @@ export function createApiRouter(
         }
       }
       validatedMediaFiles = media_files as string[];
+    }
+
+    // Validate model if provided — always reject unknown models (fail closed)
+    const modelStr = typeof requestModel === 'string' ? requestModel.trim() : undefined;
+    if (modelStr) {
+      const availableModels = models ?? DEFAULT_MODELS;
+      if (!availableModels.find((m: ModelConfig) => m.id === modelStr)) {
+        res.status(400).json({ error: `Unknown model: ${modelStr}` });
+        return;
+      }
     }
 
     const requestId = randomUUID();
@@ -251,7 +273,7 @@ export function createApiRouter(
           chatIdStr,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles },
+          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr },
         );
 
         // Client disconnect -> cleanup
@@ -280,6 +302,7 @@ export function createApiRouter(
           timeoutMs,
           allowTools: allowToolsSync,
           mediaFiles: validatedMediaFiles,
+          model: modelStr,
         });
         res.json({
           request_id: requestId,
@@ -343,14 +366,17 @@ export function createApiRouter(
     const agents = await Promise.all(
       [...agentRunners.entries()].map(async ([agentId, runner]) => {
         const cfg = agentConfigs.get(agentId);
-        const [sessions, nameMap] = await Promise.all([
+        const [sessions, metaMap] = await Promise.all([
           Promise.resolve(runner.getHistoryDb().listSessions()),
-          runner.getAllSessionNames(),
+          runner.getAllSessionMeta(),
         ]);
         return {
           agentId,
           description: cfg?.description ?? '',
-          sessions: sessions.map((s) => ({ ...s, sessionName: nameMap.get(s.sessionId) ?? null })),
+          sessions: sessions.map((s) => {
+            const meta = metaMap.get(s.sessionId);
+            return { ...s, sessionName: meta?.name ?? null };
+          }),
         };
       }),
     );
@@ -866,6 +892,19 @@ export function createApiRouter(
     res.setHeader('Cache-Control', 'private, max-age=604800, immutable');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
+
+    // For .bin files (legacy uploads without extension), detect content-type from magic bytes
+    const ext = path.extname(absPath).toLowerCase();
+    if (ext === '.bin' || ext === '') {
+      try {
+        const fd = fs.openSync(absPath, 'r');
+        const header = Buffer.alloc(12);
+        fs.readSync(fd, header, 0, 12, 0);
+        fs.closeSync(fd);
+        const mime = detectMimeFromMagic(header);
+        if (mime) res.setHeader('Content-Type', mime);
+      } catch { /* fall through to sendFile default */ }
+    }
     res.sendFile(absPath);
   });
 
@@ -993,7 +1032,7 @@ export function createApiRouter(
 
   /**
    * PATCH /api/v1/agents/:agentId/sessions/:sessionId
-   * Rename a session.
+   * Update session metadata (name and/or model).
    */
   router.patch('/v1/agents/:agentId/sessions/:sessionId', auth, async (req: Request, res: Response) => {
     const ctx = resolveApiSession(req, res);
@@ -1004,8 +1043,8 @@ export function createApiRouter(
     const sessionName = typeof body.sessionName === 'string' ? body.sessionName.trim() : undefined;
     if (!sessionName) { res.status(400).json({ error: 'sessionName is required' }); return; }
     try {
-      await runner.renameApiSession(chatId, sessionId, sessionName);
-      res.json({ sessionId, sessionName });
+      const result = await runner.updateApiSession(chatId, sessionId, { sessionName });
+      res.json(result);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }

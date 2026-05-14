@@ -23,7 +23,7 @@ const DEFAULT_MAX_CONCURRENT = 20;
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 
-const DEFAULT_MODELS: ModelConfig[] = [
+export const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
   { id: 'claude-opus-4-6', label: 'Opus 4.6', alias: 'opus46', contextWindow: 1000000 },
   { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
@@ -110,6 +110,9 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks session IDs with an in-flight API request (prevents concurrent turns)
   private readonly pendingApiSessions = new Set<string>();
+
+  // Serialises concurrent getOrSpawnSession calls for the same key to prevent double-spawn
+  private readonly sessionSpawnLocks = new Map<string, Promise<SessionProcess>>();
 
   // Tracks pending Telegram image paths per chatId (queue) for size accumulation after each turn.
   private readonly pendingImagePaths = new Map<string, string[]>();
@@ -270,6 +273,7 @@ export class AgentRunner extends EventEmitter {
               }
 
               // Route to session process (map key = chatId, actual sessionId passed separately)
+              // Channel sessions use agent-level model (not per-session)
               const session = await this.getOrSpawnSession(chatId, channelSource, sessionId);
               let channelXml = AgentRunner.buildChannelXml(params);
 
@@ -347,47 +351,42 @@ export class AgentRunner extends EventEmitter {
 
     if (command === 'set_model') {
       const newModel = typeof body.payload?.model === 'string' ? body.payload.model : '';
-      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const valid = availableModels.find(m => m.id === newModel);
-      if (!valid) {
-        respond({ success: false, error: 'Unknown model' });
+
+      try {
+        await this.setModel(newModel);
+      } catch (err) {
+        respond({ success: false, error: (err as Error).message });
         return;
       }
 
-      // Update in-memory config
-      this.agentConfig.claude.model = newModel;
-
-      // Persist to config.json (atomic write)
-      try {
-        this.persistModelToConfig(newModel);
-      } catch (err) {
-        this.logger.error('Failed to persist model to config', { error: (err as Error).message });
-      }
-
-      // Graceful restart all sessions with notify payload
+      // Graceful restart ALL channel sessions via signal files so they pick up the new agent-level model.
+      // Signal file approach: chokidar watcher in SessionProcess detects the file, reads the notify
+      // payload, finishes in-flight work, then restarts — ensuring no mid-response interruption.
       const chatId = body.chat_id ?? '';
       let restarted = false;
-      for (const [sessionId, session] of this.sessions) {
-        restarted = true;
-        const notifyPayload = JSON.stringify({
-          notify: {
-            chat_id: chatId,
-            text: `Model changed to ${newModel} — back online!`,
-          },
-        });
-        const signalPath = path.join(
-          this.agentConfig.workspace,
-          '.telegram-state',
-          `restart-${sessionId}`,
-        );
-        try {
-          fs.mkdirSync(path.dirname(signalPath), { recursive: true });
-          fs.writeFileSync(signalPath, notifyPayload);
-        } catch (err) {
-          this.logger.error('Failed to write restart signal', {
-            sessionId,
-            error: (err as Error).message,
+      for (const [key, session] of this.sessions) {
+        // Only restart channel sessions (not API sessions which use per-session model)
+        if (session.source !== 'api') {
+          restarted = true;
+          const channel = this.channelSourceMap.get(key) ?? 'telegram';
+          const stateDir = channel === 'discord' ? '.discord-state' : '.telegram-state';
+          const signalPayload = JSON.stringify({
+            notify: { chat_id: chatId, text: `✅ Model changed to ${newModel}` },
           });
+          const signalPath = path.join(
+            this.agentConfig.workspace,
+            stateDir,
+            `restart-${key}`,
+          );
+          try {
+            fs.mkdirSync(path.dirname(signalPath), { recursive: true });
+            fs.writeFileSync(signalPath, signalPayload);
+          } catch (err) {
+            this.logger.error('Failed to write restart signal for set_model', {
+              sessionKey: key,
+              error: (err as Error).message,
+            });
+          }
         }
       }
 
@@ -455,8 +454,9 @@ export class AgentRunner extends EventEmitter {
         if (!meta) {
           return respond({ success: true, text: 'No active session found.' });
         }
+        const effectiveModel = this.agentConfig.claude.model;
         const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-        const modelConfig = availableModels.find(m => m.id === this.agentConfig.claude.model);
+        const modelConfig = availableModels.find(m => m.id === effectiveModel);
         const contextWindow = modelConfig?.contextWindow ?? 200000;
         const contextTokens = meta.lastInputTokens ?? 0;
         const usedPct = Math.round((contextTokens / contextWindow) * 100);
@@ -617,9 +617,49 @@ export class AgentRunner extends EventEmitter {
     mapKey: string,              // Map lookup key (chatId for telegram/discord, sessionId for API)
     source: 'telegram' | 'discord' | 'api',
     sessionId?: string,          // actual session UUID (only for channel sessions; equals mapKey for API)
+    modelOverride?: string,      // per-session model override from SessionMeta
   ): Promise<SessionProcess> {
+    // If a spawn is already in progress for this key, wait for it instead of spawning a second one
+    const pending = this.sessionSpawnLocks.get(mapKey);
+    if (pending) return pending;
+
     const existing = this.sessions.get(mapKey);
-    if (existing) return existing;
+    if (existing) {
+      // If model changed, restart the session with the new model
+      if (modelOverride && existing.modelOverride !== modelOverride) {
+        this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: modelOverride });
+        const respawn = (async () => {
+          await existing.stop();
+          this.sessions.delete(mapKey);
+          return this.spawnSession(mapKey, source, sessionId, modelOverride);
+        })();
+        this.sessionSpawnLocks.set(mapKey, respawn);
+        try {
+          return await respawn;
+        } finally {
+          this.sessionSpawnLocks.delete(mapKey);
+        }
+      } else {
+        return existing;
+      }
+    }
+
+    // No existing session — acquire lock for the spawn path
+    const spawnPromise = this.spawnSession(mapKey, source, sessionId, modelOverride);
+    this.sessionSpawnLocks.set(mapKey, spawnPromise);
+    try {
+      return await spawnPromise;
+    } finally {
+      this.sessionSpawnLocks.delete(mapKey);
+    }
+  }
+
+  private async spawnSession(
+    mapKey: string,
+    source: 'telegram' | 'discord' | 'api',
+    sessionId?: string,
+    modelOverride?: string,
+  ): Promise<SessionProcess> {
 
     // Evict oldest idle session if at capacity
     if (this.sessions.size >= this.maxConcurrent) {
@@ -647,6 +687,10 @@ export class AgentRunner extends EventEmitter {
       this.sessionStore,
       chatId,
     );
+
+    // Apply per-session model override if provided
+    if (modelOverride) proc.modelOverride = modelOverride;
+
     await proc.start();
 
     // Forward all session output lines so listeners on AgentRunner (GatewayRouter,
@@ -896,8 +940,9 @@ export class AgentRunner extends EventEmitter {
       return;
     }
 
+    const effectiveModel = this.agentConfig.claude.model;
     const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-    const modelConfig = availableModels.find(m => m.id === this.agentConfig.claude.model);
+    const modelConfig = availableModels.find(m => m.id === effectiveModel);
     const contextWindow = modelConfig?.contextWindow ?? 200000;
     const contextTokens = meta.lastInputTokens ?? 0;
     const usedPct = Math.round((contextTokens / contextWindow) * 100);
@@ -1005,15 +1050,16 @@ export class AgentRunner extends EventEmitter {
     const meta = index.sessions.find(s => s.id === sessionId);
     const name = meta?.name ?? 'Session';
 
+    const compactModel = this.agentConfig.claude.model;
     const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-    const modelConfig = availableModels.find(m => m.id === this.agentConfig.claude.model);
+    const modelConfig = availableModels.find(m => m.id === compactModel);
     const contextWindow = modelConfig?.contextWindow ?? 200000;
 
     this.writeAutoForward(chatId, `⏳ Compacting session "${name}"...`);
 
     try {
       const compactor = new SessionCompactor(this.sessionStore);
-      const result = await compactor.compact(agentId, chatId, sessionId, this.agentConfig.claude.model, contextWindow, ch);
+      const result = await compactor.compact(agentId, chatId, sessionId, compactModel, contextWindow, ch);
       await this.sessionStore.updateSessionMeta(agentId, chatId, sessionId, {
         loadedAtSpawn: undefined,
         archivedCount: undefined,
@@ -1288,7 +1334,7 @@ export class AgentRunner extends EventEmitter {
     sessionId: string,
     chatId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string },
   ): Promise<string> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1298,13 +1344,14 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    const session = await this.getOrSpawnSession(sessionId, 'api');
-
     // Register session in api-{chatId} index.json on first use
     const internalChatIdForSession = `api-${chatId}`;
     await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdForSession, sessionId).catch((err: unknown) => {
       this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
     });
+
+    // Use model from request body if provided, otherwise use agent default
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFiles = opts.mediaFiles?.length
@@ -1480,7 +1527,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[] },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1490,13 +1537,14 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    const session = await this.getOrSpawnSession(sessionId, 'api');
-
     // Register session in api-{chatId} index.json on first use
     const internalChatIdStream = `api-${chatId}`;
     await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdStream, sessionId).catch((err: unknown) => {
       this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
     });
+
+    // Use model from request body if provided, otherwise use agent default
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFilesStream = opts.mediaFiles?.length
@@ -1721,8 +1769,8 @@ export class AgentRunner extends EventEmitter {
     return this.historyDb;
   }
 
-  getAllSessionNames(): Promise<Map<string, string>> {
-    return this.sessionStore.getAllSessionNames(this.agentConfig.id);
+  getAllSessionMeta(): Promise<Map<string, { name: string }>> {
+    return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
   }
 
   async listSessionsForChat(chatId: string, channel: 'telegram' | 'discord'): Promise<import('../types').SessionIndex> {
@@ -1751,9 +1799,10 @@ export class AgentRunner extends EventEmitter {
     if (command === '/session') {
       const index = await this.sessionStore.listSessions(agentId, internalChatId, 'api').catch(() => null);
       const meta = index?.sessions.find((s) => s.id === sessionId);
-      if (!meta) return { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: this.agentConfig.claude.model };
+      const effectiveModel = this.agentConfig.claude.model;
+      if (!meta) return { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
       const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const modelConfig = availableModels.find((m) => m.id === this.agentConfig.claude.model);
+      const modelConfig = availableModels.find((m) => m.id === effectiveModel);
       const contextWindow = modelConfig?.contextWindow ?? 200000;
       const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
       return {
@@ -1762,7 +1811,7 @@ export class AgentRunner extends EventEmitter {
         messageCount: meta.messageCount,
         archivedCount: meta.archivedCount ?? 0,
         contextUsedPct,
-        model: this.agentConfig.claude.model,
+        model: effectiveModel,
       };
     }
 
@@ -1784,11 +1833,12 @@ export class AgentRunner extends EventEmitter {
 
     if (command === '/compact') {
       const ch = 'api' as const;
+      const compactEffectiveModel = this.agentConfig.claude.model;
       const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const modelConfig = availableModels.find((m) => m.id === this.agentConfig.claude.model);
+      const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
       const contextWindow = modelConfig?.contextWindow ?? 200000;
       const compactor = new SessionCompactor(this.sessionStore);
-      const result = await compactor.compact(agentId, internalChatId, sessionId, this.agentConfig.claude.model, contextWindow, ch);
+      const result = await compactor.compact(agentId, internalChatId, sessionId, compactEffectiveModel, contextWindow, ch);
       await this.sessionStore.updateSessionMeta(agentId, internalChatId, sessionId, {
         loadedAtSpawn: undefined,
         archivedCount: undefined,
@@ -1841,8 +1891,9 @@ export class AgentRunner extends EventEmitter {
     const index = await this.sessionStore.listSessions(this.agentConfig.id, `api-${chatId}`, 'api').catch(() => null);
     const meta = index?.sessions.find((s) => s.id === sessionId);
     if (!meta) return null;
+    const effectiveModel = this.agentConfig.claude.model;
     const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-    const modelConfig = availableModels.find((m) => m.id === this.agentConfig.claude.model);
+    const modelConfig = availableModels.find((m) => m.id === effectiveModel);
     const contextWindow = modelConfig?.contextWindow ?? 200000;
     const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
     return {
@@ -1851,12 +1902,15 @@ export class AgentRunner extends EventEmitter {
       messageCount: meta.messageCount,
       archivedCount: meta.archivedCount ?? 0,
       contextUsedPct,
-      model: this.agentConfig.claude.model,
+      model: effectiveModel,
     };
   }
 
-  async renameApiSession(chatId: string, sessionId: string, sessionName: string): Promise<void> {
-    await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, { name: sessionName }, 'api');
+  async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string }): Promise<{ sessionId: string; sessionName?: string }> {
+    if (updates.sessionName) {
+      await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, { name: updates.sessionName }, 'api');
+    }
+    return { sessionId, ...(updates.sessionName ? { sessionName: updates.sessionName } : {}) };
   }
 
   async deleteApiSession(chatId: string, sessionId: string): Promise<void> {
@@ -1884,6 +1938,7 @@ export class AgentRunner extends EventEmitter {
     // Ensure the session process uses the correct channel source
     this.channelSourceMap.set(rawChatId, channel);
 
+    // Channel sessions use agent-level model (not per-session)
     const session = await this.getOrSpawnSession(rawChatId, channel, sessionId);
 
     // Persist user message (Layer 1 session JSON + Layer 2 history DB)
