@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BRANCH=$(git rev-parse --abbrev-ref HEAD | sed 's|^heads/||')
 if [[ "$BRANCH" != "main" ]]; then
   echo "Error: must be on 'main' branch to release (currently on '$BRANCH')"
   exit 1
