@@ -14,7 +14,7 @@ if [[ "$BRANCH" != "main" ]]; then
   exit 1
 fi
 
-if [[ -n $(git status --porcelain) ]]; then
+if [[ -n "$(git status --porcelain)" ]]; then
   echo "Error: working tree is not clean — commit or stash changes first"
   exit 1
 fi
@@ -26,6 +26,10 @@ if [[ $(git rev-parse HEAD) != $(git rev-parse origin/main) ]]; then
 fi
 
 CURRENT=$(node -p "require('./package.json').version")
+if ! [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: package.json version '$CURRENT' is not valid semver"
+  exit 1
+fi
 
 echo ""
 echo "Current version: v$CURRENT"
@@ -49,11 +53,15 @@ esac
 if [[ "$TYPE" == "current" ]]; then
   NEXT="$CURRENT"
 else
-  NPM_DRY_OUT=$(npm version "$TYPE" --no-git-tag-version --dry-run 2>&1)
-  NEXT=$(echo "$NPM_DRY_OUT" | tr -d 'v' | tail -1)
+  NEXT=$(CURRENT="$CURRENT" TYPE="$TYPE" node -e "
+    const [major, minor, patch] = process.env.CURRENT.split('.').map(Number);
+    const t = process.env.TYPE;
+    if (t === 'patch') console.log(major + '.' + minor + '.' + (patch + 1));
+    else if (t === 'minor') console.log(major + '.' + (minor + 1) + '.0');
+    else console.log((major + 1) + '.0.0');
+  ")
   if [[ -z "$NEXT" ]]; then
-    echo "Error: failed to compute next version"
-    echo "$NPM_DRY_OUT"
+    echo "Error: failed to compute next version from v$CURRENT"
     exit 1
   fi
 fi
@@ -73,15 +81,17 @@ if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
 fi
 
 if [[ "$TYPE" == "current" ]]; then
-  if git tag -l "v$NEXT" | grep -q "v$NEXT"; then
+  LOCAL_TAG=$(git tag -l "v$NEXT")
+  REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/v$NEXT" | grep -c "v$NEXT" || true)
+  if [[ -n "$LOCAL_TAG" || "$REMOTE_TAG" -gt 0 ]]; then
     echo ""
-    echo "Tag v$NEXT already exists locally."
+    echo "Tag v$NEXT already exists$([ -n "$LOCAL_TAG" ] && echo " locally")$([ "$REMOTE_TAG" -gt 0 ] && echo " on remote")."
     read -rp "Force retag? This will delete and recreate the tag [y/N]: " retag
     if [[ "$retag" != "y" && "$retag" != "Y" ]]; then
       echo "Aborted."
       exit 0
     fi
-    git tag -d "v$NEXT"
+    git tag -d "v$NEXT" 2>/dev/null || true
     git push origin ":refs/tags/v$NEXT" 2>/dev/null || true
   fi
 
@@ -99,14 +109,7 @@ else
     exit 1
   fi
 
-  npm version "$TYPE" --no-git-tag-version
-
-  ACTUAL_VERSION=$(node -p "require('./package.json').version")
-  if [[ "$ACTUAL_VERSION" != "$NEXT" ]]; then
-    echo "Error: package.json shows v$ACTUAL_VERSION but expected v$NEXT — aborting"
-    git checkout -- package.json package-lock.json
-    exit 1
-  fi
+  npm version "$NEXT" --no-git-tag-version
 
   git add package.json package-lock.json
   git commit -m "v$NEXT"
