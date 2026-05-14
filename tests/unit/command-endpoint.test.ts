@@ -169,29 +169,34 @@ describe('AgentRunner /command endpoint', () => {
   });
 
   // --------------------------------------------------------------------------
-  // U-CMD-02: set_model updates model and returns success
+  // U-CMD-02: set_model updates per-session model and returns success
   // --------------------------------------------------------------------------
-  it('U-CMD-02: set_model updates model and returns success', async () => {
+  it('U-CMD-02: set_model updates per-session model and returns success', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
     const port = getCallbackPort(runner);
 
+    // Create a session first
+    await sendChannelPost(port, 'chat123', 'hello');
+    await new Promise(r => setTimeout(r, 100));
+
     const { data } = await sendCommand(port, {
       command: 'set_model',
+      chat_id: 'chat123',
       payload: { model: 'claude-sonnet-4-6' },
     });
 
     expect(data.success).toBe(true);
     expect(data.model).toBe('claude-sonnet-4-6');
 
-    // Verify in-memory config was updated
-    const { data: getResult } = await sendCommand(port, { command: 'get_model' });
+    // Verify per-session model was updated
+    const { data: getResult } = await sendCommand(port, { command: 'get_model', chat_id: 'chat123' });
     expect(getResult.model).toBe('claude-sonnet-4-6');
 
-    // Verify config.json was persisted
+    // config.json should NOT be modified (per-session only)
     const configPath = path.join(tmpDir, 'config.json');
     const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    expect(persisted.agents[0].claude.model).toBe('claude-sonnet-4-6');
+    expect(persisted.agents[0].claude.model).toBe('claude-opus-4-6');
   });
 
   // --------------------------------------------------------------------------
@@ -216,9 +221,9 @@ describe('AgentRunner /command endpoint', () => {
   });
 
   // --------------------------------------------------------------------------
-  // U-CMD-04: set_model when session exists triggers restart signal
+  // U-CMD-04: set_model updates per-session model and stops session process
   // --------------------------------------------------------------------------
-  it('U-CMD-04: set_model with active session writes restart signal', async () => {
+  it('U-CMD-04: set_model with active session updates session model and stops process', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
     const port = getCallbackPort(runner);
@@ -239,38 +244,43 @@ describe('AgentRunner /command endpoint', () => {
     expect(data.success).toBe(true);
     expect(data.model).toBe('claude-sonnet-4-6');
 
-    // Verify restart signal was written for the session
-    const stateDir = path.join(agentConfig.workspace, '.telegram-state');
-    const signalPath = path.join(stateDir, 'restart-chat123');
-    // Signal may have already been consumed by chokidar, so we check the model was updated
-    const { data: getResult } = await sendCommand(port, { command: 'get_model' });
+    // Session process should be stopped (will respawn with new model on next message)
+    expect(sessions.has('chat123')).toBe(false);
+
+    // Verify get_model returns the per-session model
+    const { data: getResult } = await sendCommand(port, { command: 'get_model', chat_id: 'chat123' });
     expect(getResult.model).toBe('claude-sonnet-4-6');
   });
 
   // --------------------------------------------------------------------------
-  // U-CMD-05: set_model with no active session still updates config
+  // U-CMD-05: set_model with no active session updates session metadata
   // --------------------------------------------------------------------------
-  it('U-CMD-05: set_model with no active session still updates config', async () => {
+  it('U-CMD-05: set_model with chat_id updates session model even with no spawned process', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
     const port = getCallbackPort(runner);
 
-    // No sessions spawned
-    const sessions = getSessions(runner);
-    expect(sessions.size).toBe(0);
+    // Create a session by sending a message, then let it stop
+    await sendChannelPost(port, 'chat123', 'hello');
+    await new Promise(r => setTimeout(r, 100));
 
     const { data } = await sendCommand(port, {
       command: 'set_model',
+      chat_id: 'chat123',
       payload: { model: 'claude-haiku-4-5-20251001' },
     });
 
     expect(data.success).toBe(true);
     expect(data.model).toBe('claude-haiku-4-5-20251001');
 
-    // Verify config persisted
+    // Verify get_model returns per-session model
+    const { data: getResult } = await sendCommand(port, { command: 'get_model', chat_id: 'chat123' });
+    expect(getResult.model).toBe('claude-haiku-4-5-20251001');
+
+    // config.json should NOT be modified (per-session, not agent-level)
     const configPath = path.join(tmpDir, 'config.json');
     const persisted = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    expect(persisted.agents[0].claude.model).toBe('claude-haiku-4-5-20251001');
+    expect(persisted.agents[0].claude.model).toBe('claude-opus-4-6');
   });
 
   // --------------------------------------------------------------------------

@@ -138,6 +138,7 @@ export interface SessionMeta {
   loadedAtSpawn?: number;   // messages loaded into context at last spawn (≤ MAX_HISTORY_MESSAGES)
   archivedCount?: number;   // messages not loaded into context (older than loaded window)
   messageCountAtSpawn?: number; // total messageCount at spawn time, used to derive in-context count
+  model?: string;      // per-session model override (falls back to agent config)
 }
 
 export interface SessionIndex {

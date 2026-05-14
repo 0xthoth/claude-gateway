@@ -20,6 +20,7 @@ export class SessionProcess extends EventEmitter {
   readonly source: 'telegram' | 'discord' | 'api';
   private readonly sessionChannel: 'telegram' | 'discord';
   lastActivityAt = Date.now(); // accessible by AgentRunner for eviction sort
+  modelOverride?: string; // per-session model override (set by runner from SessionMeta)
   spawnContext: { loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number } | null = null;
   private process: ChildProcess | null = null;
   private stopping = false;
@@ -67,10 +68,12 @@ export class SessionProcess extends EventEmitter {
   }
 
   /**
-   * Read model from config.json on disk so restarts pick up changes made after startup.
-   * Falls back to the cached agentConfig.claude.model if config can't be read.
+   * Resolve the model for this session.
+   * Priority: per-session override > config.json on disk > cached agentConfig.
    */
   private readFreshModel(): string {
+    // Per-session model override takes priority
+    if (this.modelOverride) return this.modelOverride;
     try {
       const raw = fs.readFileSync(this.configPath, 'utf-8');
       const config = JSON.parse(raw) as { agents?: Array<{ id: string; claude?: { model?: string } }> };

@@ -149,8 +149,9 @@ export function createApiRouter(
       stream?: unknown;
       timeout_ms?: unknown;
       media_files?: unknown;
+      model?: unknown;
     };
-    const { message, chat_id, session_id, stream, timeout_ms, media_files } = body;
+    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel } = body;
 
     if (!message || typeof message !== 'string' || !message.trim()) {
       res.status(400).json({ error: 'message is required and must be a non-empty string' });
@@ -195,6 +196,15 @@ export function createApiRouter(
         }
       }
       validatedMediaFiles = media_files as string[];
+    }
+
+    // Validate model if provided
+    const modelStr = typeof requestModel === 'string' ? requestModel.trim() : undefined;
+    if (modelStr && models?.length) {
+      if (!models.find((m: ModelConfig) => m.id === modelStr)) {
+        res.status(400).json({ error: `Unknown model: ${modelStr}` });
+        return;
+      }
     }
 
     const requestId = randomUUID();
@@ -262,7 +272,7 @@ export function createApiRouter(
           chatIdStr,
           message.trim(),
           sseCallbacks,
-          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles },
+          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr },
         );
 
         // Client disconnect -> cleanup
@@ -291,6 +301,7 @@ export function createApiRouter(
           timeoutMs,
           allowTools: allowToolsSync,
           mediaFiles: validatedMediaFiles,
+          model: modelStr,
         });
         res.json({
           request_id: requestId,
@@ -1017,20 +1028,25 @@ export function createApiRouter(
 
   /**
    * PATCH /api/v1/agents/:agentId/sessions/:sessionId
-   * Rename a session.
+   * Update session metadata (name and/or model).
    */
   router.patch('/v1/agents/:agentId/sessions/:sessionId', auth, async (req: Request, res: Response) => {
     const ctx = resolveApiSession(req, res);
     if (!ctx) return;
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
-    const body = req.body as { sessionName?: unknown };
+    const body = req.body as { sessionName?: unknown; model?: unknown };
     const sessionName = typeof body.sessionName === 'string' ? body.sessionName.trim() : undefined;
-    if (!sessionName) { res.status(400).json({ error: 'sessionName is required' }); return; }
+    const model = typeof body.model === 'string' ? body.model.trim() : undefined;
+    if (!sessionName && !model) { res.status(400).json({ error: 'sessionName or model is required' }); return; }
     try {
-      await runner.renameApiSession(chatId, sessionId, sessionName);
-      res.json({ sessionId, sessionName });
+      const result = await runner.updateApiSession(chatId, sessionId, { sessionName, model });
+      res.json(result);
     } catch (err) {
+      if ((err as Error).message.includes('Unknown model')) {
+        res.status(400).json({ error: (err as Error).message });
+        return;
+      }
       res.status(500).json({ error: (err as Error).message });
     }
   });
