@@ -1721,10 +1721,6 @@ export class AgentRunner extends EventEmitter {
     return this.historyDb;
   }
 
-  getAllSessionNames(): Promise<Map<string, string>> {
-    return this.sessionStore.getAllSessionNames(this.agentConfig.id);
-  }
-
   getAllSessionMeta(): Promise<Map<string, { name: string; model?: string }>> {
     return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
   }
