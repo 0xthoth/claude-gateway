@@ -356,23 +356,35 @@ export class AgentRunner extends EventEmitter {
         return;
       }
 
-      // Restart ALL channel sessions so they pick up the new agent-level model
+      // Graceful restart ALL channel sessions via signal files so they pick up the new agent-level model.
+      // Signal file approach: chokidar watcher in SessionProcess detects the file, reads the notify
+      // payload, finishes in-flight work, then restarts — ensuring no mid-response interruption.
       const chatId = body.chat_id ?? '';
       let restarted = false;
-      const stopPromises: Promise<void>[] = [];
       for (const [key, session] of this.sessions) {
         // Only restart channel sessions (not API sessions which use per-session model)
         if (session.source !== 'api') {
           restarted = true;
-          stopPromises.push(session.stop());
-          this.sessions.delete(key);
+          const channel = this.channelSourceMap.get(key) ?? 'telegram';
+          const stateDir = channel === 'discord' ? '.discord-state' : '.telegram-state';
+          const signalPayload = JSON.stringify({
+            notify: { chat_id: chatId, text: `✅ Model changed to ${newModel}` },
+          });
+          const signalPath = path.join(
+            this.agentConfig.workspace,
+            stateDir,
+            `restart-${key}`,
+          );
+          try {
+            fs.mkdirSync(path.dirname(signalPath), { recursive: true });
+            fs.writeFileSync(signalPath, signalPayload);
+          } catch (err) {
+            this.logger.error('Failed to write restart signal for set_model', {
+              sessionKey: key,
+              error: (err as Error).message,
+            });
+          }
         }
-      }
-      await Promise.all(stopPromises);
-
-      // Notify the caller's channel that model changed
-      if (chatId) {
-        this.writeAutoForward(chatId, `✅ Model changed to ${newModel}`);
       }
 
       respond({ success: true, model: newModel, restarted });

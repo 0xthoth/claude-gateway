@@ -223,7 +223,7 @@ describe('AgentRunner /command endpoint', () => {
   // --------------------------------------------------------------------------
   // U-CMD-04: set_model updates agent-level model and stops session process
   // --------------------------------------------------------------------------
-  it('U-CMD-04: set_model with active session updates agent model and stops process', async () => {
+  it('U-CMD-04: set_model with active session updates agent model and writes restart signal', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
     const port = getCallbackPort(runner);
@@ -244,8 +244,15 @@ describe('AgentRunner /command endpoint', () => {
     expect(data.success).toBe(true);
     expect(data.model).toBe('claude-sonnet-4-6');
 
-    // Session process should be stopped (will respawn with new model on next message)
-    expect(sessions.has('chat123')).toBe(false);
+    // Session stays in the map — signal file triggers graceful restart via chokidar.
+    // The session is NOT removed immediately (unlike the old direct stop approach).
+    expect(sessions.has('chat123')).toBe(true);
+
+    // Verify a restart signal file was written
+    const signalPath = path.join(agentConfig.workspace, '.telegram-state', 'restart-chat123');
+    expect(fs.existsSync(signalPath)).toBe(true);
+    const signalContent = JSON.parse(fs.readFileSync(signalPath, 'utf-8'));
+    expect(signalContent.notify.text).toContain('claude-sonnet-4-6');
 
     // Verify get_model returns the agent-level model
     const { data: getResult } = await sendCommand(port, { command: 'get_model', chat_id: 'chat123' });
