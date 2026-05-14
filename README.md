@@ -26,13 +26,14 @@ A self-hosted multi-agent gateway for Claude Code. Connect Claude agents to Tele
 - **Config auto-migration** — automatic schema migration when config format changes
 - **Access control** — allowlist, open, or pairing-based Telegram access policies
 - **HTTP API** — REST API with key-based auth for external integrations
+- **Self-update API** — check for newer versions of `claude-gateway` and `claude-code` and trigger an update via a single API call; no SSH or shell access needed
 - **Session persistence** — conversation history saved and restored across restarts
 
 ---
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 22+
 - [Claude Code CLI](https://claude.ai/code) v2.1.0+ installed and authenticated — `channels mode` is required (`claude --version`)
 - [Bun](https://bun.sh) — runs the MCP server subprocess (`mcp/server.ts`)
 - A bot token per agent — Telegram (from [@BotFather](https://t.me/BotFather)) or Discord (from [Discord Developer Portal](https://discord.com/developers/applications))
@@ -41,26 +42,76 @@ A self-hosted multi-agent gateway for Claude Code. Connect Claude agents to Tele
 
 ## Quick Start
 
-### 1. Install
+### Install via npm (for users)
+
+**1. Install**
 
 ```bash
-git clone <repo>
+npm install -g @0xmaxma/claude-gateway
+```
+
+Requires [Bun](https://bun.sh) — MCP server dependencies are installed automatically via `postinstall`.
+
+**2. Configure environment (optional)**
+
+The gateway auto-loads `~/.claude-gateway/.env` on startup:
+
+```bash
+mkdir -p ~/.claude-gateway
+cat > ~/.claude-gateway/.env << 'EOF'
+# HTTP port (default: 10850)
+# PORT=10850
+
+# Path to gateway config (default: ~/.claude-gateway/config.json)
+# GATEWAY_CONFIG=~/.claude-gateway/config.json
+EOF
+```
+
+All variables are optional. Full list: [`.env.example`](.env.example)
+
+**3. Create an agent**
+
+Add an agent entry to `~/.claude-gateway/config.json` manually (see [`config.template.json`](config.template.json) for the format), or clone the repo and run `make create-agent` for the interactive wizard (see **For development** below).
+
+**4. Start**
+
+```bash
+claude-gateway
+```
+
+**Run as a service with PM2 (optional)**
+
+To keep the gateway running after logout or system restarts, use [PM2](https://pm2.keymetrics.io):
+
+```bash
+npm install -g pm2
+pm2 start $(which claude-gateway) --name gateway
+pm2 save       # persist the process list
+pm2 startup    # register PM2 to start on boot (follow the printed command)
+```
+
+Useful commands:
+
+```bash
+pm2 status           # check gateway status
+pm2 logs gateway     # tail logs
+pm2 restart gateway  # restart
+pm2 stop gateway     # stop
+pm2 delete gateway   # remove from PM2
+```
+
+---
+
+### For development
+
+```bash
+git clone https://github.com/0xMaxMa/claude-gateway
 cd claude-gateway
-npm install
+npm install          # also runs bun install in mcp/
 npm run build
 ```
 
-### 2. Install MCP server dependencies
-
-The gateway MCP server uses Bun with its own `package.json`. Install once:
-
-```bash
-make mcp-install    # runs: cd mcp && bun install
-```
-
-This installs `grammy` (Telegram Bot API) and `@modelcontextprotocol/sdk` into `mcp/node_modules/`.
-
-### 3. Create an agent
+### Create an agent
 
 The interactive wizard handles everything — workspace files, config, bot token, and pairing:
 
@@ -717,7 +768,7 @@ Once paired, the following bot commands are available in a private chat:
 
 ## Monitoring
 
-The gateway runs an HTTP server on port 3000 (set `PORT` env var to change):
+The gateway runs an HTTP server on port 10850 (set `PORT` env var to change):
 
 | Endpoint | Description |
 |----------|-------------|
