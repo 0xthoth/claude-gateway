@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { AgentRunner } from '../agent/runner';
+import { AgentRunner, DEFAULT_MODELS } from '../agent/runner';
 import { AgentConfig, ApiKey, ModelConfig } from '../types';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { MediaStore } from '../history/media-store';
@@ -198,10 +198,11 @@ export function createApiRouter(
       validatedMediaFiles = media_files as string[];
     }
 
-    // Validate model if provided
+    // Validate model if provided — always reject unknown models (fail closed)
     const modelStr = typeof requestModel === 'string' ? requestModel.trim() : undefined;
-    if (modelStr && models?.length) {
-      if (!models.find((m: ModelConfig) => m.id === modelStr)) {
+    if (modelStr) {
+      const availableModels = models ?? DEFAULT_MODELS;
+      if (!availableModels.find((m: ModelConfig) => m.id === modelStr)) {
         res.status(400).json({ error: `Unknown model: ${modelStr}` });
         return;
       }

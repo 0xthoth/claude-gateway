@@ -23,7 +23,7 @@ const DEFAULT_MAX_CONCURRENT = 20;
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 
-const DEFAULT_MODELS: ModelConfig[] = [
+export const DEFAULT_MODELS: ModelConfig[] = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
   { id: 'claude-opus-4-6', label: 'Opus 4.6', alias: 'opus46', contextWindow: 1000000 },
   { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
@@ -110,6 +110,9 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks session IDs with an in-flight API request (prevents concurrent turns)
   private readonly pendingApiSessions = new Set<string>();
+
+  // Serialises concurrent getOrSpawnSession calls for the same key to prevent double-spawn
+  private readonly sessionSpawnLocks = new Map<string, Promise<SessionProcess>>();
 
   // Tracks pending Telegram image paths per chatId (queue) for size accumulation after each turn.
   private readonly pendingImagePaths = new Map<string, string[]>();
@@ -616,18 +619,47 @@ export class AgentRunner extends EventEmitter {
     sessionId?: string,          // actual session UUID (only for channel sessions; equals mapKey for API)
     modelOverride?: string,      // per-session model override from SessionMeta
   ): Promise<SessionProcess> {
+    // If a spawn is already in progress for this key, wait for it instead of spawning a second one
+    const pending = this.sessionSpawnLocks.get(mapKey);
+    if (pending) return pending;
+
     const existing = this.sessions.get(mapKey);
     if (existing) {
       // If model changed, restart the session with the new model
       if (modelOverride && existing.modelOverride !== modelOverride) {
         this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: modelOverride });
-        await existing.stop();
-        this.sessions.delete(mapKey);
-        // Fall through to spawn a new session with updated model
+        const respawn = (async () => {
+          await existing.stop();
+          this.sessions.delete(mapKey);
+          return this.spawnSession(mapKey, source, sessionId, modelOverride);
+        })();
+        this.sessionSpawnLocks.set(mapKey, respawn);
+        try {
+          return await respawn;
+        } finally {
+          this.sessionSpawnLocks.delete(mapKey);
+        }
       } else {
         return existing;
       }
     }
+
+    // No existing session — acquire lock for the spawn path
+    const spawnPromise = this.spawnSession(mapKey, source, sessionId, modelOverride);
+    this.sessionSpawnLocks.set(mapKey, spawnPromise);
+    try {
+      return await spawnPromise;
+    } finally {
+      this.sessionSpawnLocks.delete(mapKey);
+    }
+  }
+
+  private async spawnSession(
+    mapKey: string,
+    source: 'telegram' | 'discord' | 'api',
+    sessionId?: string,
+    modelOverride?: string,
+  ): Promise<SessionProcess> {
 
     // Evict oldest idle session if at capacity
     if (this.sessions.size >= this.maxConcurrent) {
@@ -1859,7 +1891,7 @@ export class AgentRunner extends EventEmitter {
     };
   }
 
-  async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string }): Promise<Record<string, unknown>> {
+  async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string }): Promise<{ sessionId: string; sessionName?: string }> {
     if (updates.sessionName) {
       await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, { name: updates.sessionName }, 'api');
     }
