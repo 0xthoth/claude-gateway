@@ -2237,3 +2237,233 @@ describe('AgentRunner — Discord-aware auto-forward format (US-005)', () => {
     expect(runner.imageSize('chat:clr-b')).toBe(400);
   }, 15000);
 });
+
+// ── Model override / switch-back tests (US-MOD) ───────────────────────────────
+
+describe('AgentRunner — per-session model override', () => {
+  const AGENT_DEFAULT_MODEL = 'claude-opus-4-6';
+  const NON_DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-model-test-'));
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    agentConfig = makeAgentConfig(workspace);
+    fs.mkdirSync(workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  // US-MOD-01: same model → no restart
+  it('US-MOD-01: same non-default model on consecutive requests — no restart', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const chunks: StreamEvent[] = [];
+    const done1 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-01',
+        'test-chat',
+        'first',
+        { onChunk: (e) => chunks.push(e), onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: NON_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session1 = getSessions(runner).get('mod-01')!;
+    expect(session1).toBeDefined();
+    session1.emit('output', JSON.stringify({ type: 'result', result: 'r1' }));
+    await done1;
+
+    const spawnCountAfterFirst = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    // Second request with same model — should reuse session
+    const done2 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-01',
+        'test-chat',
+        'second',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: NON_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session2 = getSessions(runner).get('mod-01')!;
+    session2.emit('output', JSON.stringify({ type: 'result', result: 'r2' }));
+    await done2;
+
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBe(spawnCountAfterFirst);
+    expect(session2).toBe(session1);
+  }, 15000);
+
+  // US-MOD-02: switch from non-default model to different non-default → restart
+  it('US-MOD-02: switching from one non-default model to another — restarts session', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const done1 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-02',
+        'test-chat',
+        'first',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: NON_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session1 = getSessions(runner).get('mod-02')!;
+    session1.emit('output', JSON.stringify({ type: 'result', result: 'r1' }));
+    await done1;
+
+    const spawnCountAfterFirst = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    const done2 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-02',
+        'test-chat',
+        'second',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: 'claude-sonnet-4-6' },
+      );
+    });
+    await new Promise(r => setTimeout(r, 250));
+    const session2 = getSessions(runner).get('mod-02')!;
+    session2.emit('output', JSON.stringify({ type: 'result', result: 'r2' }));
+    await done2;
+
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBeGreaterThan(spawnCountAfterFirst);
+    expect(session2).not.toBe(session1);
+  }, 15000);
+
+  // US-MOD-03: switch from non-default back to default (no model sent) → restart
+  it('US-MOD-03: switching back to agent default (no model in request) — restarts session', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    // First request with non-default model
+    const done1 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-03',
+        'test-chat',
+        'first',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: NON_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session1 = getSessions(runner).get('mod-03')!;
+    session1.emit('output', JSON.stringify({ type: 'result', result: 'r1' }));
+    await done1;
+
+    const spawnCountAfterFirst = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    // Second request with NO model (switch back to default)
+    const done2 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-03',
+        'test-chat',
+        'second',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000 }, // no model field
+      );
+    });
+    await new Promise(r => setTimeout(r, 250));
+    const session2 = getSessions(runner).get('mod-03')!;
+    session2.emit('output', JSON.stringify({ type: 'result', result: 'r2' }));
+    await done2;
+
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBeGreaterThan(spawnCountAfterFirst);
+    expect(session2).not.toBe(session1);
+  }, 15000);
+
+  // US-MOD-04: switch from non-default back to default (explicit default sent) → restart
+  it('US-MOD-04: switching back to agent default (explicit default model) — restarts session', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const done1 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-04',
+        'test-chat',
+        'first',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: NON_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session1 = getSessions(runner).get('mod-04')!;
+    session1.emit('output', JSON.stringify({ type: 'result', result: 'r1' }));
+    await done1;
+
+    const spawnCountAfterFirst = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    // Send the agent default model explicitly — should be treated as "no override" → restart
+    const done2 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-04',
+        'test-chat',
+        'second',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: AGENT_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 250));
+    const session2 = getSessions(runner).get('mod-04')!;
+    session2.emit('output', JSON.stringify({ type: 'result', result: 'r2' }));
+    await done2;
+
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBeGreaterThan(spawnCountAfterFirst);
+    expect(session2).not.toBe(session1);
+  }, 15000);
+
+  // US-MOD-05: session already on default, re-send default → no restart
+  it('US-MOD-05: session on default model, re-sending default model — no restart', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const done1 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-05',
+        'test-chat',
+        'first',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000 }, // no model = use default
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session1 = getSessions(runner).get('mod-05')!;
+    session1.emit('output', JSON.stringify({ type: 'result', result: 'r1' }));
+    await done1;
+
+    const spawnCountAfterFirst = (require('child_process').spawn as jest.Mock).mock.calls.length;
+
+    // Re-send with explicit default model — no restart expected
+    const done2 = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'mod-05',
+        'test-chat',
+        'second',
+        { onChunk: () => {}, onDone: resolve, onError: () => {} },
+        { timeoutMs: 5000, model: AGENT_DEFAULT_MODEL },
+      );
+    });
+    await new Promise(r => setTimeout(r, 150));
+    const session2 = getSessions(runner).get('mod-05')!;
+    session2.emit('output', JSON.stringify({ type: 'result', result: 'r2' }));
+    await done2;
+
+    expect((require('child_process').spawn as jest.Mock).mock.calls.length).toBe(spawnCountAfterFirst);
+    expect(session2).toBe(session1);
+  }, 15000);
+});
