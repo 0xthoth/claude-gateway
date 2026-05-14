@@ -68,9 +68,9 @@ if [[ "$TYPE" == "current" ]]; then
 
   git tag "v$NEXT"
 
-  if ! git push --tags; then
+  if ! git push origin "v$NEXT"; then
     echo ""
-    echo "Error: git push --tags failed"
+    echo "Error: git push tag failed"
     git tag -d "v$NEXT" 2>/dev/null || true
     exit 1
   fi
@@ -85,9 +85,9 @@ else
     exit 1
   fi
 
-  if ! git push --tags; then
+  if ! git push origin "v$NEXT"; then
     echo ""
-    echo "Error: git push --tags failed"
+    echo "Error: git push tag failed"
     echo "The version commit was already pushed. Push the tag manually:"
     echo "  git push origin v$NEXT"
     exit 1
