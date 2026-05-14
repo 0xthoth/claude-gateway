@@ -374,7 +374,7 @@ export function createApiRouter(
           description: cfg?.description ?? '',
           sessions: sessions.map((s) => {
             const meta = metaMap.get(s.sessionId);
-            return { ...s, sessionName: meta?.name ?? null, model: meta?.model ?? null };
+            return { ...s, sessionName: meta?.name ?? null };
           }),
         };
       }),
@@ -1038,18 +1038,13 @@ export function createApiRouter(
     if (!ctx) return;
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
-    const body = req.body as { sessionName?: unknown; model?: unknown };
+    const body = req.body as { sessionName?: unknown };
     const sessionName = typeof body.sessionName === 'string' ? body.sessionName.trim() : undefined;
-    const model = typeof body.model === 'string' ? body.model.trim() : undefined;
-    if (!sessionName && !model) { res.status(400).json({ error: 'sessionName or model is required' }); return; }
+    if (!sessionName) { res.status(400).json({ error: 'sessionName is required' }); return; }
     try {
-      const result = await runner.updateApiSession(chatId, sessionId, { sessionName, model });
+      const result = await runner.updateApiSession(chatId, sessionId, { sessionName });
       res.json(result);
     } catch (err) {
-      if ((err as Error).message.includes('Unknown model')) {
-        res.status(400).json({ error: (err as Error).message });
-        return;
-      }
       res.status(500).json({ error: (err as Error).message });
     }
   });
