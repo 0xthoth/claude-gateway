@@ -370,6 +370,11 @@ export class AgentRunner extends EventEmitter {
       }
       await Promise.all(stopPromises);
 
+      // Notify the caller's channel that model changed
+      if (chatId) {
+        this.writeAutoForward(chatId, `✅ Model changed to ${newModel}`);
+      }
+
       respond({ success: true, model: newModel, restarted });
       return;
     }
