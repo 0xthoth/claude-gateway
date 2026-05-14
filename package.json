@@ -1,8 +1,24 @@
 {
-  "name": "claude-gateway",
+  "name": "@0xmaxma/claude-gateway",
   "version": "1.0.0",
   "description": "Multi-agent gateway for Claude",
   "main": "dist/index.js",
+  "bin": {
+    "claude-gateway": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist/",
+    "resource/",
+    "mcp/",
+    "README.md",
+    "config.template.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node --no-warnings=ExperimentalWarning --env-file-if-exists=.env dist/index.js",
