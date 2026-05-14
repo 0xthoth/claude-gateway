@@ -410,7 +410,7 @@ export class SessionStore {
     agentId: string,
     chatId: string,
     sessionId: string,
-    meta: Partial<Pick<SessionMeta, 'name' | 'totalTokensUsed' | 'messageCount' | 'lastInputTokens' | 'loadedAtSpawn' | 'archivedCount' | 'messageCountAtSpawn'>>,
+    meta: Partial<Pick<SessionMeta, 'name' | 'totalTokensUsed' | 'messageCount' | 'lastInputTokens' | 'loadedAtSpawn' | 'archivedCount' | 'messageCountAtSpawn' | 'model'>>,
     channel: 'telegram' | 'discord' | 'api' = 'telegram',
   ): Promise<void> {
     const queue = this.getTelegramQueue(agentId, chatId);
@@ -537,26 +537,27 @@ export class SessionStore {
     });
   }
 
-  async getAllSessionNames(agentId: string): Promise<Map<string, string>> {
-    const nameMap = new Map<string, string>();
+  /** Get all session metadata (name + model) for an agent, keyed by sessionId. */
+  async getAllSessionMeta(agentId: string): Promise<Map<string, { name: string; model?: string }>> {
+    const metaMap = new Map<string, { name: string; model?: string }>();
     const sessionsDir = path.join(this.agentsBaseDir, agentId, 'sessions');
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(sessionsDir, { withFileTypes: true });
     } catch {
-      return nameMap;
+      return metaMap;
     }
     const reads = entries
-      .filter((e) => e.isDirectory() && (e.name.startsWith('telegram-') || e.name.startsWith('discord-')))
+      .filter((e) => e.isDirectory() && (e.name.startsWith('telegram-') || e.name.startsWith('discord-') || e.name.startsWith('api-')))
       .map(async (e) => {
-        const channel = e.name.startsWith('discord-') ? 'discord' : 'telegram';
+        const channel = e.name.startsWith('discord-') ? 'discord' : e.name.startsWith('api-') ? 'api' : 'telegram';
         const chatId = e.name.slice(channel.length + 1);
         const index = await this.loadIndex(agentId, chatId, channel);
         if (index) {
-          for (const s of index.sessions) nameMap.set(s.id, s.name);
+          for (const s of index.sessions) metaMap.set(s.id, { name: s.name, model: s.model });
         }
       });
     await Promise.all(reads);
-    return nameMap;
+    return metaMap;
   }
 }
