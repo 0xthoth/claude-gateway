@@ -1303,16 +1303,8 @@ export class AgentRunner extends EventEmitter {
       this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
     });
 
-    // If model was provided in request body, persist it to session metadata
-    if (opts.model) {
-      await this.sessionStore.updateSessionMeta(this.agentConfig.id, internalChatIdForSession, sessionId, { model: opts.model }, 'api').catch((err: unknown) => {
-        this.logger.warn('Failed to set model on session', { sessionId, error: (err as Error).message });
-      });
-    }
-
-    // Read per-session model override before spawning
-    const sessionModel = opts.model ?? await this.getSessionModel(internalChatIdForSession, sessionId, 'api');
-    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, sessionModel);
+    // Use model from request body if provided, otherwise use agent default
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFiles = opts.mediaFiles?.length
@@ -1504,16 +1496,8 @@ export class AgentRunner extends EventEmitter {
       this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
     });
 
-    // If model was provided in request body, persist it to session metadata
-    if (opts.model) {
-      await this.sessionStore.updateSessionMeta(this.agentConfig.id, internalChatIdStream, sessionId, { model: opts.model }, 'api').catch((err: unknown) => {
-        this.logger.warn('Failed to set model on session', { sessionId, error: (err as Error).message });
-      });
-    }
-
-    // Read per-session model override before spawning
-    const sessionModelStream = opts.model ?? await this.getSessionModel(internalChatIdStream, sessionId, 'api');
-    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, sessionModelStream);
+    // Use model from request body if provided, otherwise use agent default
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFilesStream = opts.mediaFiles?.length
@@ -1738,7 +1722,7 @@ export class AgentRunner extends EventEmitter {
     return this.historyDb;
   }
 
-  getAllSessionMeta(): Promise<Map<string, { name: string; model?: string }>> {
+  getAllSessionMeta(): Promise<Map<string, { name: string }>> {
     return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
   }
 
@@ -1751,8 +1735,7 @@ export class AgentRunner extends EventEmitter {
     const internalChatId = `api-${chatId}`;
 
     if (command === '/model') {
-      const sessionModel = await this.getSessionModel(internalChatId, sessionId, 'api');
-      return { model: sessionModel ?? this.agentConfig.claude.model };
+      return { model: this.agentConfig.claude.model };
     }
 
     if (command === '/stop') {
@@ -1769,7 +1752,7 @@ export class AgentRunner extends EventEmitter {
     if (command === '/session') {
       const index = await this.sessionStore.listSessions(agentId, internalChatId, 'api').catch(() => null);
       const meta = index?.sessions.find((s) => s.id === sessionId);
-      const effectiveModel = meta?.model ?? this.agentConfig.claude.model;
+      const effectiveModel = this.agentConfig.claude.model;
       if (!meta) return { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
       const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
       const modelConfig = availableModels.find((m) => m.id === effectiveModel);
@@ -1803,8 +1786,7 @@ export class AgentRunner extends EventEmitter {
 
     if (command === '/compact') {
       const ch = 'api' as const;
-      const compactSessionModel = await this.getSessionModel(internalChatId, sessionId, ch);
-      const compactEffectiveModel = compactSessionModel ?? this.agentConfig.claude.model;
+      const compactEffectiveModel = this.agentConfig.claude.model;
       const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
       const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
       const contextWindow = modelConfig?.contextWindow ?? 200000;
@@ -1862,7 +1844,7 @@ export class AgentRunner extends EventEmitter {
     const index = await this.sessionStore.listSessions(this.agentConfig.id, `api-${chatId}`, 'api').catch(() => null);
     const meta = index?.sessions.find((s) => s.id === sessionId);
     if (!meta) return null;
-    const effectiveModel = meta.model ?? this.agentConfig.claude.model;
+    const effectiveModel = this.agentConfig.claude.model;
     const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
     const modelConfig = availableModels.find((m) => m.id === effectiveModel);
     const contextWindow = modelConfig?.contextWindow ?? 200000;
@@ -1877,42 +1859,15 @@ export class AgentRunner extends EventEmitter {
     };
   }
 
-  async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string; model?: string }): Promise<Record<string, unknown>> {
-    const meta: Partial<Pick<import('../types').SessionMeta, 'name' | 'model'>> = {};
-    if (updates.sessionName) meta.name = updates.sessionName;
-    if (updates.model) {
-      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const valid = availableModels.find(m => m.id === updates.model);
-      if (!valid) throw new Error(`Unknown model: ${updates.model}`);
-      meta.model = updates.model;
+  async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string }): Promise<Record<string, unknown>> {
+    if (updates.sessionName) {
+      await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, { name: updates.sessionName }, 'api');
     }
-    await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, meta, 'api');
-
-    // If model changed, restart the session process so it picks up the new model
-    if (updates.model) {
-      const session = this.sessions.get(sessionId);
-      if (session) {
-        await session.stop();
-        this.sessions.delete(sessionId);
-      }
-    }
-
-    return { sessionId, ...(updates.sessionName ? { sessionName: updates.sessionName } : {}), ...(updates.model ? { model: updates.model } : {}) };
+    return { sessionId, ...(updates.sessionName ? { sessionName: updates.sessionName } : {}) };
   }
 
   async deleteApiSession(chatId: string, sessionId: string): Promise<void> {
     await this.sessionStore.deleteTelegramSession(this.agentConfig.id, `api-${chatId}`, sessionId, 'api');
-  }
-
-  /** Read per-session model override from session metadata. Returns undefined if not set. */
-  private async getSessionModel(chatId: string, sessionId: string, channel: 'telegram' | 'discord' | 'api'): Promise<string | undefined> {
-    try {
-      const index = await this.sessionStore.listSessions(this.agentConfig.id, chatId, channel);
-      const meta = index.sessions.find(s => s.id === sessionId);
-      return meta?.model;
-    } catch {
-      return undefined;
-    }
   }
 
   /**
