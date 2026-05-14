@@ -356,15 +356,19 @@ export class AgentRunner extends EventEmitter {
         return;
       }
 
-      // Restart the caller's session so it picks up the new agent-level model
+      // Restart ALL channel sessions so they pick up the new agent-level model
       const chatId = body.chat_id ?? '';
       let restarted = false;
-      const session = this.sessions.get(chatId);
-      if (session) {
-        await session.stop();
-        this.sessions.delete(chatId);
-        restarted = true;
+      const stopPromises: Promise<void>[] = [];
+      for (const [key, session] of this.sessions) {
+        // Only restart channel sessions (not API sessions which use per-session model)
+        if (session.source !== 'api') {
+          restarted = true;
+          stopPromises.push(session.stop());
+          this.sessions.delete(key);
+        }
       }
+      await Promise.all(stopPromises);
 
       respond({ success: true, model: newModel, restarted });
       return;
@@ -1276,10 +1280,14 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    // If model was provided in request body, persist it to session metadata
+    // Register session in api-{chatId} index.json on first use
     const internalChatIdForSession = `api-${chatId}`;
+    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdForSession, sessionId).catch((err: unknown) => {
+      this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
+    });
+
+    // If model was provided in request body, persist it to session metadata
     if (opts.model) {
-      await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdForSession, sessionId).catch(() => {});
       await this.sessionStore.updateSessionMeta(this.agentConfig.id, internalChatIdForSession, sessionId, { model: opts.model }, 'api').catch((err: unknown) => {
         this.logger.warn('Failed to set model on session', { sessionId, error: (err as Error).message });
       });
@@ -1288,9 +1296,6 @@ export class AgentRunner extends EventEmitter {
     // Read per-session model override before spawning
     const sessionModel = opts.model ?? await this.getSessionModel(internalChatIdForSession, sessionId, 'api');
     const session = await this.getOrSpawnSession(sessionId, 'api', undefined, sessionModel);
-    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdForSession, sessionId).catch((err: unknown) => {
-      this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
-    });
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFiles = opts.mediaFiles?.length
@@ -1476,10 +1481,14 @@ export class AgentRunner extends EventEmitter {
       throw err;
     }
 
-    // If model was provided in request body, persist it to session metadata
+    // Register session in api-{chatId} index.json on first use
     const internalChatIdStream = `api-${chatId}`;
+    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdStream, sessionId).catch((err: unknown) => {
+      this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
+    });
+
+    // If model was provided in request body, persist it to session metadata
     if (opts.model) {
-      await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdStream, sessionId).catch(() => {});
       await this.sessionStore.updateSessionMeta(this.agentConfig.id, internalChatIdStream, sessionId, { model: opts.model }, 'api').catch((err: unknown) => {
         this.logger.warn('Failed to set model on session', { sessionId, error: (err as Error).message });
       });
@@ -1488,11 +1497,6 @@ export class AgentRunner extends EventEmitter {
     // Read per-session model override before spawning
     const sessionModelStream = opts.model ?? await this.getSessionModel(internalChatIdStream, sessionId, 'api');
     const session = await this.getOrSpawnSession(sessionId, 'api', undefined, sessionModelStream);
-
-    // Register session in api-{chatId} index.json on first use
-    await this.sessionStore.ensureApiSession(this.agentConfig.id, internalChatIdStream, sessionId).catch((err: unknown) => {
-      this.logger.warn('Failed to register API session in index', { agentId: this.agentConfig.id, chatId, sessionId, error: (err as Error).message });
-    });
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFilesStream = opts.mediaFiles?.length
@@ -1858,10 +1862,6 @@ export class AgentRunner extends EventEmitter {
       contextUsedPct,
       model: effectiveModel,
     };
-  }
-
-  async renameApiSession(chatId: string, sessionId: string, sessionName: string): Promise<void> {
-    await this.sessionStore.updateSessionMeta(this.agentConfig.id, `api-${chatId}`, sessionId, { name: sessionName }, 'api');
   }
 
   async updateApiSession(chatId: string, sessionId: string, updates: { sessionName?: string; model?: string }): Promise<Record<string, unknown>> {
