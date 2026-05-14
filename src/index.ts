@@ -1,15 +1,28 @@
 #!/usr/bin/env node
+
+// Must run before any other imports so env vars are set before modules read them.
+// TypeScript compiles imports to inline require() calls (CommonJS), so placement matters.
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import * as readline from 'readline';
 
-function expandTilde(p: string): string {
-  if (p === '~' || p.startsWith('~/')) {
-    return path.join(os.homedir(), p.slice(1));
+// Load ~/.claude-gateway/.env so global installs pick up env vars without
+// needing shell exports or running via npm start.
+(function loadDotenv() {
+  const envFile = path.join(os.homedir(), '.claude-gateway', '.env');
+  if (!fs.existsSync(envFile)) return;
+  for (const line of fs.readFileSync(envFile, 'utf8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+    if (!(key in process.env)) process.env[key] = val;
   }
-  return p;
-}
+})();
+
+import * as readline from 'readline';
 import { loadConfig } from './config/loader';
 import { detectMigration, applyMigration, loadCleanTemplate } from './config/migrator';
 import { loadWorkspace, watchWorkspace, migrateWorkspaceFiles } from './agent/workspace-loader';
@@ -24,6 +37,13 @@ import { ContextIsolationGuard } from './agent/context-isolation';
 import { createLogger } from './logger';
 import { ConfigWatcher, ConfigChange } from './config/watcher';
 import { AgentConfig, GatewayConfig } from './types';
+
+function expandTilde(p: string): string {
+  if (p === '~' || p.startsWith('~/')) {
+    return path.join(os.homedir(), p.slice(1));
+  }
+  return p;
+}
 
 // ─── Simple argument parsing (no heavy deps) ──────────────────────────────────
 function parseArgs(argv: string[]): Record<string, string | boolean> {
@@ -52,7 +72,7 @@ const CONFIG_PATH: string = expandTilde(
   path.join(os.homedir(), '.claude-gateway', 'config.json')
 );
 
-const PORT = parseInt((process.env.PORT ?? '3000'), 10);
+const PORT = parseInt((process.env.PORT ?? '10850'), 10);
 
 // ─── Startup summary table ────────────────────────────────────────────────────
 interface StartupResult {
