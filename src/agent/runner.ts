@@ -270,8 +270,8 @@ export class AgentRunner extends EventEmitter {
               }
 
               // Route to session process (map key = chatId, actual sessionId passed separately)
-              const channelSessionModel = await this.getSessionModel(chatId, sessionId, channelSource === 'discord' ? 'discord' : 'telegram');
-              const session = await this.getOrSpawnSession(chatId, channelSource, sessionId, channelSessionModel);
+              // Channel sessions use agent-level model (not per-session)
+              const session = await this.getOrSpawnSession(chatId, channelSource, sessionId);
               let channelXml = AgentRunner.buildChannelXml(params);
 
               // Detect skill commands and inject skill content
@@ -342,43 +342,28 @@ export class AgentRunner extends EventEmitter {
     const command = body.command;
 
     if (command === 'get_model') {
-      const chatId = body.chat_id ?? '';
-      const channel = this.channelFor(chatId);
-      // Return per-session model if set, otherwise agent default
-      const sessionModel = chatId ? await this.getSessionModel(chatId, await this.sessionStore.getActiveSessionId(this.agentConfig.id, chatId, channel), channel).catch(() => undefined) : undefined;
-      respond({ model: sessionModel ?? this.agentConfig.claude.model });
+      respond({ model: this.agentConfig.claude.model });
       return;
     }
 
     if (command === 'set_model') {
       const newModel = typeof body.payload?.model === 'string' ? body.payload.model : '';
-      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const valid = availableModels.find(m => m.id === newModel);
-      if (!valid) {
-        respond({ success: false, error: 'Unknown model' });
+
+      try {
+        await this.setModel(newModel);
+      } catch (err) {
+        respond({ success: false, error: (err as Error).message });
         return;
       }
 
-      // Per-session model: update only the active session for this chat
+      // Restart the caller's session so it picks up the new agent-level model
       const chatId = body.chat_id ?? '';
-      const channel = this.channelFor(chatId);
       let restarted = false;
-
-      try {
-        const activeSessionId = await this.sessionStore.getActiveSessionId(this.agentConfig.id, chatId, channel);
-        await this.sessionStore.updateSessionMeta(this.agentConfig.id, chatId, activeSessionId, { model: newModel }, channel);
-
-        // Restart only the affected session so it picks up the new model
-        const session = this.sessions.get(chatId);
-        if (session) {
-          await session.stop();
-          this.sessions.delete(chatId);
-          restarted = true;
-        }
-      } catch (err) {
-        this.logger.error('Failed to set per-session model', { chatId, error: (err as Error).message });
-        respond({ success: false, error: 'Failed to update session model' });
-        return;
+      const session = this.sessions.get(chatId);
+      if (session) {
+        await session.stop();
+        this.sessions.delete(chatId);
+        restarted = true;
       }
 
       respond({ success: true, model: newModel, restarted });
@@ -445,7 +430,7 @@ export class AgentRunner extends EventEmitter {
         if (!meta) {
           return respond({ success: true, text: 'No active session found.' });
         }
-        const effectiveModel = meta.model ?? this.agentConfig.claude.model;
+        const effectiveModel = this.agentConfig.claude.model;
         const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
         const modelConfig = availableModels.find(m => m.id === effectiveModel);
         const contextWindow = modelConfig?.contextWindow ?? 200000;
@@ -887,7 +872,7 @@ export class AgentRunner extends EventEmitter {
       return;
     }
 
-    const effectiveModel = meta.model ?? this.agentConfig.claude.model;
+    const effectiveModel = this.agentConfig.claude.model;
     const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
     const modelConfig = availableModels.find(m => m.id === effectiveModel);
     const contextWindow = modelConfig?.contextWindow ?? 200000;
@@ -997,7 +982,7 @@ export class AgentRunner extends EventEmitter {
     const meta = index.sessions.find(s => s.id === sessionId);
     const name = meta?.name ?? 'Session';
 
-    const compactModel = meta?.model ?? this.agentConfig.claude.model;
+    const compactModel = this.agentConfig.claude.model;
     const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
     const modelConfig = availableModels.find(m => m.id === compactModel);
     const contextWindow = modelConfig?.contextWindow ?? 200000;
@@ -1938,8 +1923,8 @@ export class AgentRunner extends EventEmitter {
     // Ensure the session process uses the correct channel source
     this.channelSourceMap.set(rawChatId, channel);
 
-    const channelModel = await this.getSessionModel(rawChatId, sessionId, channel);
-    const session = await this.getOrSpawnSession(rawChatId, channel, sessionId, channelModel);
+    // Channel sessions use agent-level model (not per-session)
+    const session = await this.getOrSpawnSession(rawChatId, channel, sessionId);
 
     // Persist user message (Layer 1 session JSON + Layer 2 history DB)
     const uiUserTs = Date.now();
