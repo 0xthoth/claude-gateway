@@ -619,19 +619,26 @@ export class AgentRunner extends EventEmitter {
     sessionId?: string,          // actual session UUID (only for channel sessions; equals mapKey for API)
     modelOverride?: string,      // per-session model override from SessionMeta
   ): Promise<SessionProcess> {
+    // Normalize: treat agent-default model as "no override" so default sessions
+    // don't restart unnecessarily when the frontend explicitly sends the default model.
+    const agentDefaultModel = this.agentConfig.claude.model;
+    const effectiveOverride = (modelOverride && modelOverride !== agentDefaultModel)
+      ? modelOverride
+      : undefined;
+
     // If a spawn is already in progress for this key, wait for it instead of spawning a second one
     const pending = this.sessionSpawnLocks.get(mapKey);
     if (pending) return pending;
 
     const existing = this.sessions.get(mapKey);
     if (existing) {
-      // If model changed, restart the session with the new model
-      if (modelOverride && existing.modelOverride !== modelOverride) {
-        this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: modelOverride });
+      // Restart if model changed (including switching back to the agent default)
+      if (existing.modelOverride !== effectiveOverride) {
+        this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: effectiveOverride ?? agentDefaultModel });
         const respawn = (async () => {
           await existing.stop();
           this.sessions.delete(mapKey);
-          return this.spawnSession(mapKey, source, sessionId, modelOverride);
+          return this.spawnSession(mapKey, source, sessionId, effectiveOverride);
         })();
         this.sessionSpawnLocks.set(mapKey, respawn);
         try {
@@ -645,7 +652,7 @@ export class AgentRunner extends EventEmitter {
     }
 
     // No existing session — acquire lock for the spawn path
-    const spawnPromise = this.spawnSession(mapKey, source, sessionId, modelOverride);
+    const spawnPromise = this.spawnSession(mapKey, source, sessionId, effectiveOverride);
     this.sessionSpawnLocks.set(mapKey, spawnPromise);
     try {
       return await spawnPromise;
@@ -688,7 +695,7 @@ export class AgentRunner extends EventEmitter {
       chatId,
     );
 
-    // Apply per-session model override if provided
+    // Apply per-session model override (caller already normalized to undefined when == agent default)
     if (modelOverride) proc.modelOverride = modelOverride;
 
     await proc.start();
