@@ -8,8 +8,51 @@ if [[ "$BRANCH" != "main" ]]; then
 fi
 
 if [[ -n $(git status --porcelain) ]]; then
-  echo "Error: working tree is not clean — commit or stash changes first"
-  exit 1
+  # Check if ONLY package.json / package-lock.json are dirty (partial npm version run)
+  DIRTY_OTHER=$(git status --porcelain | grep -v 'package\.json$' | grep -v 'package-lock\.json$')
+  if [[ -n "$DIRTY_OTHER" ]]; then
+    echo "Error: working tree is not clean — commit or stash changes first"
+    exit 1
+  fi
+
+  PARTIAL_VERSION=$(node -p "require('./package.json').version")
+  echo ""
+  echo "Detected partial release: package.json is already at v$PARTIAL_VERSION but not committed."
+  echo ""
+  echo "  1) Complete the release — commit + tag v$PARTIAL_VERSION and push"
+  echo "  2) Reset and start over"
+  echo "  3) Abort"
+  echo ""
+  read -rp "Choice [1/2/3]: " recovery
+
+  case $recovery in
+    1)
+      git add package.json package-lock.json
+      git commit -m "v$PARTIAL_VERSION"
+      if ! git push; then
+        echo "Error: git push failed"
+        git reset --soft HEAD~1
+        exit 1
+      fi
+      git tag "v$PARTIAL_VERSION"
+      if ! git push origin "v$PARTIAL_VERSION"; then
+        echo "Error: git push tag failed. Push manually: git push origin v$PARTIAL_VERSION"
+        exit 1
+      fi
+      echo ""
+      echo "Released v$PARTIAL_VERSION — GitHub Actions will publish to npm automatically."
+      exit 0
+      ;;
+    2)
+      git checkout -- package.json package-lock.json
+      echo "Reset. Continuing with fresh release..."
+      echo ""
+      ;;
+    *)
+      echo "Aborted."
+      exit 0
+      ;;
+  esac
 fi
 
 CURRENT=$(node -p "require('./package.json').version")
