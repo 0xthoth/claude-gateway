@@ -365,14 +365,17 @@ export function createApiRouter(
     const agents = await Promise.all(
       [...agentRunners.entries()].map(async ([agentId, runner]) => {
         const cfg = agentConfigs.get(agentId);
-        const [sessions, nameMap] = await Promise.all([
+        const [sessions, metaMap] = await Promise.all([
           Promise.resolve(runner.getHistoryDb().listSessions()),
-          runner.getAllSessionNames(),
+          runner.getAllSessionMeta(),
         ]);
         return {
           agentId,
           description: cfg?.description ?? '',
-          sessions: sessions.map((s) => ({ ...s, sessionName: nameMap.get(s.sessionId) ?? null })),
+          sessions: sessions.map((s) => {
+            const meta = metaMap.get(s.sessionId);
+            return { ...s, sessionName: meta?.name ?? null, model: meta?.model ?? null };
+          }),
         };
       }),
     );

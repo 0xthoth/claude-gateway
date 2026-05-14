@@ -1726,6 +1726,10 @@ export class AgentRunner extends EventEmitter {
     return this.sessionStore.getAllSessionNames(this.agentConfig.id);
   }
 
+  getAllSessionMeta(): Promise<Map<string, { name: string; model?: string }>> {
+    return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
+  }
+
   async listSessionsForChat(chatId: string, channel: 'telegram' | 'discord'): Promise<import('../types').SessionIndex> {
     return this.sessionStore.listSessions(this.agentConfig.id, chatId, channel);
   }
