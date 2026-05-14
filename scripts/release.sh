@@ -21,20 +21,30 @@ echo "Select release type:"
 echo "  1) patch  (bug fix)"
 echo "  2) minor  (new feature)"
 echo "  3) major  (breaking change)"
+echo "  4) current version (tag v$CURRENT without bumping)"
 echo ""
-read -rp "Choice [1/2/3]: " choice
+read -rp "Choice [1/2/3/4]: " choice
 
 case $choice in
   1) TYPE=patch ;;
   2) TYPE=minor ;;
   3) TYPE=major ;;
+  4) TYPE=current ;;
   *) echo "Invalid choice"; exit 1 ;;
 esac
 
-NEXT=$(npm version "$TYPE" --no-git-tag-version --dry-run 2>/dev/null | tr -d 'v')
+if [[ "$TYPE" == "current" ]]; then
+  NEXT="$CURRENT"
+else
+  NEXT=$(npm version "$TYPE" --no-git-tag-version --dry-run 2>/dev/null | tr -d 'v')
+fi
 
 echo ""
-echo "  v$CURRENT  →  v$NEXT  ($TYPE)"
+if [[ "$TYPE" == "current" ]]; then
+  echo "  Tag current version: v$CURRENT (no version bump)"
+else
+  echo "  v$CURRENT  →  v$NEXT  ($TYPE)"
+fi
 echo ""
 read -rp "Confirm release? [y/N]: " confirm
 
@@ -43,22 +53,33 @@ if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
   exit 0
 fi
 
-npm version "$TYPE"
+if [[ "$TYPE" == "current" ]]; then
+  git tag "v$NEXT"
 
-if ! git push; then
-  echo ""
-  echo "Error: git push failed — reverting version bump"
-  git tag -d "v$NEXT" 2>/dev/null || true
-  git reset --hard HEAD~1
-  exit 1
-fi
+  if ! git push --tags; then
+    echo ""
+    echo "Error: git push --tags failed"
+    git tag -d "v$NEXT" 2>/dev/null || true
+    exit 1
+  fi
+else
+  npm version "$TYPE"
 
-if ! git push --tags; then
-  echo ""
-  echo "Error: git push --tags failed"
-  echo "The version commit was already pushed. Push the tag manually:"
-  echo "  git push origin v$NEXT"
-  exit 1
+  if ! git push; then
+    echo ""
+    echo "Error: git push failed — reverting version bump"
+    git tag -d "v$NEXT" 2>/dev/null || true
+    git reset --hard HEAD~1
+    exit 1
+  fi
+
+  if ! git push --tags; then
+    echo ""
+    echo "Error: git push --tags failed"
+    echo "The version commit was already pushed. Push the tag manually:"
+    echo "  git push origin v$NEXT"
+    exit 1
+  fi
 fi
 
 echo ""
