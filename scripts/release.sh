@@ -54,6 +54,18 @@ if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
 fi
 
 if [[ "$TYPE" == "current" ]]; then
+  if git tag -l "v$NEXT" | grep -q "v$NEXT"; then
+    echo ""
+    echo "Tag v$NEXT already exists locally."
+    read -rp "Force retag? This will delete and recreate the tag [y/N]: " retag
+    if [[ "$retag" != "y" && "$retag" != "Y" ]]; then
+      echo "Aborted."
+      exit 0
+    fi
+    git tag -d "v$NEXT"
+    git push origin ":refs/tags/v$NEXT" 2>/dev/null || true
+  fi
+
   git tag "v$NEXT"
 
   if ! git push --tags; then
