@@ -13,6 +13,35 @@
  *   STATE_DIR/typing/{chatId}.error     — written by AgentRunner on session failure
  */
 
+export const TELEGRAM_MAX_CHARS = 4096
+
+/**
+ * Split text into chunks that fit within Telegram's message size limit.
+ * Prefers paragraph → line → space boundaries over hard cuts.
+ * When htmlSafe=true, avoids cutting inside an HTML tag (e.g. <code>, <b>).
+ */
+export function chunkText(text: string, limit = TELEGRAM_MAX_CHARS, htmlSafe = false): string[] {
+  if (text.length <= limit) return [text]
+  const out: string[] = []
+  let rest = text
+  while (rest.length > limit) {
+    const para = rest.lastIndexOf('\n\n', limit)
+    const line = rest.lastIndexOf('\n', limit)
+    const space = rest.lastIndexOf(' ', limit)
+    let cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
+    if (htmlSafe) {
+      // If cut lands inside an open tag (<...>), move cut to before the '<'
+      const tagStart = rest.lastIndexOf('<', cut)
+      const tagEnd = rest.lastIndexOf('>', cut)
+      if (tagStart > tagEnd) cut = tagStart
+    }
+    out.push(rest.slice(0, cut))
+    rest = rest.slice(cut).replace(/^\n+/, '')
+  }
+  if (rest) out.push(rest)
+  return out
+}
+
 export const STATUS_MESSAGES = [
   '⏳ Thinking...',
   '🔍 Analyzing your request...',
@@ -159,7 +188,10 @@ export function createWorkingStateManager(
         const alreadyReplied = fsApi.existsSync(repliedPath)
         if (!alreadyReplied && forwardText) {
           const msgOpts = parseMode ? { parse_mode: parseMode } : {}
-          await botApi.sendMessage(chatId, forwardText, msgOpts).catch(() => {})
+          const chunks = chunkText(forwardText, TELEGRAM_MAX_CHARS, parseMode === 'HTML')
+          for (const part of chunks) {
+            await botApi.sendMessage(chatId, part, msgOpts).catch(() => {})
+          }
         }
       } catch {}
       fsApi.rmSync(forwardPath, { force: true })
