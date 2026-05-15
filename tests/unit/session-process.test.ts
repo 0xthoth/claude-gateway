@@ -1195,8 +1195,8 @@ describe('SessionProcess — buildInitialPrompt system role', () => {
     const parsed = JSON.parse(firstWrite);
     const text: string = parsed.message.content[0].text;
 
-    expect(text).toContain('<turn role="system">[Image Context Summary]');
-    expect(text).not.toContain('<turn role="assistant">[Image Context Summary]');
+    expect(text).toContain('System: [Image Context Summary]');
+    expect(text).not.toContain('Assistant: [Image Context Summary]');
   });
 
   it('U-SP-SYS-02: system messages coexist with user and assistant messages', async () => {
@@ -1217,8 +1217,8 @@ describe('SessionProcess — buildInitialPrompt system role', () => {
     const parsed = JSON.parse(firstWrite);
     const text: string = parsed.message.content[0].text;
 
-    expect(text).toContain('<turn role="user">show me a picture</turn>');
-    expect(text).toContain('<turn role="assistant">Here is the image.</turn>');
-    expect(text).toContain('<turn role="system">[Image Context Summary]');
+    expect(text).toContain('User: show me a picture');
+    expect(text).toContain('Assistant: Here is the image.');
+    expect(text).toContain('System: [Image Context Summary]');
   });
 });
