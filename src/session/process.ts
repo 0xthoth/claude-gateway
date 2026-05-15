@@ -160,13 +160,8 @@ export class SessionProcess extends EventEmitter {
     }
 
     const turns = recent
-      .map(m => {
-        // system role carries injected summaries (e.g. [Image Context Summary]) from the runner
-        if (m.role === 'system') return `<turn role="system">${m.content}</turn>`;
-        const role = m.role === 'user' ? 'user' : 'assistant';
-        return `<turn role="${role}">${m.content}</turn>`;
-      })
-      .join('\n');
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+      .join('\n\n');
 
     const historyPrompt = `You are continuing an ongoing conversation. Treat the following as your own prior memory — not a summary read by a third party.\n<conversation_history>\n${turns}\n</conversation_history>`;
 
