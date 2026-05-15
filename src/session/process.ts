@@ -157,16 +157,17 @@ export class SessionProcess extends EventEmitter {
       return { prompt: CHANNELS_ACTIVATION_PROMPT, loadedAtSpawn, archivedCount, messageCountAtSpawn };
     }
 
-    const historyText = recent
+    const turns = recent
       .map(m => {
         // system role carries injected summaries (e.g. [Image Context Summary]) from the runner
-        if (m.role === 'system') return `System: ${m.content}`;
-        return `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`;
+        if (m.role === 'system') return `<turn role="system">${m.content}</turn>`;
+        const role = m.role === 'user' ? 'user' : 'assistant';
+        return `<turn role="${role}">${m.content}</turn>`;
       })
       .join('\n');
 
     return {
-      prompt: `[Conversation history with this user:\n${historyText}]\n\n${CHANNELS_ACTIVATION_PROMPT}`,
+      prompt: `You are continuing an ongoing conversation. Treat the following as your own prior memory — not a summary read by a third party.\n<conversation_history>\n${turns}\n</conversation_history>\n\n${CHANNELS_ACTIVATION_PROMPT}`,
       loadedAtSpawn,
       archivedCount,
       messageCountAtSpawn,
