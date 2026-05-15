@@ -1222,3 +1222,108 @@ describe('SessionProcess — buildInitialPrompt system role', () => {
     expect(text).toContain('System: [Image Context Summary]');
   });
 });
+
+// ── API session model-switch history injection tests ───────────────────────────
+
+describe('SessionProcess — API model-switch history injection', () => {
+  let tmpDir: string;
+  let sessionStore: SessionStore;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-apiswitch-'));
+    agentConfig = makeAgentConfig({ workspace: path.join(tmpDir, 'workspace') });
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    sessionStore = new SessionStore(path.join(tmpDir, 'sessions'));
+    lastProcess = null;
+    spawnMock = require('child_process').spawn as jest.Mock;
+    spawnMock.mockClear();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  it('U-SP-API-01: API session does not send activation prompt at spawn', async () => {
+    const sp = new SessionProcess('sess-uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    // API session should NOT write anything to stdin at spawn time
+    expect(lastProcess!.stdin!.write).not.toHaveBeenCalled();
+  });
+
+  it('U-SP-API-02: API session with history stashes historyPrompt as pendingInitialPrompt and prepends on first sendMessage', async () => {
+    await sessionStore.appendMessage('alfred', 'sess-uuid', {
+      role: 'user',
+      content: 'What is 2+2?',
+      ts: Date.now(),
+    });
+    await sessionStore.appendMessage('alfred', 'sess-uuid', {
+      role: 'assistant',
+      content: 'It is 4.',
+      ts: Date.now(),
+    });
+
+    const sp = new SessionProcess('sess-uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    // No write at spawn
+    expect(lastProcess!.stdin!.write).not.toHaveBeenCalled();
+
+    // First sendMessage should prepend history
+    sp.sendMessage('Now what is 3+3?');
+
+    const writeCalls = lastProcess!.stdin!.write.mock.calls;
+    expect(writeCalls.length).toBe(1);
+    const payload = JSON.parse(writeCalls[0][0] as string);
+    const text: string = payload.message.content[0].text;
+
+    expect(text).toContain('Conversation history');
+    expect(text).toContain('User: What is 2+2?');
+    expect(text).toContain('Assistant: It is 4.');
+    expect(text).toContain('Now what is 3+3?');
+  });
+
+  it('U-SP-API-03: pendingInitialPrompt is cleared after first sendMessage', async () => {
+    await sessionStore.appendMessage('alfred', 'sess-uuid', {
+      role: 'user',
+      content: 'Hello',
+      ts: Date.now(),
+    });
+
+    const sp = new SessionProcess('sess-uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    sp.sendMessage('First message');
+    sp.sendMessage('Second message');
+
+    const writeCalls = lastProcess!.stdin!.write.mock.calls;
+    expect(writeCalls.length).toBe(2);
+
+    // First message has history prepended
+    const firstText: string = JSON.parse(writeCalls[0][0] as string).message.content[0].text;
+    expect(firstText).toContain('Conversation history');
+
+    // Second message is plain — no history
+    const secondText: string = JSON.parse(writeCalls[1][0] as string).message.content[0].text;
+    expect(secondText).toBe('Second message');
+    expect(secondText).not.toContain('Conversation history');
+  });
+
+  it('U-SP-API-04: API session with no prior history sends message as-is', async () => {
+    const sp = new SessionProcess('sess-new', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    sp.sendMessage('Hello fresh session');
+
+    const writeCalls = lastProcess!.stdin!.write.mock.calls;
+    expect(writeCalls.length).toBe(1);
+    const text: string = JSON.parse(writeCalls[0][0] as string).message.content[0].text;
+
+    expect(text).toBe('Hello fresh session');
+    expect(text).not.toContain('Conversation history');
+  });
+});
