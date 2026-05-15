@@ -237,9 +237,9 @@ describe('SessionProcess', () => {
     const parsed = JSON.parse(firstWrite);
     const text: string = parsed.message.content[0].text;
 
-    expect(text).toContain('conversation_history');
-    expect(text).toContain('<turn role="user">Hello</turn>');
-    expect(text).toContain('<turn role="assistant">Hi there!</turn>');
+    expect(text).toContain('Conversation history');
+    expect(text).toContain('User: Hello');
+    expect(text).toContain('Assistant: Hi there!');
   });
 
   // --------------------------------------------------------------------------
