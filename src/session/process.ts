@@ -159,11 +159,14 @@ export class SessionProcess extends EventEmitter {
       return { prompt: CHANNELS_ACTIVATION_PROMPT, historyPrompt: null, loadedAtSpawn, archivedCount, messageCountAtSpawn };
     }
 
-    const turns = recent
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-      .join('\n\n');
+    const historyText = recent
+      .map(m => {
+        if (m.role === 'system') return `System: ${m.content}`;
+        return `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`;
+      })
+      .join('\n');
 
-    const historyPrompt = `You are continuing an ongoing conversation. Treat the following as your own prior memory — not a summary read by a third party.\n<conversation_history>\n${turns}\n</conversation_history>`;
+    const historyPrompt = `[Conversation history with this user:\n${historyText}]`;
 
     return {
       prompt: `${historyPrompt}\n\n${CHANNELS_ACTIVATION_PROMPT}`,
