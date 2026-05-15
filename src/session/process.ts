@@ -359,13 +359,9 @@ export class SessionProcess extends EventEmitter {
     }
 
     // Capture stdout — emit output events + persist assistant replies
-    const typingDir = this.typingDir;
-    const heartbeatPath = this.source !== 'api'
-      ? path.join(typingDir, `${this.chatId}.heartbeat`)
-      : null;
-    const statusPath = this.source !== 'api'
-      ? path.join(typingDir, `${this.chatId}.status`)
-      : null;
+    const typingDir = this.source !== 'api' ? this.typingDir : null;
+    const heartbeatPath = typingDir ? path.join(typingDir, `${this.chatId}.heartbeat`) : null;
+    const statusPath    = typingDir ? path.join(typingDir, `${this.chatId}.status`)    : null;
 
     const writeStatus = (status: string, detail?: string): void => {
       if (statusPath) {
