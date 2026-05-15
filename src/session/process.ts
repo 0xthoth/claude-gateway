@@ -40,6 +40,8 @@ export class SessionProcess extends EventEmitter {
   private _queryBuffer = '';
   private _queryTimer?: ReturnType<typeof setTimeout>;
   private _querySettled = false;
+  // For API sessions: history context to prepend to the first sendMessage() after a model-switch respawn
+  private pendingInitialPrompt?: string;
 
   constructor(
     sessionId: string,
@@ -130,7 +132,7 @@ export class SessionProcess extends EventEmitter {
     });
   }
 
-  private async buildInitialPrompt(): Promise<{ prompt: string; loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number }> {
+  private async buildInitialPrompt(): Promise<{ prompt: string; historyPrompt: string | null; loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number }> {
     const history = this.source !== 'api'
       ? await this.sessionStore.loadTelegramSession(this.agentConfig.id, this.chatId, this.sessionId, this.sessionChannel)
       : await this.sessionStore.loadSession(this.agentConfig.id, this.sessionId);
@@ -154,7 +156,7 @@ export class SessionProcess extends EventEmitter {
     const messageCountAtSpawn = history.length;
 
     if (recent.length === 0) {
-      return { prompt: CHANNELS_ACTIVATION_PROMPT, loadedAtSpawn, archivedCount, messageCountAtSpawn };
+      return { prompt: CHANNELS_ACTIVATION_PROMPT, historyPrompt: null, loadedAtSpawn, archivedCount, messageCountAtSpawn };
     }
 
     const turns = recent
@@ -166,8 +168,11 @@ export class SessionProcess extends EventEmitter {
       })
       .join('\n');
 
+    const historyPrompt = `You are continuing an ongoing conversation. Treat the following as your own prior memory — not a summary read by a third party.\n<conversation_history>\n${turns}\n</conversation_history>`;
+
     return {
-      prompt: `You are continuing an ongoing conversation. Treat the following as your own prior memory — not a summary read by a third party.\n<conversation_history>\n${turns}\n</conversation_history>\n\n${CHANNELS_ACTIVATION_PROMPT}`,
+      prompt: `${historyPrompt}\n\n${CHANNELS_ACTIVATION_PROMPT}`,
+      historyPrompt,
       loadedAtSpawn,
       archivedCount,
       messageCountAtSpawn,
@@ -305,7 +310,7 @@ export class SessionProcess extends EventEmitter {
   }
 
   private async spawnProcess(): Promise<void> {
-    const { prompt: initialPrompt, loadedAtSpawn, archivedCount, messageCountAtSpawn } = await this.buildInitialPrompt();
+    const { prompt: initialPrompt, historyPrompt, loadedAtSpawn, archivedCount, messageCountAtSpawn } = await this.buildInitialPrompt();
     this.spawnContext = { loadedAtSpawn, archivedCount, messageCountAtSpawn };
     const mcpConfigPath = this.writeMcpConfig();
     const freshModel = this.readFreshModel();
@@ -334,12 +339,16 @@ export class SessionProcess extends EventEmitter {
 
     this.process = proc;
 
-    // Send initial prompt only for Telegram sessions.
+    // Send initial prompt only for Telegram/Discord sessions.
     // API sessions receive the first message directly via sendApiMessage(),
-    // so no activation prompt is needed and sending one would race with
-    // the first API turn, causing sendApiMessage to resolve with the wrong result.
+    // so we cannot send an activation prompt here — it would race with the
+    // first API turn and cause sendApiMessage to resolve with the wrong result.
+    // Instead, if there is conversation history to restore (model-switch respawn),
+    // stash it in pendingInitialPrompt so sendMessage() prepends it to the first turn.
     if (this.source !== 'api') {
       proc.stdin?.write(SessionProcess.toStreamJsonTurn(initialPrompt) + '\n');
+    } else if (historyPrompt) {
+      this.pendingInitialPrompt = historyPrompt;
     }
 
     // Capture stdout — emit output events + persist assistant replies
@@ -653,7 +662,13 @@ export class SessionProcess extends EventEmitter {
         fs.writeFileSync(statusPath, 'queued');
       } catch {}
     }
-    this.process.stdin.write(SessionProcess.toStreamJsonTurn(text) + '\n');
+    // If there's a deferred history context (API session model-switch respawn), prepend it
+    // to the first message so Claude sees prior conversation context within the same turn.
+    const fullText = this.pendingInitialPrompt
+      ? `${this.pendingInitialPrompt}\n\n${text}`
+      : text;
+    this.pendingInitialPrompt = undefined;
+    this.process.stdin.write(SessionProcess.toStreamJsonTurn(fullText) + '\n');
   }
 
   query(prompt: string, timeoutMs = 60_000): Promise<string> {
