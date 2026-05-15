@@ -40,6 +40,8 @@ export class SessionProcess extends EventEmitter {
   private _queryBuffer = '';
   private _queryTimer?: ReturnType<typeof setTimeout>;
   private _querySettled = false;
+  // For API sessions: history context to prepend to the first sendMessage() after a model-switch respawn
+  private pendingInitialPrompt?: string;
 
   constructor(
     sessionId: string,
@@ -71,6 +73,17 @@ export class SessionProcess extends EventEmitter {
    * Resolve the model for this session.
    * Priority: per-session override > config.json on disk > cached agentConfig.
    */
+  private get typingDir(): string {
+    const sub = this.source === 'discord' ? '.discord-state' : '.telegram-state';
+    return path.join(this.agentConfig.workspace, sub, 'typing');
+  }
+
+  private appendToStore(msg: { role: 'user' | 'assistant' | 'system'; content: string; ts: number }): Promise<void> {
+    return this.source !== 'api'
+      ? this.sessionStore.appendTelegramMessage(this.agentConfig.id, this.chatId, this.sessionId, msg, this.sessionChannel)
+      : this.sessionStore.appendMessage(this.agentConfig.id, this.sessionId, msg);
+  }
+
   private readFreshModel(): string {
     // Per-session model override takes priority
     if (this.modelOverride) return this.modelOverride;
@@ -120,17 +133,14 @@ export class SessionProcess extends EventEmitter {
         ? `[System: Graceful restart completed successfully. Do not restart again. IMPORTANT: Send a Telegram reply to chat_id "${notifyPayload.chat_id}" with the message: "${notifyPayload.text}"]`
         : '[System: Graceful restart completed successfully. Do not restart again.]';
       const restartMsg = { role: 'assistant' as const, content: marker, ts: Date.now() };
-      const appendRestartMarker = this.source !== 'api'
-        ? this.sessionStore.appendTelegramMessage(this.agentConfig.id, this.chatId, this.sessionId, restartMsg, this.sessionChannel)
-        : this.sessionStore.appendMessage(this.agentConfig.id, this.sessionId, restartMsg);
-      appendRestartMarker.catch(err => this.logger.warn('Failed to write restart marker', { error: err.message }));
+      this.appendToStore(restartMsg).catch(err => this.logger.warn('Failed to write restart marker', { error: err.message }));
       if (this.process) {
         this.process.kill('SIGTERM');
       }
     });
   }
 
-  private async buildInitialPrompt(): Promise<{ prompt: string; loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number }> {
+  private async buildInitialPrompt(): Promise<{ historyPrompt: string | null; loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number }> {
     const history = this.source !== 'api'
       ? await this.sessionStore.loadTelegramSession(this.agentConfig.id, this.chatId, this.sessionId, this.sessionChannel)
       : await this.sessionStore.loadSession(this.agentConfig.id, this.sessionId);
@@ -154,7 +164,7 @@ export class SessionProcess extends EventEmitter {
     const messageCountAtSpawn = history.length;
 
     if (recent.length === 0) {
-      return { prompt: CHANNELS_ACTIVATION_PROMPT, loadedAtSpawn, archivedCount, messageCountAtSpawn };
+      return { historyPrompt: null, loadedAtSpawn, archivedCount, messageCountAtSpawn };
     }
 
     const historyText = recent
@@ -166,7 +176,7 @@ export class SessionProcess extends EventEmitter {
       .join('\n');
 
     return {
-      prompt: `[Conversation history with this user:\n${historyText}]\n\n${CHANNELS_ACTIVATION_PROMPT}`,
+      historyPrompt: `[Conversation history with this user:\n${historyText}]`,
       loadedAtSpawn,
       archivedCount,
       messageCountAtSpawn,
@@ -304,7 +314,7 @@ export class SessionProcess extends EventEmitter {
   }
 
   private async spawnProcess(): Promise<void> {
-    const { prompt: initialPrompt, loadedAtSpawn, archivedCount, messageCountAtSpawn } = await this.buildInitialPrompt();
+    const { historyPrompt, loadedAtSpawn, archivedCount, messageCountAtSpawn } = await this.buildInitialPrompt();
     this.spawnContext = { loadedAtSpawn, archivedCount, messageCountAtSpawn };
     const mcpConfigPath = this.writeMcpConfig();
     const freshModel = this.readFreshModel();
@@ -333,25 +343,25 @@ export class SessionProcess extends EventEmitter {
 
     this.process = proc;
 
-    // Send initial prompt only for Telegram sessions.
+    // Send initial prompt only for Telegram/Discord sessions.
     // API sessions receive the first message directly via sendApiMessage(),
-    // so no activation prompt is needed and sending one would race with
-    // the first API turn, causing sendApiMessage to resolve with the wrong result.
+    // so we cannot send an activation prompt here — it would race with the
+    // first API turn and cause sendApiMessage to resolve with the wrong result.
+    // Instead, if there is conversation history to restore (model-switch respawn),
+    // stash it in pendingInitialPrompt so sendMessage() prepends it to the first turn.
     if (this.source !== 'api') {
+      const initialPrompt = historyPrompt
+        ? `${historyPrompt}\n\n${CHANNELS_ACTIVATION_PROMPT}`
+        : CHANNELS_ACTIVATION_PROMPT;
       proc.stdin?.write(SessionProcess.toStreamJsonTurn(initialPrompt) + '\n');
+    } else if (historyPrompt) {
+      this.pendingInitialPrompt = historyPrompt;
     }
 
     // Capture stdout — emit output events + persist assistant replies
-    const stateDir = this.source === 'discord'
-      ? path.join(this.agentConfig.workspace, '.discord-state')
-      : path.join(this.agentConfig.workspace, '.telegram-state');
-    const typingDir = path.join(stateDir, 'typing');
-    const heartbeatPath = this.source !== 'api'
-      ? path.join(typingDir, `${this.chatId}.heartbeat`)
-      : null;
-    const statusPath = this.source !== 'api'
-      ? path.join(typingDir, `${this.chatId}.status`)
-      : null;
+    const typingDir = this.source !== 'api' ? this.typingDir : null;
+    const heartbeatPath = typingDir ? path.join(typingDir, `${this.chatId}.heartbeat`) : null;
+    const statusPath    = typingDir ? path.join(typingDir, `${this.chatId}.status`)    : null;
 
     const writeStatus = (status: string, detail?: string): void => {
       if (statusPath) {
@@ -564,10 +574,7 @@ export class SessionProcess extends EventEmitter {
             } else {
               if (assistantBuffer.trim()) {
                 const assistantMsg = { role: 'assistant' as const, content: assistantBuffer.trim(), ts: Date.now() };
-                const appendAssistant = this.source !== 'api'
-                  ? this.sessionStore.appendTelegramMessage(this.agentConfig.id, this.chatId, this.sessionId, assistantMsg, this.sessionChannel)
-                  : this.sessionStore.appendMessage(this.agentConfig.id, this.sessionId, assistantMsg);
-                appendAssistant.catch(() => {});
+                this.appendToStore(assistantMsg).catch(() => {});
                 assistantBuffer = '';
               }
               // Emit tokenUsage using message_start context (accurate per-call context window usage)
@@ -642,8 +649,7 @@ export class SessionProcess extends EventEmitter {
     // If the previous turn already called stop() and cleared the typing loop,
     // re-creating the signal file here lets stop() restart the loop for queued turns.
     if (this.source !== 'api') {
-      const stateSubDir = this.source === 'discord' ? '.discord-state' : '.telegram-state';
-      const typingDir = path.join(this.agentConfig.workspace, stateSubDir, 'typing');
+      const typingDir = this.typingDir;
       const typingSignalPath = path.join(typingDir, this.chatId);
       const statusPath = path.join(typingDir, `${this.chatId}.status`);
       try {
@@ -652,7 +658,13 @@ export class SessionProcess extends EventEmitter {
         fs.writeFileSync(statusPath, 'queued');
       } catch {}
     }
-    this.process.stdin.write(SessionProcess.toStreamJsonTurn(text) + '\n');
+    // If there's a deferred history context (API session model-switch respawn), prepend it
+    // to the first message so Claude sees prior conversation context within the same turn.
+    const fullText = this.pendingInitialPrompt
+      ? `${this.pendingInitialPrompt}\n\n${text}`
+      : text;
+    this.pendingInitialPrompt = undefined;
+    this.process.stdin.write(SessionProcess.toStreamJsonTurn(fullText) + '\n');
   }
 
   query(prompt: string, timeoutMs = 60_000): Promise<string> {
