@@ -143,9 +143,31 @@ export function createPackagesRouter(apiKeys?: ApiKey[]): Router {
       return;
     }
 
-    // Run npm install
+    // Run npm install — use sudo if the global node_modules dir is not writable
+    const npmGlobalPrefix = (() => {
+      try {
+        return execSync('npm config get prefix', { encoding: 'utf-8', timeout: 5_000 }).trim();
+      } catch {
+        return '/usr';
+      }
+    })();
+
+    const needsSudo = (() => {
+      try {
+        const { accessSync, constants } = require('fs') as typeof import('fs');
+        accessSync(`${npmGlobalPrefix}/lib/node_modules`, constants.W_OK);
+        return false;
+      } catch {
+        return true;
+      }
+    })();
+
+    const installCmd = needsSudo
+      ? `sudo npm install -g ${packageName}@latest`
+      : `npm install -g ${packageName}@latest`;
+
     try {
-      execSync(`npm install -g ${packageName}@latest`, {
+      execSync(installCmd, {
         stdio: ['pipe', 'pipe', 'pipe'],
         timeout: 120_000,
       });
