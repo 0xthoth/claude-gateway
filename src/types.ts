@@ -40,6 +40,8 @@ export interface AgentConfig {
   allow_tools?: boolean;
   /** Per-agent history retention override */
   history?: HistoryConfig;
+  /** Avatar filename relative to agent dir, e.g. "avatar.png". null = no avatar. */
+  avatar?: string;
 }
 
 export interface AgentStats {
@@ -52,6 +54,7 @@ export interface AgentStats {
 
 export interface WatchHandle {
   close(): void;
+  ready: Promise<void>;
 }
 
 export interface ApiKey {

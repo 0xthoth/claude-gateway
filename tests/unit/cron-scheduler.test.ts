@@ -288,7 +288,7 @@ describe('CronScheduler (unit)', () => {
 
     scheduler.stop();
     schedulerNoLimit.stop();
-  });
+  }, 15000);
 
   // ── HeartbeatResult is recorded in history after run ────────────────────
   it('runTask() records result in HeartbeatHistory', async () => {

@@ -1247,11 +1247,23 @@ describe('SessionProcess — API model-switch history injection', () => {
     jest.clearAllMocks();
   });
 
-  it('U-SP-API-01: API session does not send activation prompt at spawn', async () => {
+  it('U-SP-API-01: API session does not send activation prompt at spawn even when prior history exists', async () => {
+    // Pre-populate history so historyPrompt is non-null — verifies no write even when there is context to restore
+    await sessionStore.appendMessage('alfred', 'sess-uuid', {
+      role: 'user',
+      content: 'Hello',
+      ts: Date.now(),
+    });
+    await sessionStore.appendMessage('alfred', 'sess-uuid', {
+      role: 'assistant',
+      content: 'Hi there!',
+      ts: Date.now(),
+    });
+
     const sp = new SessionProcess('sess-uuid', 'api', agentConfig, gatewayConfig, sessionStore);
     await sp.start();
 
-    // API session should NOT write anything to stdin at spawn time
+    // API session must NOT write anything to stdin at spawn — history is deferred to first sendMessage()
     expect(lastProcess!.stdin!.write).not.toHaveBeenCalled();
   });
 
