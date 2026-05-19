@@ -470,6 +470,8 @@ export function createApiRouter(
         model: cfg.claude?.model ?? null,
         allow_tools: cfg.allow_tools ?? false,
         avatarUrl: cfg.avatar ? `/api/v1/agents/${id}/avatar` : null,
+        telegram_connected: !!cfg.telegram?.botToken,
+        discord_connected: !!cfg.discord?.botToken,
       }));
     res.json({ agents });
   });
@@ -1020,8 +1022,8 @@ export function createApiRouter(
       return;
     }
 
-    const body = req.body as { description?: unknown; model?: unknown; allow_tools?: unknown };
-    const { description, model, allow_tools } = body;
+    const body = req.body as { description?: unknown; model?: unknown; allow_tools?: unknown; telegram_bot_token?: unknown; discord_bot_token?: unknown };
+    const { description, model, allow_tools, telegram_bot_token, discord_bot_token } = body;
     if (description !== undefined && (typeof description !== 'string' || !description.trim())) {
       res.status(400).json({ error: 'description must be a non-empty string' });
       return;
@@ -1032,6 +1034,14 @@ export function createApiRouter(
     }
     if (allow_tools !== undefined && typeof allow_tools !== 'boolean') {
       res.status(400).json({ error: 'allow_tools must be a boolean' });
+      return;
+    }
+    if (telegram_bot_token !== undefined && telegram_bot_token !== null && typeof telegram_bot_token !== 'string') {
+      res.status(400).json({ error: 'telegram_bot_token must be a string or null' });
+      return;
+    }
+    if (discord_bot_token !== undefined && discord_bot_token !== null && typeof discord_bot_token !== 'string') {
+      res.status(400).json({ error: 'discord_bot_token must be a string or null' });
       return;
     }
 
@@ -1045,6 +1055,21 @@ export function createApiRouter(
           if (claude) claude.model = (model as string).trim();
         }
         if (allow_tools !== undefined) agent.allow_tools = allow_tools;
+        if (telegram_bot_token !== undefined) {
+          if (telegram_bot_token === null || telegram_bot_token === '') {
+            delete (agent as Record<string, unknown>).telegram;
+          } else {
+            agent.telegram = { botToken: (telegram_bot_token as string).trim() };
+          }
+        }
+        if (discord_bot_token !== undefined) {
+          if (discord_bot_token === null || discord_bot_token === '') {
+            delete (agent as Record<string, unknown>).discord;
+          } else {
+            const existing = agent.discord as Record<string, unknown> | undefined;
+            agent.discord = { ...(existing ?? {}), botToken: (discord_bot_token as string).trim() };
+          }
+        }
       });
     } catch (err) {
       res.status(500).json({ error: `Failed to write config: ${(err as Error).message}` });
@@ -1056,8 +1081,36 @@ export function createApiRouter(
     if (description !== undefined) cfg.description = (description as string).trim();
     if (model !== undefined && cfg.claude) cfg.claude.model = (model as string).trim();
     if (allow_tools !== undefined) cfg.allow_tools = allow_tools;
+    if (telegram_bot_token !== undefined) {
+      const token = typeof telegram_bot_token === 'string' ? telegram_bot_token.trim() : null;
+      if (token) {
+        cfg.telegram = { botToken: token };
+        // Hot-start receiver if not already running
+        const runner = agentRunners.get(agentId);
+        if (runner) {
+          runner.updateAgentConfig(cfg);
+          runner.startTelegramReceiver();
+        }
+      } else {
+        delete cfg.telegram;
+      }
+    }
+    if (discord_bot_token !== undefined) {
+      const token = typeof discord_bot_token === 'string' ? discord_bot_token.trim() : null;
+      if (token) {
+        cfg.discord = { ...(cfg.discord ?? {}), botToken: token };
+        // Hot-start receiver if not already running
+        const runner = agentRunners.get(agentId);
+        if (runner) {
+          runner.updateAgentConfig(cfg);
+          runner.startDiscordReceiver();
+        }
+      } else {
+        delete cfg.discord;
+      }
+    }
 
-    res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model, allow_tools: cfg.allow_tools ?? false } });
+    res.json({ agent: { id: agentId, description: cfg.description, model: cfg.claude?.model, allow_tools: cfg.allow_tools ?? false, telegram_connected: !!cfg.telegram?.botToken, discord_connected: !!cfg.discord?.botToken } });
   });
 
   /**
