@@ -81,7 +81,7 @@ function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string 
 }
 
 export class AgentRunner extends EventEmitter {
-  private readonly agentConfig: AgentConfig;
+  private agentConfig: AgentConfig;
   private readonly gatewayConfig: GatewayConfig;
   private readonly logger: Logger;
   private stopping = false;
@@ -1267,6 +1267,21 @@ export class AgentRunner extends EventEmitter {
     this.startIdleCleaner();
     this._startCleanupScheduler();
     this.logger.info('AgentRunner started', { agentId: this.agentConfig.id });
+  }
+
+  updateAgentConfig(newConfig: AgentConfig): void {
+    this.agentConfig = newConfig;
+  }
+
+  startTelegramReceiver(): void {
+    if (this.receiver?.isRunning()) return;
+    this.receiver = new TelegramReceiver(
+      this.agentConfig,
+      this.callbackPort,
+      this.gatewayConfig.gateway.logDir,
+    );
+    this.receiver.start();
+    this.logger.info('TelegramReceiver hot-started', { agentId: this.agentConfig.id });
   }
 
   startDiscordReceiver(): void {

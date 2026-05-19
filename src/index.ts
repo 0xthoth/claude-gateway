@@ -494,7 +494,13 @@ async function main(): Promise<void> {
     const freshAgent = freshConfig.agents.find(a => a.id === agentId);
     if (!freshAgent) return;
 
-    if (channel === 'discord') {
+    // Update runner's agentConfig so it has the new bot token
+    (runner as import('./agent/runner').AgentRunner).updateAgentConfig(freshAgent);
+
+    if (channel === 'telegram') {
+      (runner as import('./agent/runner').AgentRunner).startTelegramReceiver();
+      globalLogger.info('Telegram channel hot-added to existing agent', { agentId });
+    } else if (channel === 'discord') {
       (runner as import('./agent/runner').AgentRunner).startDiscordReceiver();
       globalLogger.info('Discord channel hot-added to existing agent', { agentId });
     }
