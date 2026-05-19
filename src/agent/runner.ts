@@ -1273,6 +1273,10 @@ export class AgentRunner extends EventEmitter {
     this.agentConfig = newConfig;
   }
 
+  getAgentConfig(): AgentConfig {
+    return this.agentConfig;
+  }
+
   startTelegramReceiver(): void {
     if (this.receiver?.isRunning()) return;
     this.receiver = new TelegramReceiver(

@@ -975,6 +975,13 @@ export function createApiRouter(
       });
     } catch { /* non-fatal */ }
 
+    // Hot-start the receiver so the agent responds immediately without a gateway restart
+    const runner = agentRunners.get(wizard.agentId!);
+    if (runner) {
+      runner.updateAgentConfig({ ...runner.getAgentConfig(), telegram: { botToken: wizard.botToken! } });
+      runner.startTelegramReceiver();
+    }
+
     wizardStore.delete(wizardId);
     res.json({ success: true, agentId: wizard.agentId });
   });
