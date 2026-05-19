@@ -134,6 +134,10 @@ export function createWorkingStateManager(
     return `${typingDir}/${chatId}.status`
   }
 
+  function processingFilePath(chatId: string): string {
+    return `${typingDir}/${chatId}.processing`
+  }
+
   function msgIdFilePath(chatId: string): string {
     return `${typingDir}/${chatId}.msgid`
   }
@@ -189,8 +193,20 @@ export function createWorkingStateManager(
         if (!alreadyReplied && forwardText) {
           const msgOpts = parseMode ? { parse_mode: parseMode } : {}
           const chunks = chunkText(forwardText, TELEGRAM_MAX_CHARS, parseMode === 'HTML')
+          let deliveryFailed = false
           for (const part of chunks) {
-            await botApi.sendMessage(chatId, part, msgOpts).catch(() => {})
+            try {
+              await botApi.sendMessage(chatId, part, msgOpts)
+            } catch {
+              deliveryFailed = true
+              break
+            }
+          }
+          if (deliveryFailed) {
+            await botApi.sendMessage(
+              chatId,
+              '⚠️ Claude responded but the message could not be delivered. Please try asking again.',
+            ).catch(() => {})
           }
         }
       } catch {}
@@ -209,6 +225,7 @@ export function createWorkingStateManager(
     fsApi.rmSync(heartbeatFilePath(chatId), { force: true })
     fsApi.rmSync(statusFilePath(chatId), { force: true })
     fsApi.rmSync(msgIdFilePath(chatId), { force: true })
+    fsApi.rmSync(processingFilePath(chatId), { force: true })
     if (state.statusMessageId !== null) {
       await botApi.deleteMessage(chatId, state.statusMessageId).catch(() => {})
     }
@@ -349,11 +366,33 @@ export function createWorkingStateManager(
         try { lastActivity = fsApi.statSync(hbPath).mtimeMs } catch {}
       }
       if (Date.now() - lastActivity >= STALLED_TIMEOUT_MS) {
-        await botApi.sendMessage(
-          chatId,
-          '⚠️ Claude has not responded in 5 minutes. It may be waiting for input or stuck. Please try sending a new message.',
-        ).catch(() => {})
-        await stop(chatId)
+        const s = states.get(chatId)
+        // A .processing sentinel written during this turn (mtime >= startedAt) means the
+        // session is genuinely mid-turn (e.g., waiting for a sub-agent). We can't know
+        // whether it's still making progress, so we keep typing alive but stop noisy
+        // status/stalled intervals and warn the user of the uncertainty.
+        let isMidTurn = false
+        try {
+          const mtime = fsApi.statSync(processingFilePath(chatId)).mtimeMs
+          isMidTurn = mtime >= startedAt
+        } catch {}
+
+        if (s && isMidTurn) {
+          await botApi.sendMessage(
+            chatId,
+            '⚠️ No output for 5 min — may be a long sub-agent task or stuck. Typing is still active. Send a new message to cancel if needed.',
+          ).catch(() => {})
+          clearInterval(s.stalledInterval)
+          clearInterval(s.statusInterval)
+          if (s.initialStatusTimer) clearTimeout(s.initialStatusTimer)
+          s.initialStatusTimer = null
+        } else {
+          await botApi.sendMessage(
+            chatId,
+            '⚠️ Claude has not responded in 5 minutes. It may be waiting for input or stuck. Please try sending a new message.',
+          ).catch(() => {})
+          await stop(chatId)
+        }
       }
     }, STALLED_CHECK_INTERVAL_MS)
   }

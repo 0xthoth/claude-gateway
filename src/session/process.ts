@@ -608,6 +608,19 @@ export class SessionProcess extends EventEmitter {
     if (this._processing !== active) {
       this._processing = active;
       this.emit('processingChange', active);
+      if (this.source === 'telegram') {
+        const processingPath = path.join(this.typingDir, `${this.chatId}.processing`);
+        try {
+          if (active) {
+            fs.mkdirSync(this.typingDir, { recursive: true });
+            fs.writeFileSync(processingPath, String(Date.now()));
+          } else {
+            fs.rmSync(processingPath, { force: true });
+          }
+        } catch (err) {
+          this.logger.warn('Failed to write/delete .processing sentinel', { chatId: this.chatId, error: (err as Error).message });
+        }
+      }
       if (!active && this._pendingRestart) {
         this.emit('deferredRestartReady');
       }
@@ -646,6 +659,9 @@ export class SessionProcess extends EventEmitter {
     await this.restartWatcher?.close();
     this.restartWatcher = null;
     try { fs.rmSync(this.restartSignalPath, { force: true }); } catch {}
+    if (this.source === 'telegram') {
+      try { fs.rmSync(path.join(this.typingDir, `${this.chatId}.processing`), { force: true }); } catch {}
+    }
     if (!this.process) return;
 
     return new Promise((resolve) => {
