@@ -495,14 +495,29 @@ async function main(): Promise<void> {
     if (!freshAgent) return;
 
     // Update runner's agentConfig so it has the new bot token
-    (runner as import('./agent/runner').AgentRunner).updateAgentConfig(freshAgent);
+    const agentRunner = runner as import('./agent/runner').AgentRunner;
+    agentRunner.updateAgentConfig(freshAgent);
 
     if (channel === 'telegram') {
-      (runner as import('./agent/runner').AgentRunner).startTelegramReceiver();
+      agentRunner.startTelegramReceiver();
       globalLogger.info('Telegram channel hot-added to existing agent', { agentId });
     } else if (channel === 'discord') {
-      (runner as import('./agent/runner').AgentRunner).startDiscordReceiver();
+      agentRunner.startDiscordReceiver();
       globalLogger.info('Discord channel hot-added to existing agent', { agentId });
+    }
+  });
+
+  configWatcher.on('channel.removed', (agentId: string, channel: string) => {
+    const runner = ctx.agentRunners.get(agentId);
+    if (!runner) return;
+
+    const agentRunner = runner as import('./agent/runner').AgentRunner;
+    if (channel === 'discord') {
+      agentRunner.stopDiscordReceiver();
+      globalLogger.info('Discord channel hot-removed from agent', { agentId });
+    } else if (channel === 'telegram') {
+      agentRunner.stopTelegramReceiver();
+      globalLogger.info('Telegram channel hot-removed from agent', { agentId });
     }
   });
 

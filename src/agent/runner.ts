@@ -1279,6 +1279,7 @@ export class AgentRunner extends EventEmitter {
 
   startTelegramReceiver(): void {
     if (this.receiver?.isRunning()) return;
+    if (!this.agentConfig.telegram?.botToken) return;
     this.receiver = new TelegramReceiver(
       this.agentConfig,
       this.callbackPort,
@@ -1287,6 +1288,14 @@ export class AgentRunner extends EventEmitter {
     this.receiver.start();
     this.logger.info('TelegramReceiver hot-started', { agentId: this.agentConfig.id });
   }
+
+  stopTelegramReceiver(): void {
+    if (!this.receiver) return;
+    this.receiver.stop();
+    this.receiver = null;
+    this.logger.info('TelegramReceiver stopped', { agentId: this.agentConfig.id });
+  }
+
 
   startDiscordReceiver(): void {
     if (this.discordReceiver?.isRunning()) return;
@@ -1297,6 +1306,13 @@ export class AgentRunner extends EventEmitter {
     );
     this.discordReceiver.start();
     this.logger.info('DiscordReceiver hot-started', { agentId: this.agentConfig.id });
+  }
+
+  stopDiscordReceiver(): void {
+    if (!this.discordReceiver) return;
+    this.discordReceiver.stop();
+    this.discordReceiver = null;
+    this.logger.info('DiscordReceiver stopped', { agentId: this.agentConfig.id });
   }
 
   async stop(): Promise<void> {
