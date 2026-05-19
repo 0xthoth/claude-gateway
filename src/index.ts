@@ -495,6 +495,8 @@ async function main(): Promise<void> {
     if (!freshAgent) return;
 
     // Update runner's agentConfig so it has the new bot token
+    // Expand ~ so downstream path.join calls produce absolute paths
+    freshAgent.workspace = expandTilde(freshAgent.workspace);
     const agentRunner = runner as import('./agent/runner').AgentRunner;
     agentRunner.updateAgentConfig(freshAgent);
 
