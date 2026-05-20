@@ -17,15 +17,24 @@ export const TOOL_LABELS: Record<string, ToolLabel> = {
   Agent:        { emoji: '🤖', verb: 'Running agent' },
   Task:         { emoji: '👉', verb: 'Running task' },
   TodoWrite:    { emoji: '📋', verb: 'Updating tasks' },
-  // MCP tools
-  'mcp__browser__navigate':        { emoji: '🌐', verb: 'Opening' },
-  'mcp__browser__screenshot':      { emoji: '📸', verb: 'Screenshot' },
-  'mcp__browser__click':           { emoji: '🖱️', verb: 'Clicking' },
-  'mcp__browser__type':            { emoji: '⌨️', verb: 'Typing' },
-  'mcp__browser__scroll':          { emoji: '↕️', verb: 'Scrolling' },
-  'mcp__browser__hover':           { emoji: '🖱️', verb: 'Hovering' },
-  'mcp__gateway__telegram_reply':  { emoji: '✈️', verb: 'Replying on Telegram' },
-  'mcp__gateway__discord_reply':   { emoji: '💬', verb: 'Replying on Discord' },
+  // MCP gateway browser tools
+  'mcp__gateway__browser_create_session': { emoji: '🌐', verb: 'Opening browser' },
+  'mcp__gateway__browser_close_session':  { emoji: '🌐', verb: 'Closing browser' },
+  'mcp__gateway__browser_navigate':       { emoji: '🌐', verb: 'Opening' },
+  'mcp__gateway__browser_navigate_tab':   { emoji: '🌐', verb: 'Opening' },
+  'mcp__gateway__browser_new_tab':        { emoji: '🌐', verb: 'New tab' },
+  'mcp__gateway__browser_screenshot':     { emoji: '📸', verb: 'Screenshot' },
+  'mcp__gateway__browser_click':          { emoji: '🖱️', verb: 'Clicking' },
+  'mcp__gateway__browser_fill':           { emoji: '⌨️', verb: 'Filling' },
+  'mcp__gateway__browser_type':           { emoji: '⌨️', verb: 'Typing' },
+  'mcp__gateway__browser_scroll':         { emoji: '↕️', verb: 'Scrolling' },
+  'mcp__gateway__browser_snapshot':       { emoji: '🔍', verb: 'Inspecting' },
+  'mcp__gateway__browser_get_text':       { emoji: '📋', verb: 'Reading' },
+  'mcp__gateway__browser_evaluate':       { emoji: '⚙️', verb: 'Evaluating' },
+  'mcp__gateway__browser_wait':           { emoji: '⏳', verb: 'Waiting for' },
+  // MCP gateway channel tools
+  'mcp__gateway__telegram_reply':         { emoji: '✈️', verb: 'Replying on Telegram' },
+  'mcp__gateway__discord_reply':          { emoji: '💬', verb: 'Replying on Discord' },
 };
 
 export const DEFAULT_TOOL_LABEL: ToolLabel = { emoji: '🔧', verb: 'Using tool' };
@@ -82,7 +91,8 @@ export function extractToolDetail(name: string, input: Record<string, unknown>):
       return truncateDetail(`${emoji} ${verb}: ${desc || cmd}`);
     }
     case 'WebFetch':
-    case 'mcp__browser__navigate': { // both use input.url
+    case 'mcp__gateway__browser_navigate':
+    case 'mcp__gateway__browser_navigate_tab': {
       const url = typeof input.url === 'string' ? input.url : '';
       return truncateDetail(`${emoji} ${verb}: ${url}`);
     }
@@ -102,13 +112,22 @@ export function extractToolDetail(name: string, input: Record<string, unknown>):
       const detail = active?.content ?? `${todos.length} items`;
       return truncateDetail(`${emoji} ${verb}: ${detail}`);
     }
-    case 'mcp__browser__click': {
-      const selector = typeof input.selector === 'string' ? input.selector : '';
+    case 'mcp__gateway__browser_click': {
+      const selector = typeof input.selector === 'string' ? input.selector : (typeof input.ref === 'string' ? input.ref : '');
       return truncateDetail(`${emoji} ${verb}: ${selector}`);
     }
-    case 'mcp__browser__type': {
-      const text = typeof input.text === 'string' ? input.text : '';
+    case 'mcp__gateway__browser_fill':
+    case 'mcp__gateway__browser_type': {
+      const text = typeof input.value === 'string' ? input.value : (typeof input.text === 'string' ? input.text : '');
       return truncateDetail(`${emoji} ${verb}: "${text}"`);
+    }
+    case 'mcp__gateway__browser_wait': {
+      const condition = typeof input.condition === 'string' ? input.condition : '';
+      return truncateDetail(`${emoji} ${verb}: ${condition}`);
+    }
+    case 'mcp__gateway__browser_evaluate': {
+      const script = typeof input.script === 'string' ? input.script.slice(0, 60) : '';
+      return truncateDetail(`${emoji} ${verb}: ${script}`);
     }
     case 'mcp__gateway__telegram_reply':
     case 'mcp__gateway__discord_reply': {
