@@ -153,7 +153,8 @@ export type StreamEvent =
   | { type: 'tool_use'; name: string; id: string; input?: Record<string, unknown> }
   | { type: 'thinking'; text: string }
   | { type: 'result'; text: string }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string }
+  | { type: 'stream_event'; event: Record<string, unknown> };
 
 export interface Logger {
   info(message: string, data?: Record<string, unknown>): void;

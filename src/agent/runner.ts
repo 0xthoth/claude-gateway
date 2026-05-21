@@ -1666,9 +1666,8 @@ export class AgentRunner extends EventEmitter {
 
         // Partial assistant message (from --include-partial-messages)
         // Contains cumulative text; compute delta and emit as text_delta.
-        // Final assistant messages (stop_reason set) may contain tool_use blocks — emit those too.
         if (obj['type'] === 'assistant') {
-          const msg = obj['message'] as { content?: Array<{ type: string; text?: string; name?: string; id?: string; input?: Record<string, unknown> }>; stop_reason?: string | null } | undefined;
+          const msg = obj['message'] as { content?: Array<{ type: string; text?: string }>; stop_reason?: string | null } | undefined;
           if (Array.isArray(msg?.content)) {
             let fullText = '';
             for (const block of msg!.content) {
@@ -1680,20 +1679,6 @@ export class AgentRunner extends EventEmitter {
               callbacks.onChunk({ type: 'text_delta', text: delta });
             }
             lastPartialText = fullText;
-
-            // Emit tool_use events from final message (stop_reason is set, not null/undefined)
-            if (msg!.stop_reason) {
-              for (const block of msg!.content) {
-                if (block.type === 'tool_use') {
-                  callbacks.onChunk({
-                    type: 'tool_use',
-                    name: block.name ?? '',
-                    id: block.id ?? '',
-                    input: block.input ?? {},
-                  });
-                }
-              }
-            }
           }
         }
 
@@ -1708,7 +1693,7 @@ export class AgentRunner extends EventEmitter {
 
         // stream_event from --output-format stream-json
         // Format: {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}}
-        // Also handles content_block_start for tool_use (fires earlier than the final assistant message).
+        // Pass raw stream_event to web clients so they can interpret content_block_start (tool_use) themselves.
         if (obj['type'] === 'stream_event') {
           const event = obj['event'] as Record<string, unknown> | undefined;
           if (event?.['type'] === 'content_block_delta') {
@@ -1719,18 +1704,9 @@ export class AgentRunner extends EventEmitter {
               lastPartialText += delta['text'];
               callbacks.onChunk({ type: 'text_delta', text: delta['text'] });
             }
-          }
-          // tool_use block start — emit immediately so the UI can react (e.g. open browser panel)
-          if (event?.['type'] === 'content_block_start') {
-            const cb = event['content_block'] as Record<string, unknown> | undefined;
-            if (cb?.['type'] === 'tool_use') {
-              callbacks.onChunk({
-                type: 'tool_use',
-                name: (cb['name'] as string) ?? '',
-                id: (cb['id'] as string) ?? '',
-                input: (cb['input'] as Record<string, unknown>) ?? {},
-              });
-            }
+          } else if (event?.['type'] === 'content_block_start') {
+            // Forward raw event so web can extract tool_use info and update its UI
+            callbacks.onChunk({ type: 'stream_event', event: event as Record<string, unknown> });
           }
         }
 
