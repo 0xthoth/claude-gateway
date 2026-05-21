@@ -1667,7 +1667,7 @@ export class AgentRunner extends EventEmitter {
         // Partial assistant message (from --include-partial-messages)
         // Contains cumulative text; compute delta and emit as text_delta.
         if (obj['type'] === 'assistant') {
-          const msg = obj['message'] as { content?: Array<{ type: string; text?: string }>; stop_reason?: string | null } | undefined;
+          const msg = obj['message'] as { content?: Array<{ type: string; text?: string }> } | undefined;
           if (Array.isArray(msg?.content)) {
             let fullText = '';
             for (const block of msg!.content) {
