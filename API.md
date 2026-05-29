@@ -791,7 +791,7 @@ Returns `204 No Content` (no session created) if `GREETING.md` does not exist or
 | Field | Required | Description |
 |-------|----------|-------------|
 | `chat_id` | Yes | Caller identity — same as other session endpoints |
-| `session_name` | No | Explicit session title; skips the LLM auto-naming call (~15s) when provided |
+| `session_name` | No | Explicit session title (max 200 chars); skips the LLM auto-naming call (~15s) when provided |
 
 ```bash
 curl -X POST \
