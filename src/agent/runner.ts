@@ -168,6 +168,10 @@ export class AgentRunner extends EventEmitter {
     return this.skillRegistry;
   }
 
+  get workspacePath(): string {
+    return this.agentConfig.workspace;
+  }
+
   /**
    * Bind a local HTTP server that receives POST /channel from TelegramReceiver.
    * Each payload is routed to the appropriate SessionProcess by chat_id.
@@ -1372,7 +1376,7 @@ export class AgentRunner extends EventEmitter {
     sessionId: string,
     chatId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
   ): Promise<string> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1399,24 +1403,29 @@ export class AgentRunner extends EventEmitter {
     // (same pattern as Telegram — Claude Code reads files via Read tool instead of base64 inline)
     const imagePaths = finalMediaFiles?.length ? this.resolveMediaPaths(finalMediaFiles) : [];
 
-    // Persist user message
-    const apiUserTs = Date.now();
-    await this.sessionStore
-      .appendMessage(this.agentConfig.id, sessionId, {
+    // skipUserMessage omits the trigger from both session context and history so only the
+    // assistant response is visible — intentional for system-initiated messages (e.g. cron welcome).
+    // Claude still receives the prompt via channelXml for this turn; session restarts will not
+    // replay it, which is the desired behaviour for one-shot proactive messages.
+    if (!opts.skipUserMessage) {
+      const apiUserTs = Date.now();
+      await this.sessionStore
+        .appendMessage(this.agentConfig.id, sessionId, {
+          role: 'user',
+          content: message,
+          ts: apiUserTs,
+        })
+        .catch(() => {});
+      this.historyDb.insertMessage({
+        chatId: `api-${chatId}`,
+        sessionId,
+        source: 'api',
         role: 'user',
         content: message,
+        mediaFiles: finalMediaFiles?.length ? finalMediaFiles : undefined,
         ts: apiUserTs,
-      })
-      .catch(() => {});
-    this.historyDb.insertMessage({
-      chatId: `api-${chatId}`,
-      sessionId,
-      source: 'api',
-      role: 'user',
-      content: message,
-      mediaFiles: finalMediaFiles?.length ? finalMediaFiles : undefined,
-      ts: apiUserTs,
-    });
+      });
+    }
 
     this.pendingApiSessions.add(sessionId);
     session.touch();
@@ -1527,7 +1536,10 @@ export class AgentRunner extends EventEmitter {
           // result event = end of turn
           if (obj['type'] === 'result') {
             session.setProcessing(false);
-            const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+            // Use || instead of ?? so an empty-string result falls back to the
+            // accumulated buffer (needed for non-Anthropic models e.g. OpenRouter,
+            // which emit result:"" even though the text arrived via stream_event chunks).
+            const resultText = (obj['result'] as string | undefined) || buffer.join('');
             done(resultText);
           }
         } catch {
@@ -1564,7 +1576,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -1590,24 +1602,25 @@ export class AgentRunner extends EventEmitter {
     // Resolve media files to absolute paths for file-path based image passing
     const imagePathsStream = finalMediaFilesStream?.length ? this.resolveMediaPaths(finalMediaFilesStream) : [];
 
-    // Persist user message
-    const streamUserTs = Date.now();
-    await this.sessionStore
-      .appendMessage(this.agentConfig.id, sessionId, {
+    if (!opts.skipUserMessage) {
+      const streamUserTs = Date.now();
+      await this.sessionStore
+        .appendMessage(this.agentConfig.id, sessionId, {
+          role: 'user',
+          content: message,
+          ts: streamUserTs,
+        })
+        .catch(() => {});
+      this.historyDb.insertMessage({
+        chatId: `api-${chatId}`,
+        sessionId,
+        source: 'api',
         role: 'user',
         content: message,
+        mediaFiles: finalMediaFilesStream?.length ? finalMediaFilesStream : undefined,
         ts: streamUserTs,
-      })
-      .catch(() => {});
-    this.historyDb.insertMessage({
-      chatId: `api-${chatId}`,
-      sessionId,
-      source: 'api',
-      role: 'user',
-      content: message,
-      mediaFiles: finalMediaFilesStream?.length ? finalMediaFilesStream : undefined,
-      ts: streamUserTs,
-    });
+      });
+    }
 
     this.pendingApiSessions.add(sessionId);
     session.touch();
@@ -1616,6 +1629,8 @@ export class AgentRunner extends EventEmitter {
     let settled = false;
     // Track partial message text for delta computation (--include-partial-messages)
     let lastPartialText = '';
+    // Accumulate tool_use blocks from stream_event (content_block_start → delta → stop)
+    const toolBlocks = new Map<number, { id: string; name: string; chunks: string[] }>();
 
     const done = (result: string) => {
       if (settled) return;
@@ -1699,20 +1714,13 @@ export class AgentRunner extends EventEmitter {
           }
         }
 
-        // stream_event from --output-format stream-json
-        // Format: {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}}
-        if (obj['type'] === 'stream_event') {
-          const event = obj['event'] as Record<string, unknown> | undefined;
-          if (event?.['type'] === 'content_block_delta') {
-            const delta = event['delta'] as Record<string, unknown> | undefined;
-            if (delta?.['type'] === 'text_delta' && typeof delta['text'] === 'string' && delta['text']) {
-              buffer.push(delta['text']);
-              // Update lastPartialText so the final 'assistant' message won't re-send the full text
-              lastPartialText += delta['text'];
-              callbacks.onChunk({ type: 'text_delta', text: delta['text'] });
-            }
-          }
-        }
+        // stream_event from --output-format stream-json (tool_use + text_delta)
+        this._applyStreamEvent(obj, toolBlocks, callbacks.onChunk, (text) => {
+          buffer.push(text);
+          // Update lastPartialText so the final 'assistant' message won't re-send the full text
+          lastPartialText += text;
+          callbacks.onChunk({ type: 'text_delta', text });
+        });
 
         // Text from delta field (other formats)
         if (obj['type'] !== 'assistant' && obj['type'] !== 'text' && obj['type'] !== 'result' && obj['type'] !== 'stream_event') {
@@ -1721,16 +1729,6 @@ export class AgentRunner extends EventEmitter {
             buffer.push(deltaText);
             callbacks.onChunk({ type: 'text_delta', text: deltaText });
           }
-        }
-
-        // Tool use
-        if (obj['type'] === 'tool_use') {
-          callbacks.onChunk({
-            type: 'tool_use',
-            name: (obj['name'] as string) ?? '',
-            id: (obj['id'] as string) ?? '',
-            input: (obj['input'] as Record<string, unknown>) ?? {},
-          });
         }
 
         // Thinking
@@ -1745,7 +1743,8 @@ export class AgentRunner extends EventEmitter {
         if (obj['type'] === 'result') {
           session.setProcessing(false);
           lastPartialText = ''; // reset for next turn
-          const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+          // Use || so empty-string result falls back to buffer (OpenRouter emits result:"").
+          const resultText = (obj['result'] as string | undefined) || buffer.join('');
           done(resultText);
         }
       } catch {
@@ -1902,10 +1901,8 @@ export class AgentRunner extends EventEmitter {
   }
 
   async setModel(newModel: string): Promise<void> {
-    const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-    if (!availableModels.find((m) => m.id === newModel)) {
-      throw Object.assign(new Error(`Unknown model: ${newModel}`), { code: 'UNKNOWN_MODEL' });
-    }
+    // Allow any model string through — BYOK/third-party models (openrouter/* etc.)
+    // are validated by the upstream provider, not the local config list.
     this.agentConfig.claude.model = newModel;
     try { this.persistModelToConfig(newModel); } catch (err) {
       this.logger.error('Failed to persist model to config', { error: (err as Error).message });
@@ -2023,6 +2020,7 @@ export class AgentRunner extends EventEmitter {
     const buffer: string[] = [];
     let settled = false;
     let lastPartialText = '';
+    const toolBlocks = new Map<number, { id: string; name: string; chunks: string[] }>();
 
     const done = (result: string) => {
       if (settled) return;
@@ -2083,9 +2081,17 @@ export class AgentRunner extends EventEmitter {
           const text = (obj['text'] as string) ?? '';
           if (text) { buffer.push(text); callbacks.onChunk({ type: 'text_delta', text }); }
         }
+        // stream_event from --output-format stream-json (tool_use + text_delta)
+        this._applyStreamEvent(obj, toolBlocks, callbacks.onChunk, (text) => {
+          buffer.push(text);
+          // Update lastPartialText so the final 'assistant' message won't re-send the full text
+          lastPartialText += text;
+          callbacks.onChunk({ type: 'text_delta', text });
+        });
         if (obj['type'] === 'result') {
           session.setProcessing(false);
-          const resultText = (obj['result'] as string | undefined) ?? buffer.join('');
+          // Use || so empty-string result falls back to buffer (OpenRouter emits result:"").
+          const resultText = (obj['result'] as string | undefined) || buffer.join('');
           done(resultText);
         }
       } catch { /* non-JSON */ }
@@ -2108,6 +2114,49 @@ export class AgentRunner extends EventEmitter {
     return () => {
       if (!settled) { settled = true; cleanup(); }
     };
+  }
+
+  private _applyStreamEvent(
+    obj: Record<string, unknown>,
+    toolBlocks: Map<number, { id: string; name: string; chunks: string[] }>,
+    onChunk: (event: StreamEvent) => void,
+    onTextDelta: (text: string) => void,
+  ): void {
+    if (obj['type'] !== 'stream_event') return;
+    const event = obj['event'] as Record<string, unknown> | undefined;
+    const index = event?.['index'] as number | undefined;
+
+    if (event?.['type'] === 'content_block_start') {
+      const cb = event['content_block'] as Record<string, unknown> | undefined;
+      if (cb?.['type'] === 'tool_use' && index !== undefined) {
+        toolBlocks.set(index, {
+          id: (cb['id'] as string) ?? '',
+          name: (cb['name'] as string) ?? '',
+          chunks: [],
+        });
+      }
+    }
+
+    if (event?.['type'] === 'content_block_delta') {
+      const delta = event['delta'] as Record<string, unknown> | undefined;
+      if (delta?.['type'] === 'text_delta' && typeof delta['text'] === 'string' && delta['text']) {
+        onTextDelta(delta['text']);
+      }
+      if (delta?.['type'] === 'input_json_delta' && index !== undefined) {
+        toolBlocks.get(index)?.chunks.push((delta['partial_json'] as string) ?? '');
+      }
+    }
+
+    if (event?.['type'] === 'content_block_stop' && index !== undefined) {
+      const block = toolBlocks.get(index);
+      if (block) {
+        toolBlocks.delete(index);
+        try {
+          const input = JSON.parse(block.chunks.join('') || '{}') as Record<string, unknown>;
+          onChunk({ type: 'tool_use', name: block.name, id: block.id, input });
+        } catch { /* malformed tool input JSON — skip */ }
+      }
+    }
   }
 
   /**

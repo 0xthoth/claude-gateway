@@ -26,6 +26,7 @@ All API endpoints require an API key configured in `config.json`. Pass it via:
 | `PATCH` | `/api/v1/agents/:agentId` | Write | Update agent description, model, or allow_tools |
 | `DELETE` | `/api/v1/agents/:agentId` | Admin | Delete an agent |
 | `POST` | `/api/v1/agents/:agentId/messages` | Key | Send a message — sync JSON or SSE stream; supports slash commands |
+| `POST` | `/api/v1/agents/:agentId/greeting` | Write | Stream a proactive welcome from `GREETING.md` into an existing session (SSE); returns 204 if file absent |
 | `GET` | `/api/v1/models` | Key | List all supported Claude models |
 | `PUT` | `/api/v1/agents/:agentId/model` | Admin | Set the active model for an agent |
 
@@ -577,6 +578,7 @@ Send a message to an agent. Returns a JSON response or SSE stream.
 | `stream` | No | `true` to enable SSE streaming (default `false`) |
 | `timeout_ms` | No | Override the default response timeout in milliseconds (default 60000) |
 | `media_files` | No | Array of `mediaPath` strings returned by the Media Upload endpoint |
+| `store_user_message` | No | Set to `false` to skip persisting the user message in session history — only the assistant response is stored. Requires a write or admin key. Useful for proactive/trigger prompts where the user trigger should be invisible. |
 
 #### Slash command dispatch
 
@@ -776,6 +778,63 @@ Manage API sessions for a specific agent and `chat_id`. Sessions are stored at `
 
 ---
 
+### POST /api/v1/agents/:agentId/greeting
+
+Stream a proactive welcome into an **existing** session. The endpoint reads `GREETING.md` from the agent's workspace and sends its content to the agent as a trigger prompt via SSE. Only the **assistant response** is stored in session history — the trigger prompt is invisible (uses `store_user_message: false` internally).
+
+Returns `204 No Content` if `GREETING.md` does not exist or is empty.
+
+**Auth:** Write or Admin key required.
+
+**Two-step flow:**
+
+1. Create the session first: `POST /api/v1/agents/:agentId/sessions` → redirect the user to the chat UI with the returned `session_id`.
+2. Once in the chat UI, trigger the greeting: `POST /api/v1/agents/:agentId/greeting` with `session_id` → stream the assistant's opening message as SSE with typing animation visible to the user.
+
+**Request:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `session_id` | Yes | ID of an existing session to deliver the greeting into |
+| `chat_id` | No | Same `chat_id` used when the session was created; ensures the greeting message is stored in the correct history bucket. Defaults to `session_id` when omitted (creates a secondary index entry) |
+
+```bash
+curl -N -X POST \
+  -H "X-Api-Key: my-write-key" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "7f3a1c2d-89ab-4def-b012-345678901234"}' \
+  http://localhost:10850/api/v1/agents/getpod/greeting
+```
+
+**Response `200` (SSE stream)** — greeting is streaming:
+
+```
+data: {"type":"text_delta","text":"Hello! "}
+data: {"type":"text_delta","text":"Welcome to GetPod."}
+data: {"type":"result","text":"Hello! Welcome to GetPod.","session_id":"7f3a1c2d-..."}
+data: [DONE]
+```
+
+If the session has an active request in flight, the endpoint returns `409` before sending SSE headers.
+
+**Response `204`** — `GREETING.md` not found or empty; nothing sent to session.
+
+**`GREETING.md` format:**
+
+Place the file at `~/.claude-gateway/agents/{agentId}/workspace/GREETING.md`. Its content is used as the prompt sent to the agent. It is **not** concatenated into the agent system prompt — it is a one-time trigger only.
+
+```markdown
+The user's environment is ready. Send a warm, concise welcome message
+introducing yourself and what you can help with.
+```
+
+**Notes:**
+- `GREETING.md` is **deleted before streaming begins**. Subsequent calls return 204 immediately, making the endpoint idempotent. Re-provisioning `GREETING.md` enables a new greeting on the next call.
+- The SSE stream format matches `POST /messages` with `stream: true` — use the same client-side handler.
+- If the agent errors mid-stream, an `{"type":"error","message":"..."}` SSE event is sent and the stream closes.
+
+---
+
 ### GET /api/v1/agents/:agentId/sessions
 
 List all API sessions for a given `chat_id`.
@@ -867,13 +926,13 @@ Rename a session.
 | Field | Required | Description |
 |-------|----------|-------------|
 | `chat_id` | Yes | Caller identity |
-| `sessionName` | Yes | New session name |
+| `session_name` | Yes | New session name (snake_case preferred; `sessionName` also accepted for backward compatibility) |
 
 ```bash
 curl -X PATCH \
   -H "X-Api-Key: my-secret-key-123" \
   -H "Content-Type: application/json" \
-  -d '{"chat_id": "myapp", "sessionName": "Q3 Infra Discussion"}' \
+  -d '{"chat_id": "myapp", "session_name": "Q3 Infra Discussion"}' \
   http://localhost:10850/api/v1/agents/alfred/sessions/da19d84a | jq
 ```
 
@@ -883,6 +942,10 @@ curl -X PATCH \
   "sessionName": "Q3 Infra Discussion"
 }
 ```
+
+**Notes:**
+- Request body accepts `session_name` (snake_case, preferred) or `sessionName` (camelCase, backward compatibility). When both are present, `session_name` takes priority.
+- The response body always uses camelCase (`sessionName`), consistent with all other API responses.
 
 ---
 
