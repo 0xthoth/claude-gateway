@@ -4,7 +4,7 @@ import * as fsPromises from 'fs/promises';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent } from '../types';
+import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess } from '../session/process';
 import { SessionStore, SessionNotInIndexError } from '../session/store';
@@ -118,6 +118,9 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks pending Telegram image paths per chatId (queue) for size accumulation after each turn.
   private readonly pendingImagePaths = new Map<string, string[]>();
+
+  // Buffers attachment file paths registered via api_reply tool for the current API session turn.
+  private readonly pendingApiAttachments = new Map<string, string[]>();
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
@@ -681,6 +684,7 @@ export class AgentRunner extends EventEmitter {
       if (idleEntry) {
         await idleEntry[1].stop();
         this.sessions.delete(idleEntry[0]);
+        this.cleanupApiSessionMediaDir(idleEntry[0], idleEntry[1].source);
         this.logger.info('Evicted idle session', { sessionId: idleEntry[0] });
       } else {
         throw new Error(`Session pool full: ${this.maxConcurrent} concurrent sessions`);
@@ -1247,6 +1251,7 @@ export class AgentRunner extends EventEmitter {
           this.logger.info('Stopping idle session', { sessionId: id });
           await proc.stop();
           this.sessions.delete(id);
+          this.cleanupApiSessionMediaDir(id, proc.source);
         }
       }
     }, 5 * 60 * 1000);
@@ -1386,7 +1391,7 @@ export class AgentRunner extends EventEmitter {
     chatId: string,
     message: string,
     opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
-  ): Promise<string> {
+  ): Promise<{ text: string; attachments: ApiAttachment[] }> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
         new Error(`Session ${sessionId} already has a pending request`),
@@ -1466,7 +1471,7 @@ export class AgentRunner extends EventEmitter {
       `</channel>` +
       (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ text: string; attachments: ApiAttachment[] }>((resolve, reject) => {
       const buffer: string[] = [];
       let quietTimer: ReturnType<typeof setTimeout> | undefined;
       // Track partial message text for delta computation (--include-partial-messages)
@@ -1474,6 +1479,7 @@ export class AgentRunner extends EventEmitter {
 
       const done = (result: string) => {
         cleanup();
+        const attachments = this.popApiAttachments(sessionId);
         // Persist assistant reply
         if (result.trim()) {
           const apiAssistantTs = Date.now();
@@ -1493,7 +1499,7 @@ export class AgentRunner extends EventEmitter {
             ts: apiAssistantTs,
           });
         }
-        resolve(result.trim());
+        resolve({ text: result.trim(), attachments });
       };
 
       const fail = (err: Error) => {
@@ -1582,7 +1588,7 @@ export class AgentRunner extends EventEmitter {
     message: string,
     callbacks: {
       onChunk: (event: StreamEvent) => void;
-      onDone: (fullText: string) => void;
+      onDone: (fullText: string, attachments: ApiAttachment[]) => void;
       onError: (err: Error) => void;
     },
     opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
@@ -1645,6 +1651,7 @@ export class AgentRunner extends EventEmitter {
       if (settled) return;
       settled = true;
       cleanup();
+      const attachments = this.popApiAttachments(sessionId);
       // Persist assistant reply
       if (result.trim()) {
         const streamAssistantTs = Date.now();
@@ -1664,7 +1671,7 @@ export class AgentRunner extends EventEmitter {
           ts: streamAssistantTs,
         });
       }
-      callbacks.onDone(result.trim());
+      callbacks.onDone(result.trim(), attachments);
     };
 
     const fail = (err: Error) => {
@@ -1800,6 +1807,44 @@ export class AgentRunner extends EventEmitter {
    */
   hasActiveApiSession(sessionId: string): boolean {
     return this.pendingApiSessions.has(sessionId);
+  }
+
+  /**
+   * Register file paths as attachments for the current API session turn.
+   * Called by the api_reply MCP tool via the attachments endpoint.
+   * Files must be absolute paths within the agent's media directory.
+   */
+  addApiAttachments(sessionId: string, filePaths: string[]): void {
+    const existing = this.pendingApiAttachments.get(sessionId) ?? [];
+    this.pendingApiAttachments.set(sessionId, [...existing, ...filePaths]);
+  }
+
+  /**
+   * Pop and return buffered attachment paths for a session, then clear the buffer.
+   * Converts absolute paths to relative media URLs for the API response.
+   */
+  popApiAttachments(sessionId: string): ApiAttachment[] {
+    const paths = this.pendingApiAttachments.get(sessionId) ?? [];
+    this.pendingApiAttachments.delete(sessionId);
+    const mediaRoot = path.join(this.agentsBaseDir, this.agentConfig.id, 'media') + path.sep;
+    return paths
+      .map((absPath): ApiAttachment | null => {
+        if (!absPath.startsWith(mediaRoot)) return null;
+        if (!fs.existsSync(absPath)) return null;
+        const rel = absPath.slice(mediaRoot.length).replace(/\\/g, '/');
+        return { type: 'image', url: `/v1/agents/${encodeURIComponent(this.agentConfig.id)}/media/${rel}` };
+      })
+      .filter((a): a is ApiAttachment => a !== null);
+  }
+
+  private cleanupApiSessionMediaDir(sessionId: string, source: string): void {
+    if (source !== 'api') return;
+    const mediaDir = path.join(this.agentsBaseDir, this.agentConfig.id, 'media', `api-${sessionId}`);
+    try {
+      fs.rmSync(mediaDir, { recursive: true, force: true });
+    } catch {
+      // best-effort — log nothing, just don't crash the cleaner
+    }
   }
 
   getAgentsBaseDir(): string {
