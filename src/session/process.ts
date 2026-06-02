@@ -295,12 +295,7 @@ export class SessionProcess extends EventEmitter {
   private findApiKeyForAgent(agentId: string): string {
     const keys = this.gatewayConfig.gateway.api?.keys;
     if (!keys?.length) return '';
-    // Prefer a key scoped to this agent; fall back to wildcard or admin key.
-    const match = keys.find(k =>
-      (Array.isArray(k.agents) && k.agents.includes(agentId)) ||
-      k.agents === '*' ||
-      k.admin
-    );
+    const match = keys.find(k => k.agents === '*' || (Array.isArray(k.agents) && k.agents.includes(agentId)));
     return match?.key ?? '';
   }
 
