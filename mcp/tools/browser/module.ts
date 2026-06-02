@@ -39,8 +39,8 @@ export class BrowserModule implements ToolModule {
 
     if (name === 'browser_screenshot' && !result.isError) {
       // getpod-browser returns {type:"image", data: base64, mimeType:"image/jpeg"}.
-      // Decode and save so callers can attach the file path directly.
-      // For API sessions, save to the session media dir so files are HTTP-accessible.
+      // Always return the absolute file path — callers use api_reply(files=[path])
+      // and the gateway converts the path to an attachment URL in the response.
       const block = result.content[0] as Record<string, string> | undefined;
       const b64 = block?.['data'] ?? '';
       const mime = block?.['mimeType'] ?? 'image/jpeg';
@@ -54,19 +54,6 @@ export class BrowserModule implements ToolModule {
           const filename = `browser_shot_${sid}_${Date.now()}.${ext}`;
           filePath = path.join(mediaDir, filename);
           fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
-          const apiUrl = process.env.GATEWAY_API_URL;
-          const agentId = process.env.GATEWAY_AGENT_ID;
-          if (apiUrl && agentId) {
-            // mediaDir is <agentBase>/media/<subdir>; parent is the agent's media root
-            const agentMediaRoot = path.dirname(mediaDir);
-            const relPath = path.relative(agentMediaRoot, filePath)
-              .split(path.sep)
-              .map(encodeURIComponent)
-              .join('/');
-            return {
-              content: [{ type: 'text', text: `${apiUrl}/v1/agents/${encodeURIComponent(agentId)}/media/${relPath}` }],
-            };
-          }
           return { content: [{ type: 'text', text: filePath }] };
         }
         filePath = path.join('/tmp', `browser_shot_${sid}.${ext}`);
