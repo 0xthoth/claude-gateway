@@ -11,10 +11,6 @@ import * as path from 'path';
 import * as os from 'os';
 import { watchSkills } from '../../src/skills/watcher';
 
-// Overlayfs (Docker CI) doesn't always fire inotify unlink events — polling is reliable.
-beforeAll(() => { process.env.CHOKIDAR_USEPOLLING = '1'; });
-afterAll(() => { delete process.env.CHOKIDAR_USEPOLLING; });
-
 let tmpDir: string;
 let skillsDir: string;
 
@@ -35,6 +31,10 @@ description: A test skill
 
 Test instructions
 `;
+
+// Use polling in tests so events are detected reliably regardless of inotify availability
+// (overlayfs, inotify watch limits in parallel CI runs, etc.)
+const TEST_CHOKIDAR_OPTS = { usePolling: true, interval: 50 };
 
 function writeSkillFile(name: string): void {
   const dir = path.join(skillsDir, name);
@@ -66,6 +66,7 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 50,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
     await watcher.ready;
@@ -84,6 +85,7 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 50,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
     await watcher.ready;
@@ -102,6 +104,7 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 50,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
     await watcher.ready;
@@ -118,6 +121,7 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 200,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
     await watcher.ready;
