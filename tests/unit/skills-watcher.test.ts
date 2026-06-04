@@ -11,6 +11,10 @@ import * as path from 'path';
 import * as os from 'os';
 import { watchSkills } from '../../src/skills/watcher';
 
+// Overlayfs (Docker CI) doesn't always fire inotify unlink events — polling is reliable.
+beforeAll(() => { process.env.CHOKIDAR_USEPOLLING = '1'; });
+afterAll(() => { delete process.env.CHOKIDAR_USEPOLLING; });
+
 let tmpDir: string;
 let skillsDir: string;
 
@@ -47,8 +51,6 @@ function modifySkillFile(name: string): void {
   fs.writeFileSync(file, SKILL_CONTENT + '\nModified!');
 }
 
-const WATCHER_INIT_MS = 1000;
-
 async function pollUntil(condition: () => boolean, intervalMs = 50, timeoutMs = 6000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
@@ -66,7 +68,7 @@ describe('Skill File Watcher', () => {
       debounceMs: 50,
     });
 
-    await new Promise((r) => setTimeout(r, WATCHER_INIT_MS));
+    await watcher.ready;
     writeSkillFile('new-skill');
     await pollUntil(() => callCount >= 1);
 
@@ -84,7 +86,7 @@ describe('Skill File Watcher', () => {
       debounceMs: 50,
     });
 
-    await new Promise((r) => setTimeout(r, WATCHER_INIT_MS));
+    await watcher.ready;
     deleteSkillFile('to-delete');
     await pollUntil(() => callCount >= 1);
 
@@ -102,7 +104,7 @@ describe('Skill File Watcher', () => {
       debounceMs: 50,
     });
 
-    await new Promise((r) => setTimeout(r, WATCHER_INIT_MS));
+    await watcher.ready;
     modifySkillFile('to-modify');
     await pollUntil(() => callCount >= 1);
 
@@ -118,7 +120,7 @@ describe('Skill File Watcher', () => {
       debounceMs: 200,
     });
 
-    await new Promise((r) => setTimeout(r, WATCHER_INIT_MS));
+    await watcher.ready;
 
     for (let i = 0; i < 5; i++) {
       writeSkillFile(`rapid-${i}`);
