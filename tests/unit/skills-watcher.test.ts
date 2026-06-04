@@ -32,9 +32,9 @@ description: A test skill
 Test instructions
 `;
 
-// Use polling in tests so events are detected reliably regardless of inotify availability
-// (overlayfs, inotify watch limits in parallel CI runs, etc.)
-const TEST_CHOKIDAR_OPTS = { usePolling: true, interval: 50 };
+// Use default inotify (no polling) — inotify is event-driven and not affected by CPU load.
+// usePolling is unreliable under parallel test load since setInterval gets starved.
+const TEST_CHOKIDAR_OPTS = {};
 
 function writeSkillFile(name: string): void {
   const dir = path.join(skillsDir, name);

@@ -356,6 +356,7 @@ describe('SessionProcess restart watcher notify payload', () => {
     loadTelegramSession: jest.Mock;
     appendTelegramMessage: jest.Mock;
   }>;
+  let currentSp: import('../../src/session/process').SessionProcess | null = null;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-cmd-test-'));
@@ -374,9 +375,15 @@ describe('SessionProcess restart watcher notify payload', () => {
 
     allProcesses.length = 0;
     (require('child_process').spawn as jest.Mock).mockClear();
+    currentSp = null;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Always stop the SessionProcess to prevent chokidar watcher leak
+    if (currentSp) {
+      await currentSp.stop();
+      currentSp = null;
+    }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -395,6 +402,7 @@ describe('SessionProcess restart watcher notify payload', () => {
       gatewayConfig,
       sessionStore as unknown as import('../../src/session/store').SessionStore,
     );
+    currentSp = sp;
     await sp.start();
 
     // Give chokidar time to initialize the watcher
@@ -427,8 +435,6 @@ describe('SessionProcess restart watcher notify payload', () => {
     const markerContent = (restartMarkerCall![3] as { content: string }).content;
     expect(markerContent).toContain('IMPORTANT: Send a Telegram reply to chat_id "chat123"');
     expect(markerContent).toContain('Model changed to claude-sonnet-4-6');
-
-    await sp.stop();
   });
 
   // --------------------------------------------------------------------------
@@ -446,6 +452,7 @@ describe('SessionProcess restart watcher notify payload', () => {
       gatewayConfig,
       sessionStore as unknown as import('../../src/session/store').SessionStore,
     );
+    currentSp = sp;
     await sp.start();
 
     // Give chokidar time to initialize the watcher
@@ -476,7 +483,5 @@ describe('SessionProcess restart watcher notify payload', () => {
     const markerContent = (restartMarkerCall![3] as { content: string }).content;
     expect(markerContent).toBe('[System: Graceful restart completed successfully. Do not restart again.]');
     expect(markerContent).not.toContain('IMPORTANT');
-
-    await sp.stop();
   });
 });
