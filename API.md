@@ -46,6 +46,7 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/compact` | Key | Summarise old history, keep only recent messages |
 | `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/stop` | Key | Interrupt the in-flight turn |
 | `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/restart` | Key | Graceful session restart |
+| `POST` | `/api/v1/agents/:agentId/sessions/:sessionId/attachments` | Key | Register file paths as attachments for the current turn (called internally by `api_reply` MCP tool) |
 
 ### Workspace File API
 
@@ -53,6 +54,19 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 |--------|------|------|-------------|
 | `GET` | `/api/v1/agents/:agentId/files/:filename` | Key | Read a workspace file |
 | `PUT` | `/api/v1/agents/:agentId/files/:filename` | Write | Write a workspace file |
+
+### Telegram Channel API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/agents/:agentId/telegram/pending` | Admin | List pending pairing requests |
+| `POST` | `/api/v1/agents/:agentId/telegram/approve` | Admin | Approve a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/deny` | Admin | Deny a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/init-pairing` | Admin | Write sentinel — next DM auto-approves as owner |
+| `GET` | `/api/v1/agents/:agentId/telegram/pairing-status` | Admin | Check sentinel status + current allowlist |
+| `PATCH` | `/api/v1/agents/:agentId/telegram/policy` | Admin | Update DM policy |
+| `GET` | `/api/v1/agents/:agentId/telegram/allowlist` | Admin | List allowlisted users |
+| `DELETE` | `/api/v1/agents/:agentId/telegram/allow/:userId` | Admin | Remove a user from the allowlist |
 
 ### Skill API
 
@@ -312,12 +326,12 @@ Update an agent's description, model, or allow_tools flag. Requires write access
 curl -X PATCH \
   -H "X-Api-Key: admin-key-456" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-opus-4-7"}' \
+  -d '{"model": "claude-opus-4-8"}' \
   http://localhost:10850/api/v1/agents/alfred | jq
 ```
 
 ```json
-{ "agent": { "id": "alfred", "description": "Personal assistant", "model": "claude-opus-4-7", "allow_tools": false } }
+{ "agent": { "id": "alfred", "description": "Personal assistant", "model": "claude-opus-4-8", "allow_tools": false } }
 ```
 
 ---
@@ -562,6 +576,222 @@ curl -X DELETE \
 
 ---
 
+## Telegram Channel API
+
+Manage Telegram access control per agent — pending pairings, allowlist, and DM policy. All endpoints require an **admin** key.
+
+### Endpoints Overview
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/agents/:agentId/telegram/pending` | Admin | List pending (non-expired) pairing requests |
+| `POST` | `/api/v1/agents/:agentId/telegram/approve` | Admin | Approve a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/deny` | Admin | Deny and remove a pending pairing by code |
+| `POST` | `/api/v1/agents/:agentId/telegram/init-pairing` | Admin | Write sentinel so next DM auto-approves as owner |
+| `GET` | `/api/v1/agents/:agentId/telegram/pairing-status` | Admin | Check whether init-pairing sentinel is active |
+| `PATCH` | `/api/v1/agents/:agentId/telegram/policy` | Admin | Update the DM policy |
+| `GET` | `/api/v1/agents/:agentId/telegram/allowlist` | Admin | List all users in the allowlist |
+| `DELETE` | `/api/v1/agents/:agentId/telegram/allow/:userId` | Admin | Remove a user from the allowlist |
+
+---
+
+### GET /api/v1/agents/:agentId/telegram/pending
+
+List all pending (non-expired) Telegram pairing requests for an agent. Expired entries are cleaned up automatically on this call.
+
+```bash
+curl -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/pending | jq
+```
+
+```json
+{
+  "pending": [
+    {
+      "code": "A3F9C1",
+      "senderId": "123456789",
+      "chatId": "123456789",
+      "createdAt": 1775737709000,
+      "expiresAt": 1775738309000
+    }
+  ]
+}
+```
+
+---
+
+### POST /api/v1/agents/:agentId/telegram/approve
+
+Approve a pending pairing by its 6-character code. The sender's `chatId` is added to `allowFrom` in `access.json`.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `code` | Yes | 6-character pairing code |
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key-456" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "A3F9C1"}' \
+  http://localhost:10850/api/v1/agents/alfred/telegram/approve | jq
+```
+
+```json
+{ "ok": true, "senderId": "123456789" }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `code` missing |
+| 404 | Code not found or expired |
+
+---
+
+### POST /api/v1/agents/:agentId/telegram/deny
+
+Deny and remove a pending pairing request by code.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `code` | Yes | 6-character pairing code |
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key-456" \
+  -H "Content-Type: application/json" \
+  -d '{"code": "A3F9C1"}' \
+  http://localhost:10850/api/v1/agents/alfred/telegram/deny | jq
+```
+
+```json
+{ "ok": true }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `code` missing |
+| 404 | Code not found |
+
+---
+
+### POST /api/v1/agents/:agentId/telegram/init-pairing
+
+Write a sentinel file so the **next** private message to the bot is auto-approved as the owner. Sentinel expires after 10 minutes.
+
+```bash
+curl -X POST \
+  -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/init-pairing | jq
+```
+
+```json
+{ "ok": true }
+```
+
+---
+
+### GET /api/v1/agents/:agentId/telegram/pairing-status
+
+Check whether the init-pairing sentinel is still active (i.e. waiting for the first DM). Also returns the current allowlist.
+
+```bash
+curl -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/pairing-status | jq
+```
+
+```json
+{ "waiting": true, "allowFrom": [] }
+```
+
+`waiting` is `false` if the sentinel has expired or does not exist.
+
+---
+
+### PATCH /api/v1/agents/:agentId/telegram/policy
+
+Update the DM policy for the agent's Telegram channel.
+
+**Request body:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `dmPolicy` | Yes | One of `open`, `pairing`, `allowlist`, `disabled` |
+
+```bash
+curl -X PATCH \
+  -H "X-Api-Key: admin-key-456" \
+  -H "Content-Type: application/json" \
+  -d '{"dmPolicy": "allowlist"}' \
+  http://localhost:10850/api/v1/agents/alfred/telegram/policy | jq
+```
+
+```json
+{ "ok": true, "dmPolicy": "allowlist" }
+```
+
+**Policy values:**
+
+| Value | Behaviour |
+|-------|-----------|
+| `open` | Any Telegram user can message the bot |
+| `pairing` | Users must complete a pairing flow first |
+| `allowlist` | Only users in `allowFrom` can message the bot |
+| `disabled` | No messages accepted |
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `dmPolicy` missing or invalid value |
+
+---
+
+### GET /api/v1/agents/:agentId/telegram/allowlist
+
+Return all users in the `allowFrom` list for the agent's Telegram channel.
+
+```bash
+curl -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/allowlist | jq
+```
+
+```json
+{ "allowFrom": ["123456789", "987654321"] }
+```
+
+---
+
+### DELETE /api/v1/agents/:agentId/telegram/allow/:userId
+
+Remove a user from the `allowFrom` list. `:userId` must be a numeric Telegram user ID.
+
+```bash
+curl -X DELETE \
+  -H "X-Api-Key: admin-key-456" \
+  http://localhost:10850/api/v1/agents/alfred/telegram/allow/123456789 | jq
+```
+
+```json
+{ "ok": true }
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `userId` is not numeric |
+| 404 | Agent not found |
+
+---
+
 ### POST /api/v1/agents/:agentId/messages
 
 Send a message to an agent. Returns a JSON response or SSE stream.
@@ -623,9 +853,14 @@ curl -X POST \
   "agent_id": "alfred",
   "response": "Hello! I'm Alfred, your personal assistant. I can help you with...",
   "session_id": "da19d84a-6a36-4f57-b419-d322d82c4db8",
-  "duration_ms": 2341
+  "duration_ms": 2341,
+  "attachments": [
+    { "type": "image", "url": "/v1/agents/alfred/media/api-sess-id/browser_shot_default_1234567890.jpg" }
+  ]
 }
 ```
+
+> `attachments` is only present when the agent captured images during the turn (e.g. via `browser_screenshot`). Each entry has `type: "image"` and a `url` that can be fetched via `GET /api/v1/agents/:agentId/media/*`.
 
 **Continue a session:**
 
@@ -676,6 +911,8 @@ data: {"type":"tool_use","name":"Read","id":"toolu_abc123"}
 data: {"type":"text_delta","text":"Here's the explanation..."}
 data: {"type":"result","text":"Here's the full explanation...","request_id":"550e8400-...","session_id":"abc-123","duration_ms":4200}
 data: [DONE]
+
+> When images are captured during the turn, the `result` event also includes `"attachments": [{"type":"image","url":"..."}]`.
 ```
 
 ### Requests with tool use
@@ -707,7 +944,7 @@ Regardless of `allow_tools`, the agent will not create or update workspace ident
 | `text_delta` | `text` | Incremental text chunk |
 | `tool_use` | `name`, `id` | Tool invocation (e.g. Read, Grep, Bash) |
 | `thinking` | `text` | Agent reasoning (if available) |
-| `result` | `text`, `request_id`, `session_id`, `duration_ms` | Final aggregated result |
+| `result` | `text`, `request_id`, `session_id`, `duration_ms`, `attachments?` | Final aggregated result; `attachments` present only when images were captured |
 | `error` | `message` | Error event |
 
 The stream ends with `data: [DONE]`.
@@ -728,8 +965,9 @@ curl -H "X-Api-Key: my-secret-key-123" \
 ```json
 {
   "models": [
-    { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "alias": "sonnet", "contextWindow": 200000, "multiplier": 1 },
-    { "id": "claude-opus-4-7", "name": "Claude Opus 4.7", "alias": "opus", "contextWindow": 200000, "multiplier": 3 }
+    { "id": "claude-opus-4-8", "name": "Claude Opus 4.8", "alias": "opus",   "contextWindow": 1000000, "multiplier": 3 },
+    { "id": "claude-opus-4-7", "name": "Claude Opus 4.7", "alias": "opus47", "contextWindow": 1000000, "multiplier": 3 },
+    { "id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "alias": "sonnet", "contextWindow": 1000000, "multiplier": 1 }
   ]
 }
 ```
@@ -744,18 +982,18 @@ Set the active model for a specific agent. Persists to `config.json`. Requires a
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `model` | Yes | Claude model ID (e.g. `"claude-opus-4-7"`) |
+| `model` | Yes | Claude model ID (e.g. `"claude-opus-4-8"`) |
 
 ```bash
 curl -X PUT \
   -H "X-Api-Key: admin-key-456" \
   -H "Content-Type: application/json" \
-  -d '{"model": "claude-opus-4-7"}' \
+  -d '{"model": "claude-opus-4-8"}' \
   http://localhost:10850/api/v1/agents/alfred/model | jq
 ```
 
 ```json
-{ "model": "claude-opus-4-7" }
+{ "model": "claude-opus-4-8" }
 ```
 
 **Error responses:**

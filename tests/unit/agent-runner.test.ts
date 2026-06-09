@@ -781,17 +781,17 @@ describe('AgentRunner — sendApiMessageStream', () => {
     expect((err as Error & { code: string }).code).toBe('TIMEOUT');
   }, 15000);
 
-  // T14: cleanup function removes listeners
-  it('T14: cleanup function removes listeners and frees session slot', async () => {
+  // T14: onClientDisconnect keeps stream alive; session freed only after result
+  it('T14: onClientDisconnect keeps session active; slot freed on result', async () => {
     runner = new AgentRunner(agentConfig, gatewayConfig);
     await runner.start();
 
-    let cleanup: (() => void) | undefined;
-    const cleanupReady = new Promise<void>((resolve) => {
+    let onClientDisconnect: (() => void) | undefined;
+    const streamStarted = new Promise<void>((resolve) => {
       runner.sendApiMessageStream(
         'stream-t14',
         'test-chat',
-        'cleanup test',
+        'disconnect test',
         {
           onChunk: () => {},
           onDone: () => {},
@@ -799,20 +799,27 @@ describe('AgentRunner — sendApiMessageStream', () => {
         },
         { timeoutMs: 10000 },
       ).then((fn) => {
-        cleanup = fn;
+        onClientDisconnect = fn;
         resolve();
       });
     });
 
     await new Promise(r => setTimeout(r, 200));
-    await cleanupReady;
+    await streamStarted;
 
     expect(runner.hasActiveApiSession('stream-t14')).toBe(true);
 
-    // Call cleanup
-    cleanup!();
+    // Simulate SSE client disconnect — session must stay active server-side
+    onClientDisconnect!();
+    expect(runner.hasActiveApiSession('stream-t14')).toBe(true);
 
-    // Session slot should be freed
+    // Simulate Claude completing the response after disconnect
+    const session = getSessions(runner).get('stream-t14')!;
+    session.emit('output', JSON.stringify({ type: 'result', result: 'Response after disconnect' }));
+
+    await new Promise(r => setTimeout(r, 100));
+
+    // Session slot freed once result arrives
     expect(runner.hasActiveApiSession('stream-t14')).toBe(false);
 
     // Should be able to start a new stream on same session
@@ -820,11 +827,56 @@ describe('AgentRunner — sendApiMessageStream', () => {
       runner.sendApiMessageStream(
         'stream-t14',
         'test-chat',
-        'after cleanup',
+        'after result',
         { onChunk: () => {}, onDone: () => {}, onError: () => {} },
         { timeoutMs: 5000 },
       ),
     ).resolves.toBeDefined();
+  }, 15000);
+
+  // T14b: response is persisted to history DB after client disconnect
+  it('T14b: response persisted to history DB after client disconnect', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    let onClientDisconnect: (() => void) | undefined;
+    let doneText = '';
+    let doneFiredResolve!: () => void;
+    const doneFired = new Promise<void>((res) => { doneFiredResolve = res; });
+
+    runner.sendApiMessageStream(
+      'stream-t14b',
+      'test-chat',
+      'persist after disconnect',
+      {
+        onChunk: () => {},
+        onDone: (text) => { doneText = text; doneFiredResolve(); },
+        onError: () => {},
+      },
+      { timeoutMs: 10000 },
+    ).then((fn) => { onClientDisconnect = fn; });
+
+    // Wait for stream to start and disconnect fn to be available
+    await new Promise(r => setTimeout(r, 200));
+    expect(onClientDisconnect).toBeDefined();
+
+    // Simulate SSE client disconnect before result arrives
+    onClientDisconnect!();
+
+    // Simulate Claude completing the response after disconnect
+    const session = getSessions(runner).get('stream-t14b')!;
+    session.emit('output', JSON.stringify({ type: 'result', result: 'Persisted response' }));
+
+    // onDone must still fire even though client disconnected
+    await doneFired;
+    expect(doneText).toBe('Persisted response');
+
+    // History DB must contain the assistant message
+    const page = runner.getHistoryDb().getMessages('api-test-chat');
+    const msgs = page.messages as Array<{ role: string; content: string }>;
+    const assistantMsg = msgs.find(m => m.role === 'assistant');
+    expect(assistantMsg).toBeDefined();
+    expect(assistantMsg!.content).toBe('Persisted response');
   }, 15000);
 
   // --------------------------------------------------------------------------
@@ -2894,4 +2946,92 @@ describe('AgentRunner — sendMessageToSession SSE tool_use', () => {
     expect(tc.name).toBe('Bash');
     expect(tc.input).toEqual({ command: 'ls' });
   }, 15000);
+});
+
+// ── AgentRunner — API attachment buffer ────────────────────────────────────────
+
+describe('AgentRunner — API attachment buffer', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-attach-'));
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    agentConfig = makeAgentConfig(workspace);
+    gatewayConfig = makeGatewayConfig();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function createMediaFile(tmpDir: string, relPath: string): string {
+    const absPath = path.join(tmpDir, 'agents', 'alfred', 'media', relPath);
+    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    fs.writeFileSync(absPath, 'fake-image-data');
+    return absPath;
+  }
+
+  it('addApiAttachments and popApiAttachments round-trip', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const filePath = createMediaFile(tmpDir, 'api-sess/shot.jpg');
+
+    runner.addApiAttachments('sess-1', [filePath]);
+    const attachments = runner.popApiAttachments('sess-1');
+
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].type).toBe('image');
+    expect(attachments[0].url).toContain('/v1/agents/alfred/media/');
+    expect(attachments[0].url).toContain('shot.jpg');
+  });
+
+  it('popApiAttachments clears the buffer', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const filePath = createMediaFile(tmpDir, 'api-sess/a.jpg');
+    runner.addApiAttachments('sess-2', [filePath]);
+
+    runner.popApiAttachments('sess-2');
+    const second = runner.popApiAttachments('sess-2');
+    expect(second).toHaveLength(0);
+  });
+
+  it('popApiAttachments returns empty array when no attachments registered', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    expect(runner.popApiAttachments('unknown-sess')).toEqual([]);
+  });
+
+  it('filters out files outside the agent media directory', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    runner.addApiAttachments('sess-3', ['/tmp/evil/traversal.jpg']);
+    const attachments = runner.popApiAttachments('sess-3');
+    expect(attachments).toHaveLength(0);
+  });
+
+  it('filters out files that do not exist on disk', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const mediaRoot = path.join(tmpDir, 'agents', 'alfred', 'media') + path.sep;
+    runner.addApiAttachments('sess-nonexist', [`${mediaRoot}api-s/ghost.jpg`]);
+    const attachments = runner.popApiAttachments('sess-nonexist');
+    expect(attachments).toHaveLength(0);
+  });
+
+  it('accumulates multiple addApiAttachments calls', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const fileA = createMediaFile(tmpDir, 'api-s/a.jpg');
+    const fileB = createMediaFile(tmpDir, 'api-s/b.jpg');
+    runner.addApiAttachments('sess-4', [fileA]);
+    runner.addApiAttachments('sess-4', [fileB]);
+    const attachments = runner.popApiAttachments('sess-4');
+    expect(attachments).toHaveLength(2);
+  });
+
+  it('attachment URL uses agent id and relative path', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const filePath = createMediaFile(tmpDir, 'api-sess/screen.jpg');
+    runner.addApiAttachments('sess-5', [filePath]);
+    const attachments = runner.popApiAttachments('sess-5');
+    expect(attachments[0].url).toBe('/v1/agents/alfred/media/api-sess/screen.jpg');
+  });
 });

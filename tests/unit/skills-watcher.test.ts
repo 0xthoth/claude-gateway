@@ -32,6 +32,10 @@ description: A test skill
 Test instructions
 `;
 
+// Use default inotify (no polling) — inotify is event-driven and not affected by CPU load.
+// usePolling is unreliable under parallel test load since setInterval gets starved.
+const TEST_CHOKIDAR_OPTS = {};
+
 function writeSkillFile(name: string): void {
   const dir = path.join(skillsDir, name);
   fs.mkdirSync(dir, { recursive: true });
@@ -47,6 +51,14 @@ function modifySkillFile(name: string): void {
   fs.writeFileSync(file, SKILL_CONTENT + '\nModified!');
 }
 
+async function pollUntil(condition: () => boolean, intervalMs = 50, timeoutMs = 6000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) return;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+}
+
 describe('Skill File Watcher', () => {
   test('W1: detects new SKILL.md file', async () => {
     let callCount = 0;
@@ -54,15 +66,16 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 50,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
-    await new Promise((r) => setTimeout(r, 200));
+    await watcher.ready;
     writeSkillFile('new-skill');
-    await new Promise((r) => setTimeout(r, 500));
+    await pollUntil(() => callCount >= 1);
 
     await watcher.close();
     expect(callCount).toBeGreaterThanOrEqual(1);
-  });
+  }, 12000);
 
   test('W2: detects SKILL.md deletion', async () => {
     writeSkillFile('to-delete');
@@ -72,15 +85,16 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 50,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
-    await new Promise((r) => setTimeout(r, 200));
+    await watcher.ready;
     deleteSkillFile('to-delete');
-    await new Promise((r) => setTimeout(r, 500));
+    await pollUntil(() => callCount >= 1);
 
     await watcher.close();
     expect(callCount).toBeGreaterThanOrEqual(1);
-  });
+  }, 12000);
 
   test('W3: detects SKILL.md modification', async () => {
     writeSkillFile('to-modify');
@@ -90,15 +104,16 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 50,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
-    await new Promise((r) => setTimeout(r, 200));
+    await watcher.ready;
     modifySkillFile('to-modify');
-    await new Promise((r) => setTimeout(r, 500));
+    await pollUntil(() => callCount >= 1);
 
     await watcher.close();
     expect(callCount).toBeGreaterThanOrEqual(1);
-  });
+  }, 12000);
 
   test('W4: debounces multiple rapid changes into fewer calls', async () => {
     let callCount = 0;
@@ -106,20 +121,23 @@ describe('Skill File Watcher', () => {
       dirs: [skillsDir],
       onChange: () => { callCount++; },
       debounceMs: 200,
+      chokidarOpts: TEST_CHOKIDAR_OPTS,
     });
 
-    await new Promise((r) => setTimeout(r, 200));
+    await watcher.ready;
 
     for (let i = 0; i < 5; i++) {
       writeSkillFile(`rapid-${i}`);
     }
 
-    await new Promise((r) => setTimeout(r, 800));
+    // Wait for at least one call, then let debounce settle before asserting max
+    await pollUntil(() => callCount >= 1);
+    await new Promise((r) => setTimeout(r, 400));
 
     await watcher.close();
     expect(callCount).toBeGreaterThanOrEqual(1);
     expect(callCount).toBeLessThanOrEqual(3);
-  });
+  }, 12000);
 
   test('returns no-op handle for empty dirs', async () => {
     const watcher = watchSkills({

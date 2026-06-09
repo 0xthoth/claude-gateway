@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { BrowserModule } from '../../mcp/tools/browser/module';
 
 describe('BrowserModule', () => {
@@ -186,7 +189,9 @@ describe('BrowserModule', () => {
       const result = await mod.handleTool('browser_create_session', { session_id: 'test-session' });
       expect(result.isError).toBeFalsy();
       expect(result.content[0].type).toBe('text');
-      expect(result.content[0].text).toContain('stream_url');
+      // stream_url is stripped by handleTool before returning to agent
+      expect(result.content[0].text).not.toContain('stream_url');
+      expect(result.content[0].text).toContain('session_id');
     });
 
     it('sends correct JSON-RPC body to getpod-browser', async () => {
@@ -275,6 +280,93 @@ describe('BrowserModule', () => {
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       const headers = init.headers as Record<string, string>;
       expect(headers['Authorization']).toBeUndefined();
+    });
+  });
+
+  // --- browser_screenshot URL construction ---
+
+  describe('browser_screenshot', () => {
+    const smallJpegB64 = '/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAARC';
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bm-screenshot-'));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    function makeScreenshotRpc(b64: string, mime = 'image/jpeg') {
+      return {
+        jsonrpc: '2.0',
+        id: 1,
+        result: { content: [{ type: 'image', data: b64, mimeType: mime }] },
+      };
+    }
+
+    it('returns filesystem path when GATEWAY_SESSION_MEDIA_DIR is not set', async () => {
+      delete process.env.GATEWAY_SESSION_MEDIA_DIR;
+      fetchMock.mockResolvedValue(
+        new Response(`data: ${JSON.stringify(makeScreenshotRpc(smallJpegB64))}\n\n`, { status: 200 }),
+      );
+      const mod = new BrowserModule();
+      const result = await mod.handleTool('browser_screenshot', { session_id: 'sess1' });
+      expect(result.isError).toBeFalsy();
+      const text = result.content[0].text as string;
+      expect(text).toMatch(/^\/tmp\//);
+      expect(text).toMatch(/browser_shot_sess1.*\.jpg$/);
+    });
+
+    it('returns file path inside mediaDir regardless of GATEWAY_API_URL and GATEWAY_AGENT_ID', async () => {
+      const mediaDir = path.join(tmpDir, 'api-sess2');
+      process.env.GATEWAY_SESSION_MEDIA_DIR = mediaDir;
+      process.env.GATEWAY_API_URL = 'http://127.0.0.1:10850';
+      process.env.GATEWAY_AGENT_ID = 'my-agent';
+      fetchMock.mockResolvedValue(
+        new Response(`data: ${JSON.stringify(makeScreenshotRpc(smallJpegB64))}\n\n`, { status: 200 }),
+      );
+      const mod = new BrowserModule();
+      const result = await mod.handleTool('browser_screenshot', { session_id: 'sess2' });
+      expect(result.isError).toBeFalsy();
+      const text = result.content[0].text as string;
+      // Always returns absolute file path — agent uses api_reply(files=[path]) to attach
+      expect(text).not.toMatch(/^http/);
+      expect(text.startsWith(mediaDir)).toBe(true);
+      expect(text).toMatch(/browser_shot_sess2.*\.jpg$/);
+      expect(fs.existsSync(text)).toBe(true);
+    });
+
+    it('returns file path inside mediaDir regardless of env vars', async () => {
+      const mediaDir = path.join(tmpDir, 'api-sess3');
+      process.env.GATEWAY_SESSION_MEDIA_DIR = mediaDir;
+      delete process.env.GATEWAY_API_URL;
+      process.env.GATEWAY_AGENT_ID = 'my-agent';
+      fetchMock.mockResolvedValue(
+        new Response(`data: ${JSON.stringify(makeScreenshotRpc(smallJpegB64))}\n\n`, { status: 200 }),
+      );
+      const mod = new BrowserModule();
+      const result = await mod.handleTool('browser_screenshot', { session_id: 'sess3' });
+      expect(result.isError).toBeFalsy();
+      const text = result.content[0].text as string;
+      expect(text).not.toMatch(/^http/);
+      expect(text).toMatch(/browser_shot_sess3.*\.jpg$/);
+      expect(text.startsWith(mediaDir)).toBe(true);
+    });
+
+    it('saves PNG when mimeType is image/png', async () => {
+      const mediaDir = path.join(tmpDir, 'api-sess6');
+      process.env.GATEWAY_SESSION_MEDIA_DIR = mediaDir;
+      fetchMock.mockResolvedValue(
+        new Response(
+          `data: ${JSON.stringify(makeScreenshotRpc('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'image/png'))}\n\n`,
+          { status: 200 },
+        ),
+      );
+      const mod = new BrowserModule();
+      const result = await mod.handleTool('browser_screenshot', { session_id: 'sess6' });
+      const text = result.content[0].text as string;
+      expect(text).toMatch(/\.png$/);
     });
   });
 });

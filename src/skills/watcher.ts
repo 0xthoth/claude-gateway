@@ -1,3 +1,4 @@
+import chokidar from 'chokidar';
 import { createWatcher, WatchHandle } from '../watch/factory';
 
 export interface SkillWatcherOptions {
@@ -7,6 +8,8 @@ export interface SkillWatcherOptions {
   onChange: () => void;
   /** Debounce interval in ms (default: 250) */
   debounceMs?: number;
+  /** Extra chokidar options (e.g. usePolling: true for CI/overlayfs) */
+  chokidarOpts?: chokidar.WatchOptions;
 }
 
 /**
@@ -28,7 +31,7 @@ export function watchSkills(opts: SkillWatcherOptions): WatchHandle {
   return createWatcher({
     paths: patterns,
     debounceMs,
-    chokidarOpts: { depth: 2 },
+    chokidarOpts: { depth: 2, ...opts.chokidarOpts },
     onChange: opts.onChange,
   });
 }

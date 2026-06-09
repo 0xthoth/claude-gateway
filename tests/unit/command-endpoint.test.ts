@@ -3,6 +3,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+async function pollUntil(condition: () => boolean, intervalMs = 50, timeoutMs = 6000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() >= deadline) return;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+}
+
 // ── Mock child_process ────────────────────────────────────────────────────────
 
 interface MockStdin {
@@ -348,6 +356,7 @@ describe('SessionProcess restart watcher notify payload', () => {
     loadTelegramSession: jest.Mock;
     appendTelegramMessage: jest.Mock;
   }>;
+  let currentSp: import('../../src/session/process').SessionProcess | null = null;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sp-cmd-test-'));
@@ -366,9 +375,15 @@ describe('SessionProcess restart watcher notify payload', () => {
 
     allProcesses.length = 0;
     (require('child_process').spawn as jest.Mock).mockClear();
+    currentSp = null;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Always stop the SessionProcess to prevent chokidar watcher leak
+    if (currentSp) {
+      await currentSp.stop();
+      currentSp = null;
+    }
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -387,10 +402,11 @@ describe('SessionProcess restart watcher notify payload', () => {
       gatewayConfig,
       sessionStore as unknown as import('../../src/session/store').SessionStore,
     );
+    currentSp = sp;
     await sp.start();
 
     // Give chokidar time to initialize the watcher
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 500));
 
     // Write restart signal with notify payload
     const signalPath = path.join(stateDir, 'restart-chat123');
@@ -398,8 +414,13 @@ describe('SessionProcess restart watcher notify payload', () => {
       notify: { chat_id: 'chat123', text: 'Model changed to claude-sonnet-4-6 — back online!' },
     }));
 
-    // Wait for chokidar to detect the file and trigger the handler
-    await new Promise(r => setTimeout(r, 1000));
+    // Poll until appendTelegramMessage is called with a restart marker
+    const hasMarker = () => sessionStore.appendTelegramMessage.mock.calls.some(
+      (c: unknown[]) => typeof c[3] === 'object' && c[3] !== null &&
+        typeof (c[3] as { content?: string }).content === 'string' &&
+        (c[3] as { content: string }).content.includes('Graceful restart completed'),
+    );
+    await pollUntil(hasMarker);
 
     // Check that appendTelegramMessage was called with a marker containing notify instruction
     // appendTelegramMessage(agentId, chatId, sessionId, message) — message is arg[3]
@@ -414,8 +435,6 @@ describe('SessionProcess restart watcher notify payload', () => {
     const markerContent = (restartMarkerCall![3] as { content: string }).content;
     expect(markerContent).toContain('IMPORTANT: Send a Telegram reply to chat_id "chat123"');
     expect(markerContent).toContain('Model changed to claude-sonnet-4-6');
-
-    await sp.stop();
   });
 
   // --------------------------------------------------------------------------
@@ -433,17 +452,23 @@ describe('SessionProcess restart watcher notify payload', () => {
       gatewayConfig,
       sessionStore as unknown as import('../../src/session/store').SessionStore,
     );
+    currentSp = sp;
     await sp.start();
 
     // Give chokidar time to initialize the watcher
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 500));
 
     // Write empty restart signal (self-restart)
     const signalPath = path.join(stateDir, 'restart-chat456');
     fs.writeFileSync(signalPath, '');
 
-    // Wait for chokidar to detect the file and trigger the handler
-    await new Promise(r => setTimeout(r, 1000));
+    // Poll until appendTelegramMessage is called with a restart marker
+    const hasMarker = () => sessionStore.appendTelegramMessage.mock.calls.some(
+      (c: unknown[]) => typeof c[3] === 'object' && c[3] !== null &&
+        typeof (c[3] as { content?: string }).content === 'string' &&
+        (c[3] as { content: string }).content.includes('Graceful restart completed'),
+    );
+    await pollUntil(hasMarker);
 
     // Check that appendTelegramMessage was called with default marker (no notify)
     // appendTelegramMessage(agentId, chatId, sessionId, message) — message is arg[3]
@@ -458,7 +483,5 @@ describe('SessionProcess restart watcher notify payload', () => {
     const markerContent = (restartMarkerCall![3] as { content: string }).content;
     expect(markerContent).toBe('[System: Graceful restart completed successfully. Do not restart again.]');
     expect(markerContent).not.toContain('IMPORTANT');
-
-    await sp.stop();
   });
 });

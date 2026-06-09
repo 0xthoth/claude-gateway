@@ -9,12 +9,12 @@ import { AgentConfig, ApiKey, StreamEvent } from '../../src/types';
 
 interface StreamCallbacks {
   onChunk: (event: StreamEvent) => void;
-  onDone: (fullText: string) => void;
+  onDone: (fullText: string, attachments: import('../../src/types').ApiAttachment[]) => void;
   onError: (err: Error) => void;
 }
 
 class MockAgentRunner extends EventEmitter {
-  sendApiMessageImpl: (sessionId: string, chatId: string, message: string, opts?: { allowTools?: boolean }) => Promise<string>;
+  sendApiMessageImpl: (sessionId: string, chatId: string, message: string, opts?: { allowTools?: boolean }) => Promise<{ text: string; attachments: import('../../src/types').ApiAttachment[] }>;
   sendApiMessageStreamImpl?: (
     sessionId: string,
     chatId: string,
@@ -24,7 +24,7 @@ class MockAgentRunner extends EventEmitter {
   ) => Promise<() => void>;
   private _activeApiSessions = new Set<string>();
 
-  constructor(impl: (sessionId: string, chatId: string, message: string, opts?: { allowTools?: boolean }) => Promise<string>) {
+  constructor(impl: (sessionId: string, chatId: string, message: string, opts?: { allowTools?: boolean }) => Promise<{ text: string; attachments: import('../../src/types').ApiAttachment[] }>) {
     super();
     this.sendApiMessageImpl = impl;
   }
@@ -34,7 +34,7 @@ class MockAgentRunner extends EventEmitter {
     chatId: string,
     message: string,
     opts: { timeoutMs: number; allowTools?: boolean },
-  ): Promise<string> {
+  ): Promise<{ text: string; attachments: import('../../src/types').ApiAttachment[] }> {
     return this.sendApiMessageImpl(sessionId, chatId, message, { allowTools: opts.allowTools });
   }
 
@@ -58,6 +58,11 @@ class MockAgentRunner extends EventEmitter {
   markSessionActive(sessionId: string): void {
     this._activeApiSessions.add(sessionId);
   }
+
+  // Required by media_files path validation in the router
+  getAgentsBaseDir(): string {
+    return '/tmp';
+  }
 }
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -80,7 +85,7 @@ const apiKeys: ApiKey[] = [
   { key: 'sk-test-write', agents: [AGENT_ID], write: true },
 ];
 
-function buildApp(runnerImpl: (sessionId: string, chatId: string, msg: string) => Promise<string>) {
+function buildApp(runnerImpl: (sessionId: string, chatId: string, msg: string) => Promise<{ text: string; attachments: import('../../src/types').ApiAttachment[] }>) {
   const runner = new MockAgentRunner(runnerImpl);
   const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
   const configs = new Map([[AGENT_ID, agentConfig]]);
@@ -99,7 +104,7 @@ function buildStreamApp(
     opts?: { timeoutMs: number; allowTools?: boolean },
   ) => Promise<() => void>,
 ): { app: express.Express; runner: MockAgentRunner } {
-  const runner = new MockAgentRunner(async () => 'ok');
+  const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
   runner.sendApiMessageStreamImpl = streamImpl;
   const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
   const configs = new Map([[AGENT_ID, agentConfig]]);
@@ -116,7 +121,7 @@ const POST_URL = `/api/v1/agents/${AGENT_ID}/messages`;
 
 describe('POST /api/v1/agents/:agentId/messages', () => {
   it('returns 200 with response on success', async () => {
-    const app = buildApp(async () => 'Hello!');
+    const app = buildApp(async () => ({ text: 'Hello!', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
@@ -130,7 +135,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
   });
 
   it('echoes back provided session_id', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
@@ -140,7 +145,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
   });
 
   it('generates a uuid session_id when not provided', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
@@ -152,27 +157,53 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
     );
   });
 
-  it('returns 400 when message is missing', async () => {
-    const app = buildApp(async () => 'ok');
+  it('returns 400 when message is missing and no media_files provided', async () => {
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
-      .send({});
+      .send({ chat_id: 'test-chat' });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/message is required/i);
   });
 
-  it('returns 400 when message is empty string', async () => {
-    const app = buildApp(async () => 'ok');
+  it('returns 400 when message is empty string and no media_files provided', async () => {
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
-      .send({ message: '   ' });
+      .send({ message: '   ', chat_id: 'test-chat' });
     expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/message is required/i);
+  });
+
+  it('returns 200 when message is missing but media_files is provided (image-only)', async () => {
+    let receivedMessage: string | undefined;
+    const app = buildApp(async (_sid, _chatId, msg) => {
+      receivedMessage = msg;
+      return { text: 'Saw the image.', attachments: [] };
+    });
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ chat_id: 'test-chat', media_files: ['ui-upload/abc/test.jpg'] });
+    expect(res.status).toBe(200);
+    expect(res.body.response).toBe('Saw the image.');
+    // Runner receives empty string when no text was provided
+    expect(receivedMessage).toBe('');
+  });
+
+  it('returns 200 when message is empty string but media_files is provided', async () => {
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ message: '   ', chat_id: 'test-chat', media_files: ['ui-upload/abc/test.jpg'] });
+    expect(res.status).toBe(200);
   });
 
   it('returns 400 when message exceeds 10,000 chars', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
@@ -182,7 +213,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
   });
 
   it('returns 400 when session_id is not a string', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
@@ -191,7 +222,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
   });
 
   it('returns 401 when no auth header', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .send({ message: 'hi' });
@@ -199,10 +230,10 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
   });
 
   it('returns 403 when key has no access to agent', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     // Use a key that only accesses a different agent
     const restrictedKeys: ApiKey[] = [{ key: 'sk-test-app', agents: ['other-agent'] }];
-    const runner = new MockAgentRunner(async () => 'ok');
+    const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
     const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
     const configs = new Map([[AGENT_ID, agentConfig]]);
     const restrictedApp = express();
@@ -216,7 +247,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
   });
 
   it('returns 404 for unknown agent', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const adminAuth = { Authorization: 'Bearer sk-test-admin' };
     const res = await supertest.default(app)
       .post('/api/v1/agents/unknown-agent/messages')
@@ -263,7 +294,7 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
 
 describe('GET /api/v1/agents', () => {
   it('returns only agents accessible by the key', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .get('/api/v1/agents')
       .set(AUTH); // sk-test-app → only alfred
@@ -273,7 +304,7 @@ describe('GET /api/v1/agents', () => {
   });
 
   it('admin key returns all agents', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .get('/api/v1/agents')
       .set({ Authorization: 'Bearer sk-test-admin' });
@@ -282,7 +313,7 @@ describe('GET /api/v1/agents', () => {
   });
 
   it('returns 401 without auth', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app).get('/api/v1/agents');
     expect(res.status).toBe(401);
   });
@@ -290,7 +321,7 @@ describe('GET /api/v1/agents', () => {
 
 describe('POST /api/v1/agents — access control', () => {
   it('returns 403 for non-admin key', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post('/api/v1/agents')
       .set(AUTH) // sk-test-app — no admin flag
@@ -300,7 +331,7 @@ describe('POST /api/v1/agents — access control', () => {
   });
 
   it('returns 403 for write key without admin flag', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post('/api/v1/agents')
       .set({ Authorization: 'Bearer sk-test-write' })
@@ -309,7 +340,7 @@ describe('POST /api/v1/agents — access control', () => {
   });
 
   it('admin key passes auth check (returns 501 without configPath)', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .post('/api/v1/agents')
       .set({ Authorization: 'Bearer sk-test-admin' })
@@ -320,7 +351,7 @@ describe('POST /api/v1/agents — access control', () => {
 
 describe('PATCH /api/v1/agents/:agentId — access control', () => {
   it('returns 403 for key without write flag', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .patch(`/api/v1/agents/${AGENT_ID}`)
       .set(AUTH) // sk-test-app — no write flag
@@ -330,7 +361,7 @@ describe('PATCH /api/v1/agents/:agentId — access control', () => {
   });
 
   it('write key with correct scope passes auth check (returns 501 without configPath)', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .patch(`/api/v1/agents/${AGENT_ID}`)
       .set({ Authorization: 'Bearer sk-test-write' })
@@ -339,7 +370,7 @@ describe('PATCH /api/v1/agents/:agentId — access control', () => {
   });
 
   it('admin key passes auth check', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .patch(`/api/v1/agents/${AGENT_ID}`)
       .set({ Authorization: 'Bearer sk-test-admin' })
@@ -350,7 +381,7 @@ describe('PATCH /api/v1/agents/:agentId — access control', () => {
 
 describe('DELETE /api/v1/agents/:agentId — access control', () => {
   it('returns 403 for non-admin key', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .delete(`/api/v1/agents/${AGENT_ID}`)
       .set(AUTH);
@@ -359,7 +390,7 @@ describe('DELETE /api/v1/agents/:agentId — access control', () => {
   });
 
   it('returns 403 for write key without admin flag', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .delete(`/api/v1/agents/${AGENT_ID}`)
       .set({ Authorization: 'Bearer sk-test-write' });
@@ -367,7 +398,7 @@ describe('DELETE /api/v1/agents/:agentId — access control', () => {
   });
 
   it('admin key passes auth check (returns 501 without configPath)', async () => {
-    const app = buildApp(async () => 'ok');
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
     const res = await supertest.default(app)
       .delete(`/api/v1/agents/${AGENT_ID}`)
       .set({ Authorization: 'Bearer sk-test-admin' });
@@ -422,7 +453,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   // T1: SSE headers
   it('T1: returns SSE headers when stream=true', async () => {
     const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
-      cb.onDone('Hello');
+      cb.onDone('Hello', []);
       return () => {};
     });
     const { status, headers } = await collectSSE(app, { message: 'hi', chat_id: 'test-chat', stream: true });
@@ -436,7 +467,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
       cb.onChunk({ type: 'text_delta', text: 'Hello' });
       cb.onChunk({ type: 'text_delta', text: ' world' });
-      cb.onDone('Hello world');
+      cb.onDone('Hello world', []);
       return () => {};
     });
     const { data } = await collectSSE(app, { message: 'hi', chat_id: 'test-chat', stream: true });
@@ -454,7 +485,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   // T3: ends with [DONE]
   it('T3: stream ends with [DONE]', async () => {
     const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
-      cb.onDone('done');
+      cb.onDone('done', []);
       return () => {};
     });
     const { data } = await collectSSE(app, { message: 'hi', chat_id: 'test-chat', stream: true });
@@ -462,23 +493,37 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   });
 
   // T4: no message returns 400 JSON
-  it('T4: stream with no message returns 400 JSON', async () => {
+  it('T4: stream with no message and no media_files returns 400 JSON', async () => {
     const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
-      cb.onDone('ok');
+      cb.onDone('ok', []);
       return () => {};
     });
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
-      .send({ stream: true });
+      .send({ chat_id: 'test-chat', stream: true });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/message is required/i);
+  });
+
+  // T4b: stream + image-only (no message) returns 200 SSE
+  it('T4b: stream with image-only (no message) returns 200', async () => {
+    const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
+      cb.onDone('Saw the image.', []);
+      return () => {};
+    });
+    const { status } = await collectSSE(app, {
+      chat_id: 'test-chat',
+      stream: true,
+      media_files: ['ui-upload/abc/test.jpg'],
+    });
+    expect(status).toBe(200);
   });
 
   // T5: conflict returns 409 JSON
   it('T5: stream conflict returns 409 JSON', async () => {
     const { app, runner } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
-      cb.onDone('ok');
+      cb.onDone('ok', []);
       return () => {};
     });
     runner.markSessionActive('conflict-session');
@@ -506,7 +551,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
 
   // T7: stream=false still works (regression)
   it('T7: stream=false returns existing JSON behavior', async () => {
-    const app = buildApp(async () => 'Hello!');
+    const app = buildApp(async () => ({ text: 'Hello!', attachments: [] }));
     const res = await supertest.default(app)
       .post(POST_URL)
       .set(AUTH)
@@ -564,13 +609,62 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     expect(cleanupCalled).toBe(true);
   }, 10000);
 
+  // T8b: onDone fires after SSE client disconnects — no crash, router stays stable
+  it('T8b: onDone fires after SSE client disconnects — no crash', async () => {
+    let onDoneCalled = false;
+    let savedCallbacks: StreamCallbacks | undefined;
+
+    const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
+      savedCallbacks = cb;
+      cb.onChunk({ type: 'text_delta', text: 'partial' });
+      // Disconnect handler: simulate Claude finishing after client leaves
+      return () => {
+        setTimeout(() => {
+          savedCallbacks!.onDone('full response after disconnect', []);
+          onDoneCalled = true;
+        }, 50);
+      };
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const server = app.listen(0, () => {
+        const addr = server.address() as { port: number };
+        const reqBody = JSON.stringify({ message: 'hi', chat_id: 'test-chat', stream: true });
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: addr.port,
+            path: POST_URL,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer sk-test-app',
+              'Content-Length': Buffer.byteLength(reqBody),
+            },
+          },
+          (res) => {
+            res.once('data', () => { res.destroy(); });
+          },
+        );
+        req.on('error', () => {});
+        req.write(reqBody);
+        req.end();
+        setTimeout(() => { server.close(); resolve(); }, 500);
+      });
+      server.on('error', reject);
+    });
+
+    await new Promise(r => setTimeout(r, 200));
+    expect(onDoneCalled).toBe(true);
+  }, 10000);
+
   // T-ALLOW-TOOLS-1: key with allow_tools=true passes allowTools=true to runner
   it('T-ALLOW-TOOLS-1: key with allow_tools=true passes allowTools=true to runner', async () => {
     let capturedOpts: { timeoutMs: number; allowTools?: boolean } | undefined;
-    const runner = new MockAgentRunner(async () => 'ok');
+    const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
     runner.sendApiMessageStream = async (sid, chatId, msg, cbs, opts) => {
       capturedOpts = opts as { timeoutMs: number; allowTools?: boolean };
-      cbs.onDone('done');
+      cbs.onDone('done', []);
       return () => {};
     };
 
@@ -589,10 +683,10 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   // T-ALLOW-TOOLS-2: key without allow_tools passes allowTools=false to runner
   it('T-ALLOW-TOOLS-2: key without allow_tools passes allowTools=false to runner', async () => {
     let capturedOpts: { timeoutMs: number; allowTools?: boolean } | undefined;
-    const runner = new MockAgentRunner(async () => 'ok');
+    const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
     runner.sendApiMessageStream = async (sid, chatId, msg, cbs, opts) => {
       capturedOpts = opts as { timeoutMs: number; allowTools?: boolean };
-      cbs.onDone('done');
+      cbs.onDone('done', []);
       return () => {};
     };
 
@@ -610,10 +704,10 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   // T-ALLOW-TOOLS-3: timeout_ms forwarded to runner
   it('T-ALLOW-TOOLS-3: custom timeout_ms is forwarded to runner', async () => {
     let capturedOpts: { timeoutMs: number; allowTools?: boolean } | undefined;
-    const runner = new MockAgentRunner(async () => 'ok');
+    const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
     runner.sendApiMessageStream = async (sid, chatId, msg, cbs, opts) => {
       capturedOpts = opts as { timeoutMs: number; allowTools?: boolean };
-      cbs.onDone('done');
+      cbs.onDone('done', []);
       return () => {};
     };
 
@@ -631,10 +725,10 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
   // T-ALLOW-TOOLS-4: timeout_ms over max is clamped to default (60000)
   it('T-ALLOW-TOOLS-4: timeout_ms over max is clamped to default', async () => {
     let capturedOpts: { timeoutMs: number } | undefined;
-    const runner = new MockAgentRunner(async () => 'ok');
+    const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
     runner.sendApiMessageStream = async (sid, chatId, msg, cbs, opts) => {
       capturedOpts = opts as { timeoutMs: number };
-      cbs.onDone('done');
+      cbs.onDone('done', []);
       return () => {};
     };
 
@@ -654,7 +748,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     let capturedAllowTools: boolean | undefined;
     const runner = new MockAgentRunner(async (_sid, _chatId, _msg, opts) => {
       capturedAllowTools = opts?.allowTools;
-      return 'ok';
+      return { text: 'ok', attachments: [] };
     });
     const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
     const configs = new Map([[AGENT_ID, agentConfig]]);
@@ -676,7 +770,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     let capturedAllowTools: boolean | undefined;
     const runner = new MockAgentRunner(async (_sid, _chatId, _msg, opts) => {
       capturedAllowTools = opts?.allowTools;
-      return 'ok';
+      return { text: 'ok', attachments: [] };
     });
     const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
     const configs = new Map([[AGENT_ID, agentConfig]]);
@@ -698,7 +792,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
     const { app } = buildStreamApp(async (_sid, _chatId, _msg, cb) => {
       cb.onChunk({ type: 'text_delta', text: 'fast' });
       cb.onChunk({ type: 'text_delta', text: ' response' });
-      cb.onDone('fast response');
+      cb.onDone('fast response', []);
       return () => {};
     });
     const { status, headers, data } = await collectSSE(app, { message: 'hi', chat_id: 'test-chat', stream: true });

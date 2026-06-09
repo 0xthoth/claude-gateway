@@ -4,7 +4,7 @@ import * as fsPromises from 'fs/promises';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent } from '../types';
+import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess } from '../session/process';
 import { SessionStore, SessionNotInIndexError } from '../session/store';
@@ -25,10 +25,11 @@ const DEFAULT_MAX_CONCURRENT = 20;
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 
 export const DEFAULT_MODELS: ModelConfig[] = [
-  { id: 'claude-opus-4-7', label: 'Opus 4.7', alias: 'opus', contextWindow: 1000000 },
-  { id: 'claude-opus-4-6', label: 'Opus 4.6', alias: 'opus46', contextWindow: 1000000 },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku', contextWindow: 200000 },
+  { id: 'claude-opus-4-8',          label: 'Opus 4.8',   alias: 'opus',   contextWindow: 1000000 },
+  { id: 'claude-opus-4-7',          label: 'Opus 4.7',   alias: 'opus47', contextWindow: 1000000 },
+  { id: 'claude-opus-4-6',          label: 'Opus 4.6',   alias: 'opus46', contextWindow: 1000000 },
+  { id: 'claude-sonnet-4-6',        label: 'Sonnet 4.6', alias: 'sonnet', contextWindow: 1000000 },
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5', alias: 'haiku',  contextWindow: 200000 },
 ];
 
 const PROTECTED_WORKSPACE_FILES = [
@@ -117,6 +118,9 @@ export class AgentRunner extends EventEmitter {
 
   // Tracks pending Telegram image paths per chatId (queue) for size accumulation after each turn.
   private readonly pendingImagePaths = new Map<string, string[]>();
+
+  // Buffers attachment file paths registered via api_reply tool for the current API session turn.
+  private readonly pendingApiAttachments = new Map<string, string[]>();
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
@@ -680,6 +684,7 @@ export class AgentRunner extends EventEmitter {
       if (idleEntry) {
         await idleEntry[1].stop();
         this.sessions.delete(idleEntry[0]);
+        this.cleanupApiSessionMediaDir(idleEntry[0], idleEntry[1].source);
         this.logger.info('Evicted idle session', { sessionId: idleEntry[0] });
       } else {
         throw new Error(`Session pool full: ${this.maxConcurrent} concurrent sessions`);
@@ -797,7 +802,11 @@ export class AgentRunner extends EventEmitter {
             // sending a duplicate message to the channel.
             // Skip forwarding when session is in query mode (internal image summary request).
             const resultText = typeof obj['result'] === 'string' ? obj['result'] : '';
-            if (resultText.trim() && !proc.queryMode && !replyCalled) {
+            // Suppress the corrupted-thinking 400: the session auto-respawns to recover,
+            // so the raw API error must not reach the user's chat or the history DB.
+            const isThinkingCorruption =
+              obj['is_error'] === true && SessionProcess.isThinkingCorruptionError(resultText);
+            if (resultText.trim() && !proc.queryMode && !replyCalled && !isThinkingCorruption) {
               const text = resultText.trim();
               const channelSrcForResult = this.channelSourceMap.get(mapKey) ?? 'telegram';
               // Persist assistant reply to permanent history DB
@@ -1242,6 +1251,7 @@ export class AgentRunner extends EventEmitter {
           this.logger.info('Stopping idle session', { sessionId: id });
           await proc.stop();
           this.sessions.delete(id);
+          this.cleanupApiSessionMediaDir(id, proc.source);
         }
       }
     }, 5 * 60 * 1000);
@@ -1325,8 +1335,12 @@ export class AgentRunner extends EventEmitter {
     }
     this.cancelCleanup?.();
     this.cancelCleanup = null;
-    this.callbackServer?.close();
-    this.callbackServer = null;
+    if (this.callbackServer) {
+      const srv = this.callbackServer;
+      this.callbackServer = null;
+      srv.closeAllConnections?.();
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    }
     this.receiver?.stop();
     this.discordReceiver?.stop();
     await Promise.all([...this.sessions.values()].map((s) => s.stop()));
@@ -1377,7 +1391,7 @@ export class AgentRunner extends EventEmitter {
     chatId: string,
     message: string,
     opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
-  ): Promise<string> {
+  ): Promise<{ text: string; attachments: ApiAttachment[] }> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
         new Error(`Session ${sessionId} already has a pending request`),
@@ -1457,7 +1471,7 @@ export class AgentRunner extends EventEmitter {
       `</channel>` +
       (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
 
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<{ text: string; attachments: ApiAttachment[] }>((resolve, reject) => {
       const buffer: string[] = [];
       let quietTimer: ReturnType<typeof setTimeout> | undefined;
       // Track partial message text for delta computation (--include-partial-messages)
@@ -1465,6 +1479,7 @@ export class AgentRunner extends EventEmitter {
 
       const done = (result: string) => {
         cleanup();
+        const attachments = this.popApiAttachments(sessionId);
         // Persist assistant reply
         if (result.trim()) {
           const apiAssistantTs = Date.now();
@@ -1484,7 +1499,7 @@ export class AgentRunner extends EventEmitter {
             ts: apiAssistantTs,
           });
         }
-        resolve(result.trim());
+        resolve({ text: result.trim(), attachments });
       };
 
       const fail = (err: Error) => {
@@ -1564,8 +1579,8 @@ export class AgentRunner extends EventEmitter {
   /**
    * Send a message to an API session and stream back events via callbacks.
    *
-   * Returns a cleanup function that removes all listeners and frees the session slot.
-   * The caller MUST invoke cleanup on client disconnect or when done.
+   * Returns a disconnect handler for the caller to wire to the SSE close event.
+   * On client disconnect the stream continues server-side until the result is saved to DB.
    */
   async sendApiMessageStream(
     sessionId: string,
@@ -1573,7 +1588,7 @@ export class AgentRunner extends EventEmitter {
     message: string,
     callbacks: {
       onChunk: (event: StreamEvent) => void;
-      onDone: (fullText: string) => void;
+      onDone: (fullText: string, attachments: ApiAttachment[]) => void;
       onError: (err: Error) => void;
     },
     opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
@@ -1627,6 +1642,7 @@ export class AgentRunner extends EventEmitter {
 
     const buffer: string[] = [];
     let settled = false;
+    let clientGone = false;
     // Track partial message text for delta computation (--include-partial-messages)
     let lastPartialText = '';
     // Accumulate tool_use blocks from stream_event (content_block_start → delta → stop)
@@ -1636,7 +1652,8 @@ export class AgentRunner extends EventEmitter {
       if (settled) return;
       settled = true;
       cleanup();
-      // Persist assistant reply
+      const attachments = this.popApiAttachments(sessionId);
+      // Persist assistant reply regardless of whether the SSE client is still connected
       if (result.trim()) {
         const streamAssistantTs = Date.now();
         this.sessionStore
@@ -1655,7 +1672,7 @@ export class AgentRunner extends EventEmitter {
           ts: streamAssistantTs,
         });
       }
-      callbacks.onDone(result.trim());
+      callbacks.onDone(result.trim(), attachments);
     };
 
     const fail = (err: Error) => {
@@ -1670,6 +1687,10 @@ export class AgentRunner extends EventEmitter {
       session.off('output', onOutput);
       this.pendingApiSessions.delete(sessionId);
     };
+
+    // Called when the SSE client disconnects. Marks clientGone so SSE writes
+    // fail silently, but keeps onOutput listening so the result is still saved to DB.
+    const onClientDisconnect = () => { clientGone = true; };
 
     const onOutput = (line: string) => {
       try {
@@ -1687,7 +1708,7 @@ export class AgentRunner extends EventEmitter {
             if (fullText.length > lastPartialText.length) {
               const delta = fullText.slice(lastPartialText.length);
               buffer.push(delta);
-              callbacks.onChunk({ type: 'text_delta', text: delta });
+              if (!clientGone) callbacks.onChunk({ type: 'text_delta', text: delta });
             }
             lastPartialText = fullText;
             // Emit tool_use with full input from final assistant message content.
@@ -1710,16 +1731,16 @@ export class AgentRunner extends EventEmitter {
           const text = (obj['text'] as string) ?? '';
           if (text) {
             buffer.push(text);
-            callbacks.onChunk({ type: 'text_delta', text });
+            if (!clientGone) callbacks.onChunk({ type: 'text_delta', text });
           }
         }
 
         // stream_event from --output-format stream-json (tool_use + text_delta)
-        this._applyStreamEvent(obj, toolBlocks, callbacks.onChunk, (text) => {
+        this._applyStreamEvent(obj, toolBlocks, clientGone ? () => {} : callbacks.onChunk, (text) => {
           buffer.push(text);
           // Update lastPartialText so the final 'assistant' message won't re-send the full text
           lastPartialText += text;
-          callbacks.onChunk({ type: 'text_delta', text });
+          if (!clientGone) callbacks.onChunk({ type: 'text_delta', text });
         });
 
         // Text from delta field (other formats)
@@ -1727,13 +1748,13 @@ export class AgentRunner extends EventEmitter {
           const deltaText = (obj['delta'] as Record<string, unknown> | undefined)?.['text'] as string | undefined;
           if (deltaText) {
             buffer.push(deltaText);
-            callbacks.onChunk({ type: 'text_delta', text: deltaText });
+            if (!clientGone) callbacks.onChunk({ type: 'text_delta', text: deltaText });
           }
         }
 
         // Thinking
         if (obj['type'] === 'thinking') {
-          callbacks.onChunk({
+          if (!clientGone) callbacks.onChunk({
             type: 'thinking',
             text: (obj['text'] as string) ?? '',
           });
@@ -1789,13 +1810,7 @@ export class AgentRunner extends EventEmitter {
     session.setProcessing(true);
     session.sendMessage(channelXml);
 
-    // Return cleanup function for client disconnect
-    return () => {
-      if (!settled) {
-        settled = true;
-        cleanup();
-      }
-    };
+    return onClientDisconnect;
   }
 
   /**
@@ -1803,6 +1818,44 @@ export class AgentRunner extends EventEmitter {
    */
   hasActiveApiSession(sessionId: string): boolean {
     return this.pendingApiSessions.has(sessionId);
+  }
+
+  /**
+   * Register file paths as attachments for the current API session turn.
+   * Called by the api_reply MCP tool via the attachments endpoint.
+   * Files must be absolute paths within the agent's media directory.
+   */
+  addApiAttachments(sessionId: string, filePaths: string[]): void {
+    const existing = this.pendingApiAttachments.get(sessionId) ?? [];
+    this.pendingApiAttachments.set(sessionId, [...existing, ...filePaths]);
+  }
+
+  /**
+   * Pop and return buffered attachment paths for a session, then clear the buffer.
+   * Converts absolute paths to relative media URLs for the API response.
+   */
+  popApiAttachments(sessionId: string): ApiAttachment[] {
+    const paths = this.pendingApiAttachments.get(sessionId) ?? [];
+    this.pendingApiAttachments.delete(sessionId);
+    const mediaRoot = path.join(this.agentsBaseDir, this.agentConfig.id, 'media') + path.sep;
+    return paths
+      .map((absPath): ApiAttachment | null => {
+        if (!absPath.startsWith(mediaRoot)) return null;
+        if (!fs.existsSync(absPath)) return null;
+        const rel = absPath.slice(mediaRoot.length).replace(/\\/g, '/');
+        return { type: 'image', url: `/v1/agents/${encodeURIComponent(this.agentConfig.id)}/media/${rel}` };
+      })
+      .filter((a): a is ApiAttachment => a !== null);
+  }
+
+  private cleanupApiSessionMediaDir(sessionId: string, source: string): void {
+    if (source !== 'api') return;
+    const mediaDir = path.join(this.agentsBaseDir, this.agentConfig.id, 'media', `api-${sessionId}`);
+    try {
+      fs.rmSync(mediaDir, { recursive: true, force: true });
+    } catch {
+      // best-effort — log nothing, just don't crash the cleaner
+    }
   }
 
   getAgentsBaseDir(): string {
@@ -1914,8 +1967,21 @@ export class AgentRunner extends EventEmitter {
   }
 
   async createApiSession(chatId: string, prompt?: string, name?: string): Promise<import('../types').SessionMeta> {
-    let sessionName = name;
-    if (!sessionName && prompt) {
+    const sessionName = name ?? (prompt
+      ? (prompt.length > 60 ? `${prompt.slice(0, 60)}...` : prompt)
+      : undefined);
+
+    const meta = await this.sessionStore.createTelegramSession(this.agentConfig.id, chatId, sessionName, 'api');
+
+    if (!name && prompt) {
+      this.generateSessionNameInBackground(chatId, meta.id, prompt);
+    }
+
+    return meta;
+  }
+
+  private generateSessionNameInBackground(chatId: string, sessionId: string, prompt: string): void {
+    (async () => {
       try {
         const { execFile } = await import('child_process');
         const { promisify } = await import('util');
@@ -1926,12 +1992,14 @@ export class AgentRunner extends EventEmitter {
           ['-p', titlePrompt, '--output-format', 'text', '--model', 'claude-haiku-4-5-20251001'],
           { timeout: 15000, encoding: 'utf-8' },
         );
-        sessionName = stdout.trim().slice(0, 60) || undefined;
-      } catch {
-        sessionName = undefined;
+        const aiName = stdout.trim().slice(0, 60) || undefined;
+        if (aiName) {
+          await this.sessionStore.updateSessionMeta(this.agentConfig.id, chatId, sessionId, { name: aiName }, 'api');
+        }
+      } catch (err) {
+        this.logger.warn('Background session name generation failed', { sessionId, error: (err as Error).message });
       }
-    }
-    return this.sessionStore.createTelegramSession(this.agentConfig.id, chatId, sessionName, 'api');
+    })();
   }
 
   async getApiSessionInfo(chatId: string, sessionId: string): Promise<Record<string, unknown> | null> {
@@ -2019,6 +2087,7 @@ export class AgentRunner extends EventEmitter {
 
     const buffer: string[] = [];
     let settled = false;
+    let clientGone = false;
     let lastPartialText = '';
     const toolBlocks = new Map<number, { id: string; name: string; chunks: string[] }>();
 
@@ -2059,6 +2128,8 @@ export class AgentRunner extends EventEmitter {
       session.off('output', onOutput);
     };
 
+    const onClientDisconnect = () => { clientGone = true; };
+
     const onOutput = (line: string) => {
       try {
         const obj = JSON.parse(line) as Record<string, unknown>;
@@ -2072,21 +2143,21 @@ export class AgentRunner extends EventEmitter {
             if (fullText.length > lastPartialText.length) {
               const delta = fullText.slice(lastPartialText.length);
               buffer.push(delta);
-              callbacks.onChunk({ type: 'text_delta', text: delta });
+              if (!clientGone) callbacks.onChunk({ type: 'text_delta', text: delta });
             }
             lastPartialText = fullText;
           }
         }
         if (obj['type'] === 'text') {
           const text = (obj['text'] as string) ?? '';
-          if (text) { buffer.push(text); callbacks.onChunk({ type: 'text_delta', text }); }
+          if (text) { buffer.push(text); if (!clientGone) callbacks.onChunk({ type: 'text_delta', text }); }
         }
         // stream_event from --output-format stream-json (tool_use + text_delta)
-        this._applyStreamEvent(obj, toolBlocks, callbacks.onChunk, (text) => {
+        this._applyStreamEvent(obj, toolBlocks, clientGone ? () => {} : callbacks.onChunk, (text) => {
           buffer.push(text);
           // Update lastPartialText so the final 'assistant' message won't re-send the full text
           lastPartialText += text;
-          callbacks.onChunk({ type: 'text_delta', text });
+          if (!clientGone) callbacks.onChunk({ type: 'text_delta', text });
         });
         if (obj['type'] === 'result') {
           session.setProcessing(false);
@@ -2111,9 +2182,7 @@ export class AgentRunner extends EventEmitter {
     session.setProcessing(true);
     session.sendMessage(channelXml);
 
-    return () => {
-      if (!settled) { settled = true; cleanup(); }
-    };
+    return onClientDisconnect;
   }
 
   private _applyStreamEvent(

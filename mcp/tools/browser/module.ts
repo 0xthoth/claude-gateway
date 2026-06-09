@@ -24,16 +24,39 @@ export class BrowserModule implements ToolModule {
 
     const result = await callGetpodBrowser(name, args);
 
+    if (name === 'browser_create_session' && !result.isError) {
+      const textBlock = result.content[0] as { type: string; text: string } | undefined;
+      if (textBlock?.type === 'text') {
+        try {
+          const parsed = JSON.parse(textBlock.text) as Record<string, unknown>;
+          delete parsed['stream_url'];
+          return { content: [{ type: 'text', text: JSON.stringify(parsed) }] };
+        } catch {
+          // return as-is if parsing fails
+        }
+      }
+    }
+
     if (name === 'browser_screenshot' && !result.isError) {
       // getpod-browser returns {type:"image", data: base64, mimeType:"image/jpeg"}.
-      // Decode and save to /tmp so callers can attach the file path directly.
+      // Always return the absolute file path — callers use api_reply(files=[path])
+      // and the gateway converts the path to an attachment URL in the response.
       const block = result.content[0] as Record<string, string> | undefined;
       const b64 = block?.['data'] ?? '';
       const mime = block?.['mimeType'] ?? 'image/jpeg';
       if (b64) {
         const ext = mime.includes('png') ? 'png' : 'jpg';
         const sid = (args.session_id as string | undefined) ?? 'default';
-        const filePath = path.join('/tmp', `browser_shot_${sid}.${ext}`);
+        const mediaDir = process.env.GATEWAY_SESSION_MEDIA_DIR;
+        let filePath: string;
+        if (mediaDir) {
+          fs.mkdirSync(mediaDir, { recursive: true });
+          const filename = `browser_shot_${sid}_${Date.now()}.${ext}`;
+          filePath = path.join(mediaDir, filename);
+          fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
+          return { content: [{ type: 'text', text: filePath }] };
+        }
+        filePath = path.join('/tmp', `browser_shot_${sid}.${ext}`);
         fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
         return { content: [{ type: 'text', text: filePath }] };
       }
@@ -136,9 +159,7 @@ async function callGetpodBrowser(
 const browserToolDefs: McpToolDefinition[] = [
   {
     name: 'browser_create_session',
-    description:
-      'Create or resume a browser session. Returns stream_url and status. ' +
-      'IMPORTANT: After creating a session, always share the stream_url with the user so they can open the browser in their client.',
+    description: 'Create or resume a browser session. Returns session status.',
     inputSchema: {
       type: 'object',
       properties: {

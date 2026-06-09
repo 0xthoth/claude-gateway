@@ -17,6 +17,9 @@ import {
 const MAX_HISTORY_MESSAGES = 50;
 const AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_RESTARTS = 3;
+// Bound how many times a single session may auto-respawn to recover from a
+// corrupted thinking block, so a recovery that never helps can't loop forever.
+const MAX_THINKING_RECOVERIES = 2;
 const CHANNELS_ACTIVATION_PROMPT =
   'Channels mode is active. Wait for incoming messages from your channels and respond to them.';
 
@@ -42,6 +45,7 @@ export class SessionProcess extends EventEmitter {
   private readonly configPath: string;
   private readonly restartSignalPath: string;
   queryMode = false;
+  private thinkingRecoveryCount = 0;
   private _queryResolve?: (text: string) => void;
   private _queryBuffer = '';
   private _queryTimer?: ReturnType<typeof setTimeout>;
@@ -260,12 +264,18 @@ export class SessionProcess extends EventEmitter {
             DISCORD_DM_POLICY: this.agentConfig.discord?.dmPolicy ?? 'disabled',
             DISCORD_DM_ALLOWLIST: (this.agentConfig.discord?.dmAllowlist ?? []).join(','),
             GATEWAY_AGENT_ID: this.agentConfig.id,
+            // Must be the base URL without /api suffix (e.g. http://127.0.0.1:10850).
+            // MCP tools append /api/v1/... themselves — a trailing /api here causes double-prefix 404s.
             GATEWAY_API_URL: process.env.GATEWAY_API_URL ?? `http://127.0.0.1:${process.env.PORT ?? '10850'}`,
             GATEWAY_API_KEY: this.findApiKeyForAgent(this.agentConfig.id),
             GATEWAY_ORIGIN_CHANNEL: this.source,
             GATEWAY_WORKSPACE_DIR: this.agentConfig.workspace,
             GATEWAY_SHARED_SKILLS_DIR: path.join(os.homedir(), '.claude-gateway', 'shared-skills'),
             GATEWAY_SESSION_ID: this.sessionId,
+            // For API sessions: absolute path to session media dir so browser screenshots land there
+            GATEWAY_SESSION_MEDIA_DIR: this.source === 'api'
+              ? path.resolve(this.agentConfig.workspace, '..', 'media', `api-${this.sessionId}`)
+              : '',
           },
         },
       },
@@ -284,7 +294,12 @@ export class SessionProcess extends EventEmitter {
   private findApiKeyForAgent(agentId: string): string {
     const keys = this.gatewayConfig.gateway.api?.keys;
     if (!keys?.length) return '';
-    const match = keys.find(k => k.agents === '*' || (Array.isArray(k.agents) && k.agents.includes(agentId)));
+    // Prefer a key scoped to this agent; fall back to wildcard or admin key.
+    const match = keys.find(k =>
+      (Array.isArray(k.agents) && k.agents.includes(agentId)) ||
+      k.agents === '*' ||
+      k.admin
+    );
     return match?.key ?? '';
   }
 
@@ -516,6 +531,17 @@ export class SessionProcess extends EventEmitter {
           if (obj.type === 'result') {
             lastPartialText = ''; // reset for next turn
             writeStatus(obj.is_error ? 'error' : 'done');
+            // A clean turn means the in-memory history is healthy again — refill the budget.
+            if (!obj.is_error) this.thinkingRecoveryCount = 0;
+            // A previous turn's thinking block was corrupted (e.g. interrupted mid-stream),
+            // and Claude Code keeps replaying it from in-memory history → every turn 400s.
+            // Detect strictly on the failed result's error text (not assistant deltas) so an
+            // agent merely discussing the error phrase can never trigger a spurious respawn.
+            const corruptedThinking =
+              this.source !== 'api' &&
+              !this.queryMode &&
+              obj.is_error === true &&
+              SessionProcess.isThinkingCorruptionError(typeof obj.result === 'string' ? obj.result : '');
             if (this.queryMode) {
               if (this._queryTimer) clearTimeout(this._queryTimer);
               if (!this._querySettled) {
@@ -527,6 +553,12 @@ export class SessionProcess extends EventEmitter {
               }
               this._queryBuffer = '';
               assistantBuffer = '';
+            } else if (corruptedThinking) {
+              // Don't persist the 400 API error text as an assistant message — respawn
+              // to reload clean text-only history and break the loop.
+              assistantBuffer = '';
+              lastMessageStartContext = 0;
+              this.recoverFromCorruptedThinking();
             } else {
               if (assistantBuffer.trim()) {
                 // For non-API sessions (Telegram/Discord), persist here via appendTelegramMessage.
@@ -596,6 +628,41 @@ export class SessionProcess extends EventEmitter {
         );
       }
     }, AUTO_RESTART_DELAY_MS);
+  }
+
+  /**
+   * Detect the Anthropic API 400 raised when a previously-emitted thinking block
+   * is sent back altered. Match the full API signature (not loose keywords) so it
+   * only fires on the genuine error text, never on prose that mentions thinking blocks.
+   * Callers must gate this on a failed result (is_error === true).
+   */
+  static isThinkingCorruptionError(errorText: string): boolean {
+    return errorText.includes('blocks in the latest assistant message cannot be modified');
+  }
+
+  /**
+   * Recover from a corrupted thinking block by respawning the subprocess.
+   * The gateway stores history as plain text, so buildInitialPrompt() reloads a
+   * thinking-block-free prompt on respawn — clearing the offending in-memory turn
+   * that Claude Code was replaying on every request.
+   */
+  private recoverFromCorruptedThinking(): void {
+    if (this.restartRequested || this.stopping) return; // already respawning
+    if (this.thinkingRecoveryCount >= MAX_THINKING_RECOVERIES) {
+      this.logger.error('Thinking-block recovery limit reached — not respawning again', {
+        sessionId: this.sessionId,
+      });
+      return;
+    }
+    this.thinkingRecoveryCount++;
+    this.logger.warn('Corrupted thinking block detected (400) — respawning to restore clean history', {
+      sessionId: this.sessionId,
+      attempt: this.thinkingRecoveryCount,
+    });
+    // Reuse graceful-restart semantics so the respawn doesn't count as a crash.
+    this.restartRequested = true;
+    this.setProcessing(false);
+    if (this.process) this.process.kill('SIGTERM');
   }
 
   sendMessage(text: string): void {
@@ -712,12 +779,18 @@ export class SessionProcess extends EventEmitter {
 
     return new Promise((resolve) => {
       const proc = this.process!;
+      let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
       proc.once('exit', () => {
+        if (forceKillTimer !== null) {
+          clearTimeout(forceKillTimer);
+          forceKillTimer = null;
+        }
         this.process = null;
         resolve();
       });
       proc.kill('SIGTERM');
-      setTimeout(() => {
+      forceKillTimer = setTimeout(() => {
+        forceKillTimer = null;
         if (this.process) proc.kill('SIGKILL');
       }, 10_000);
     });

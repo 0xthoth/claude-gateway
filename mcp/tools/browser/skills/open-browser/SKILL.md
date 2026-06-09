@@ -1,12 +1,12 @@
 ---
 name: open-browser
-description: "Open a URL in the agent's persistent browser session via MCP browser tools"
+description: "ALWAYS invoke this skill when user says 'browser [site]', 'open [site]', or asks to navigate to a website. Never call MCP browser tools directly."
 user-invocable: true
 ---
 
 # open-browser
 
-When user says "เปิด X", "navigate to X", "open X in browser", "switch to tab X", etc.
+When user says "open X in browser", "navigate to X", "open chrome", "browser to X", "switch to tab X", etc.
 
 ## Rules
 
@@ -21,13 +21,9 @@ When user says "เปิด X", "navigate to X", "open X in browser", "switch t
 
 Call `mcp__gateway__browser_create_session` with NO arguments (session_id is auto-injected).
 
-Result contains `stream_url` — use it to build the browser URL for the user.
+Result contains session status only.
 
-### Step 2 — Send browser URL to user IMMEDIATELY (no waiting)
-
-Reply on Telegram right away with the stream_url so the user can open the browser.
-
-### Step 3 — Check current tabs
+### Step 2 — Check current tabs
 
 Call `mcp__gateway__browser_tabs` — returns list of `{tab_id, url, title}`.
 
@@ -57,9 +53,15 @@ If `browser_navigate` or `browser_navigate_tab` returns error like `tab "t99" no
 
 ### Step 5 — Screenshot and confirm
 
-Call `mcp__gateway__browser_screenshot` — result is absolute file path.
+Call `mcp__gateway__browser_screenshot` → `result` is an **absolute file path**.
 
-Send to Telegram with the screenshot attached.
+Detect channel: `api_reply` tool available = API session; `telegram_reply` tool available = Telegram session.
+
+| Channel | Action |
+|---------|--------|
+| API | `api_reply(files=[result])` — caller receives it as an attachment with a URL |
+| Telegram | `telegram_reply(files=[result])` |
+| Other | include path in text response |
 
 ## Multi-tab Management
 

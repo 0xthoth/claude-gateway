@@ -281,11 +281,11 @@ export function createApiRouter(
     };
     const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message } = body;
 
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      res.status(400).json({ error: 'message is required and must be a non-empty string' });
+    if (message !== undefined && typeof message !== 'string') {
+      res.status(400).json({ error: 'message must be a string if provided' });
       return;
     }
-    if (message.length > MAX_MESSAGE_LENGTH) {
+    if (typeof message === 'string' && message.length > MAX_MESSAGE_LENGTH) {
       res.status(400).json({ error: `message too long (max ${MAX_MESSAGE_LENGTH} characters)` });
       return;
     }
@@ -326,6 +326,15 @@ export function createApiRouter(
       validatedMediaFiles = media_files as string[];
     }
 
+    // Allow message OR media_files. Image-only sends pass an empty text
+    // alongside the image_path attribute on channelXml so Claude can Read the file.
+    const trimmedMessage = typeof message === 'string' ? message.trim() : '';
+    const hasMedia = !!(validatedMediaFiles && validatedMediaFiles.length);
+    if (!trimmedMessage && !hasMedia) {
+      res.status(400).json({ error: 'message is required and must be a non-empty string (or provide media_files)' });
+      return;
+    }
+
     if (store_user_message !== undefined && typeof store_user_message !== 'boolean') {
       res.status(400).json({ error: 'store_user_message must be a boolean if provided' });
       return;
@@ -348,11 +357,12 @@ export function createApiRouter(
         ? timeout_ms
         : DEFAULT_TIMEOUT_MS;
 
-    // Built-in command dispatch — only intercept known commands, let everything else reach Claude
-    if (AgentRunner.isApiBuiltinCommand(message.trim())) {
+    // Built-in command dispatch — only intercept known commands, let everything else reach Claude.
+    // Image-only sends have an empty trimmedMessage and never match built-in commands.
+    if (trimmedMessage && AgentRunner.isApiBuiltinCommand(trimmedMessage)) {
       try {
-        const result = await runner.executeApiCommand(sessionId, chatIdStr, message.trim());
-        res.json({ command: message.trim(), session_id: sessionId, result });
+        const result = await runner.executeApiCommand(sessionId, chatIdStr, trimmedMessage);
+        res.json({ command: trimmedMessage, session_id: sessionId, result });
       } catch (err: unknown) {
         res.status(500).json({ error: (err as Error).message ?? 'Command failed' });
       }
@@ -361,15 +371,17 @@ export function createApiRouter(
 
     if (stream) {
       // SSE streaming mode
-      let cleanup: (() => void) | undefined;
+      let onClientDisconnect: (() => void) | undefined;
       try {
         const sseCallbacks = {
           onChunk: (event: import('../types').StreamEvent) => {
             try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch { /* client gone */ }
           },
-          onDone: (fullText: string) => {
+          onDone: (fullText: string, attachments: import('../types').ApiAttachment[]) => {
             try {
-              res.write(`data: ${JSON.stringify({ type: 'result', text: fullText, request_id: requestId, session_id: sessionId, duration_ms: Date.now() - startTime })}\n\n`);
+              const resultEvent: Record<string, unknown> = { type: 'result', text: fullText, request_id: requestId, session_id: sessionId, duration_ms: Date.now() - startTime };
+              if (attachments.length) resultEvent['attachments'] = attachments;
+              res.write(`data: ${JSON.stringify(resultEvent)}\n\n`);
               res.write('data: [DONE]\n\n');
               res.end();
             } catch { /* client gone */ }
@@ -399,16 +411,16 @@ export function createApiRouter(
 
         const agentCfg = agentConfigs.get(agentId)!;
         const allowTools = agentCfg.allow_tools ?? !!apiKey.allow_tools;
-        cleanup = await runner.sendApiMessageStream(
+        onClientDisconnect = await runner.sendApiMessageStream(
           sessionId,
           chatIdStr,
-          message.trim(),
+          trimmedMessage,
           sseCallbacks,
           { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage },
         );
 
-        // Client disconnect -> cleanup
-        res.on('close', cleanup);
+        // Client disconnect — marks SSE writes as no-op; stream continues server-side until result is saved to DB
+        res.on('close', onClientDisconnect);
       } catch (err: unknown) {
         const code = (err as { code?: string }).code;
         if (!res.headersSent) {
@@ -429,20 +441,22 @@ export function createApiRouter(
       try {
         const agentCfgSync = agentConfigs.get(agentId)!;
         const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
-        const response = await runner.sendApiMessage(sessionId, chatIdStr, message.trim(), {
+        const { text: responseText, attachments } = await runner.sendApiMessage(sessionId, chatIdStr, trimmedMessage, {
           timeoutMs,
           allowTools: allowToolsSync,
           mediaFiles: validatedMediaFiles,
           model: modelStr,
           skipUserMessage,
         });
-        res.json({
+        const syncResult: Record<string, unknown> = {
           request_id: requestId,
           agent_id: agentId,
-          response,
+          response: responseText,
           session_id: sessionId,
           duration_ms: Date.now() - startTime,
-        });
+        };
+        if (attachments.length) syncResult['attachments'] = attachments;
+        res.json(syncResult);
       } catch (err: unknown) {
         const code = (err as { code?: string }).code;
         if (code === 'TIMEOUT') {
@@ -1599,6 +1613,50 @@ export function createApiRouter(
   });
 
   /**
+   * POST /api/v1/agents/:agentId/sessions/:sessionId/attachments
+   * Register file paths as attachments for the current API session turn.
+   * Called by the api_reply MCP tool from within the agent subprocess.
+   * Body: { files: string[] }  — absolute file paths within the agent's media directory.
+   */
+  router.post(
+    '/v1/agents/:agentId/sessions/:sessionId/attachments',
+    auth,
+    (req: Request, res: Response) => {
+      const { agentId, sessionId } = req.params as { agentId: string; sessionId: string };
+      const apiKey = (req as AuthedRequest).apiKey;
+      if (!canAccessAgent(apiKey, agentId)) {
+        res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+        return;
+      }
+      const runner = agentRunners.get(agentId);
+      if (!runner) {
+        res.status(404).json({ error: `Agent '${agentId}' not found` });
+        return;
+      }
+      const body = req.body as Record<string, unknown>;
+      const files = body['files'];
+      if (!Array.isArray(files) || files.some((f) => typeof f !== 'string')) {
+        res.status(400).json({ error: 'files must be an array of strings' });
+        return;
+      }
+      // Validate all paths stay within the agent's media directory
+      const agentsBaseDir = runner.getAgentsBaseDir();
+      const mediaRoot = path.join(agentsBaseDir, agentId, 'media') + path.sep;
+      const validFiles: string[] = [];
+      for (const f of files as string[]) {
+        const real = path.resolve(f);
+        if (!real.startsWith(mediaRoot)) {
+          res.status(400).json({ error: `File path outside media directory: ${f}` });
+          return;
+        }
+        validFiles.push(real);
+      }
+      runner.addApiAttachments(sessionId, validFiles);
+      res.json({ ok: true, count: validFiles.length });
+    },
+  );
+
+  /**
    * POST /api/v1/agents/:agentId/media
    * Upload a media file as raw binary body (image/* or application/pdf).
    * Headers: Content-Type (mime type), X-Filename (optional original filename)
@@ -1943,10 +2001,19 @@ export function createApiRouter(
   router.get('/v1/agents/:agentId/sessions', auth, async (req: Request, res: Response) => {
     const ctx = resolveApiSession(req, res);
     if (!ctx) return;
-    const { runner, agentId, chatId } = ctx;
+    const { runner, chatId } = ctx;
     try {
       const index = await runner.listApiSessions(chatId);
-      res.json(index);
+      const historySessions = runner.getHistoryDb().listSessions(`api-${chatId}`);
+      const roleMap = new Map(historySessions.map((s) => [s.sessionId, s.lastMessageRole]));
+      const enriched = {
+        ...index,
+        sessions: index.sessions.map((s) => {
+          const lastMessageRole = roleMap.get(s.id) ?? undefined;
+          return lastMessageRole !== undefined ? { ...s, lastMessageRole } : s;
+        }),
+      };
+      res.json(enriched);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -2142,7 +2209,7 @@ export function createApiRouter(
       console.error(`[api] Failed to delete GREETING.md for '${agentId}': ${(e as Error).message}`);
     }
 
-    let cleanup: (() => void) | undefined;
+    let onClientDisconnect: (() => void) | undefined;
     try {
       const sseCallbacks = {
         onChunk: (event: import('../types').StreamEvent) => {
@@ -2161,7 +2228,7 @@ export function createApiRouter(
             res.end();
           } catch { /* client gone */ }
         },
-      };
+      } satisfies Parameters<typeof runner.sendApiMessageStream>[3];
 
       // Preflight conflict check already done above; throw-based check catches races after headers
       res.writeHead(200, {
@@ -2173,7 +2240,7 @@ export function createApiRouter(
       res.flushHeaders();
       res.socket?.setNoDelay(true);
 
-      cleanup = await runner.sendApiMessageStream(
+      onClientDisconnect = await runner.sendApiMessageStream(
         sessionId,
         chatId,
         content,
@@ -2181,7 +2248,7 @@ export function createApiRouter(
         { timeoutMs: DEFAULT_TIMEOUT_MS, skipUserMessage: true },
       );
 
-      res.on('close', cleanup);
+      res.on('close', onClientDisconnect);
     } catch (err: unknown) {
       const code = (err as { code?: string }).code;
       // res.headersSent is always true here (writeHead is called before sendApiMessageStream),
