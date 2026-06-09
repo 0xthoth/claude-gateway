@@ -620,7 +620,7 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
       // Disconnect handler: simulate Claude finishing after client leaves
       return () => {
         setTimeout(() => {
-          savedCallbacks!.onDone('full response after disconnect');
+          savedCallbacks!.onDone('full response after disconnect', []);
           onDoneCalled = true;
         }, 50);
       };
