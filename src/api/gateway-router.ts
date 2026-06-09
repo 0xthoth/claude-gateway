@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import cors from 'cors';
 import * as http from 'node:http';
 import { Server } from 'http';
 import { AgentRunner } from '../agent/runner';
@@ -158,6 +159,20 @@ export class GatewayRouter {
   }
 
   private setupRoutes(): void {
+    const allowedOrigins = this.gatewayConfig?.gateway?.api?.allowedOrigins;
+    if (allowedOrigins?.length) {
+      this.app.use(cors({
+        origin: (origin, callback) => {
+          if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+            callback(null, true);
+          } else {
+            callback(new Error(`CORS: origin '${origin}' not allowed`));
+          }
+        },
+        credentials: true,
+      }));
+    }
+
     this.app.use(express.json());
 
     // Mount API router after body parser so req.body is populated
