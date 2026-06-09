@@ -255,7 +255,9 @@ export class HistoryDB {
     }
   }
 
-  listSessions(): SessionSummary[] {
+  listSessions(chatId?: string): SessionSummary[] {
+    const where = chatId ? 'WHERE m.chat_id = ?' : '';
+    const params = chatId ? [chatId] : [];
     const rows = this.db.prepare(`
       SELECT
         chat_id,
@@ -271,9 +273,10 @@ export class HistoryDB {
          WHERE m3.session_id = m.session_id
          ORDER BY ts DESC LIMIT 1) AS last_message_role
       FROM messages m
+      ${where}
       GROUP BY session_id
       ORDER BY last_activity DESC
-    `).all() as Array<{
+    `).all(...params) as Array<{
       chat_id: string;
       session_id: string;
       source: string;

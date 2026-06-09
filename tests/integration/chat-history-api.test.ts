@@ -506,7 +506,7 @@ describe('Chat History API integration (planning-50)', () => {
     const chatId = `api-${sid}`;
     const port = ((router as unknown as { server: http.Server }).server.address() as { port: number }).port;
 
-    // Stream request — disconnect right after first data arrives, then wait for Claude to finish
+    // Stream request — disconnect right after first data arrives
     await new Promise<void>((resolve) => {
       const reqBody = JSON.stringify({ message: 'disconnect test message', chat_id: sid, session_id: sid, stream: true });
       const req = http.request(
@@ -522,28 +522,30 @@ describe('Chat History API integration (planning-50)', () => {
           },
         },
         (res) => {
-          res.once('data', () => { res.destroy(); });
+          res.once('data', () => { res.destroy(); resolve(); });
         },
       );
       req.on('error', () => {});
       req.write(reqBody);
       req.end();
-      // Allow time for claude to finish processing after disconnect
-      setTimeout(resolve, 600);
     });
 
-    const res = await supertest(router.getApp())
-      .get(`/api/v1/agents/alfred/chats/${chatId}/messages`)
-      .set('X-Api-Key', API_KEY_ADMIN);
+    // Poll until Claude finishes server-side and persists the assistant reply
+    const app = router.getApp();
+    let messages: Array<{ role: string; content: string }> = [];
+    await waitFor(async () => {
+      const res = await supertest(app)
+        .get(`/api/v1/agents/alfred/chats/${chatId}/messages`)
+        .set('X-Api-Key', API_KEY_ADMIN);
+      messages = (res.body.messages as Array<{ role: string; content: string }>) ?? [];
+      return messages.some(m => m.role === 'assistant');
+    }, 10000, 200);
 
-    expect(res.status).toBe(200);
-    const userMsg = (res.body.messages as Array<{ role: string; content: string }>)
-      .find(m => m.role === 'user');
+    const userMsg = messages.find(m => m.role === 'user');
     expect(userMsg).toBeDefined();
     expect(userMsg!.content).toBe('disconnect test message');
 
-    const assistantMsg = (res.body.messages as Array<{ role: string; content: string }>)
-      .find(m => m.role === 'assistant');
+    const assistantMsg = messages.find(m => m.role === 'assistant');
     expect(assistantMsg).toBeDefined();
     expect(assistantMsg!.content).toContain('disconnect test message');
 

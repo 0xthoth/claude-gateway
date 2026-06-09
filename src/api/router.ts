@@ -371,7 +371,7 @@ export function createApiRouter(
 
     if (stream) {
       // SSE streaming mode
-      let cleanup: (() => void) | undefined;
+      let onClientDisconnect: (() => void) | undefined;
       try {
         const sseCallbacks = {
           onChunk: (event: import('../types').StreamEvent) => {
@@ -411,7 +411,7 @@ export function createApiRouter(
 
         const agentCfg = agentConfigs.get(agentId)!;
         const allowTools = agentCfg.allow_tools ?? !!apiKey.allow_tools;
-        cleanup = await runner.sendApiMessageStream(
+        onClientDisconnect = await runner.sendApiMessageStream(
           sessionId,
           chatIdStr,
           trimmedMessage,
@@ -420,7 +420,7 @@ export function createApiRouter(
         );
 
         // Client disconnect — marks SSE writes as no-op; stream continues server-side until result is saved to DB
-        res.on('close', cleanup);
+        res.on('close', onClientDisconnect);
       } catch (err: unknown) {
         const code = (err as { code?: string }).code;
         if (!res.headersSent) {
@@ -2004,18 +2004,14 @@ export function createApiRouter(
     const { runner, chatId } = ctx;
     try {
       const index = await runner.listApiSessions(chatId);
-      const historySessions = runner.getHistoryDb().listSessions();
-      const roleMap = new Map(
-        historySessions
-          .filter((s) => s.chatId === `api-${chatId}`)
-          .map((s) => [s.sessionId, s.lastMessageRole]),
-      );
+      const historySessions = runner.getHistoryDb().listSessions(`api-${chatId}`);
+      const roleMap = new Map(historySessions.map((s) => [s.sessionId, s.lastMessageRole]));
       const enriched = {
         ...index,
-        sessions: index.sessions.map((s) => ({
-          ...s,
-          lastMessageRole: roleMap.get(s.id) ?? null,
-        })),
+        sessions: index.sessions.map((s) => {
+          const lastMessageRole = roleMap.get(s.id) ?? undefined;
+          return lastMessageRole !== undefined ? { ...s, lastMessageRole } : s;
+        }),
       };
       res.json(enriched);
     } catch (err) {
@@ -2213,7 +2209,7 @@ export function createApiRouter(
       console.error(`[api] Failed to delete GREETING.md for '${agentId}': ${(e as Error).message}`);
     }
 
-    let cleanup: (() => void) | undefined;
+    let onClientDisconnect: (() => void) | undefined;
     try {
       const sseCallbacks = {
         onChunk: (event: import('../types').StreamEvent) => {
@@ -2244,7 +2240,7 @@ export function createApiRouter(
       res.flushHeaders();
       res.socket?.setNoDelay(true);
 
-      cleanup = await runner.sendApiMessageStream(
+      onClientDisconnect = await runner.sendApiMessageStream(
         sessionId,
         chatId,
         content,
@@ -2252,7 +2248,7 @@ export function createApiRouter(
         { timeoutMs: DEFAULT_TIMEOUT_MS, skipUserMessage: true },
       );
 
-      res.on('close', cleanup);
+      res.on('close', onClientDisconnect);
     } catch (err: unknown) {
       const code = (err as { code?: string }).code;
       // res.headersSent is always true here (writeHead is called before sendApiMessageStream),
