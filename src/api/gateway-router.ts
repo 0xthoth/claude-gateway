@@ -159,7 +159,8 @@ export class GatewayRouter {
   }
 
   private setupRoutes(): void {
-    const allowedOrigins = this.gatewayConfig?.gateway?.api?.allowedOrigins;
+    const allowedOrigins = this.gatewayConfig?.gateway?.api?.allowedOrigins
+      ?? this.gatewayConfig?.gateway?.api?.cors?.origins;
     if (allowedOrigins?.length) {
       this.app.use(cors({
         origin: (origin, callback) => {

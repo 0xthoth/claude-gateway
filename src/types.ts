@@ -88,6 +88,9 @@ export interface GatewayConfig {
     api?: {
       keys: ApiKey[];
       allowedOrigins?: string[];
+      cors?: {
+        origins?: string[];
+      };
     };
     /** Global history retention/cleanup defaults */
     history?: HistoryConfig & {
