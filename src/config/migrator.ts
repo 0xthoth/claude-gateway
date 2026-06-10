@@ -65,9 +65,23 @@ function deepMerge(
   }
 }
 
+// Per-agent fields that are instance-specific and must never be copied from a
+// template agent into user agents during migration (credentials, identity, paths).
+const AGENT_CREDENTIAL_FIELDS = new Set([
+  'env',
+  'telegram',
+  'discord',
+  'workspace',
+  'avatar',
+  'id',
+  'name',
+  'description',
+]);
+
 /**
  * Merge missing fields from template agent into each user agent.
  * Uses the first agent in the template as the schema source.
+ * Instance-specific fields (credentials, paths, identity) are always excluded.
  */
 function mergeAgentArrays(
   userAgents: Array<Record<string, unknown>>,
@@ -78,7 +92,11 @@ function mergeAgentArrays(
   if (templateAgents.length === 0) return;
   const schema = templateAgents[0];
   for (let i = 0; i < userAgents.length; i++) {
-    deepMerge(userAgents[i], schema, `agents[${i}]`, added, ignorePaths);
+    const agentIgnorePaths = new Set(ignorePaths);
+    for (const field of AGENT_CREDENTIAL_FIELDS) {
+      agentIgnorePaths.add(`agents[${i}].${field}`);
+    }
+    deepMerge(userAgents[i], schema, `agents[${i}]`, added, agentIgnorePaths);
   }
 }
 
@@ -109,6 +127,52 @@ function pruneAgentPaths(
         delete obj[leaf];
         const fullPath = `agents[${i}].${dotPath}`;
         if (!removed.includes(fullPath)) removed.push(fullPath);
+      }
+    }
+  }
+  return removed;
+}
+
+const PLACEHOLDER_RE = /^\$\{[^}]+\}$/;
+// Matches ~/.claude-gateway/agents/<id>/.env — captures the agent id in the path
+const AGENT_ENV_PATH_RE = /[/\\]agents[/\\]([^/\\]+)[/\\]\.env$/;
+
+/**
+ * Remove fields from agents that were incorrectly injected by a prior buggy
+ * migration (where the template agent's credentials leaked into user agents).
+ *
+ * - telegram/discord: removed when botToken is an unresolved ${VAR} placeholder
+ * - env: removed when the path references a different agent's directory
+ *
+ * Returns the list of paths removed.
+ */
+export function repairInjectedAgentFields(
+  agents: Array<Record<string, unknown>>,
+): string[] {
+  const removed: string[] = [];
+  for (let i = 0; i < agents.length; i++) {
+    const agent = agents[i];
+
+    // Remove channel blocks whose botToken is a ${VAR} placeholder
+    for (const channel of ['telegram', 'discord'] as const) {
+      const block = agent[channel];
+      if (
+        block &&
+        typeof block === 'object' &&
+        !Array.isArray(block) &&
+        PLACEHOLDER_RE.test(String((block as Record<string, unknown>).botToken ?? ''))
+      ) {
+        delete agent[channel];
+        removed.push(`agents[${i}].${channel}`);
+      }
+    }
+
+    // Remove env paths that point to a different agent's directory
+    if (typeof agent.env === 'string') {
+      const match = AGENT_ENV_PATH_RE.exec(agent.env);
+      if (match && match[1] !== String(agent.id ?? '')) {
+        delete agent.env;
+        removed.push(`agents[${i}].env`);
       }
     }
   }
@@ -278,6 +342,11 @@ export function detectMigration(
     );
   }
 
+  // Repair credential fields that were incorrectly injected by earlier buggy migrations
+  if (Array.isArray(configClone.agents)) {
+    removed.push(...repairInjectedAgentFields(configClone.agents as Array<Record<string, unknown>>));
+  }
+
   // configVersion will always be updated
   if (!added.includes('configVersion')) {
     added.push('configVersion');
@@ -332,6 +401,11 @@ export function applyMigration(
     removed.push(
       ...pruneAgentPaths(config.agents as Array<Record<string, unknown>>, removePaths),
     );
+  }
+
+  // Repair credential fields that were incorrectly injected by earlier buggy migrations
+  if (Array.isArray(config.agents)) {
+    removed.push(...repairInjectedAgentFields(config.agents as Array<Record<string, unknown>>));
   }
 
   // Update configVersion
@@ -434,4 +508,4 @@ function migrateModels(
 }
 
 // Exported for testing
-export { compareSemver, deepMerge, migrateModels, pruneAgentPaths };
+export { compareSemver, deepMerge, migrateModels, pruneAgentPaths, AGENT_CREDENTIAL_FIELDS };
