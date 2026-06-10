@@ -1899,6 +1899,11 @@ export function createApiRouter(
       return;
     }
 
+    // Update in-memory map immediately — don't wait for the file watcher so the
+    // GET handler can serve the new file before the next config reload fires.
+    const cfg = agentConfigs.get(agentId);
+    if (cfg) cfg.avatar = newFilename;
+
     res.json({ avatarUrl: `/api/v1/agents/${agentId}/avatar` });
   });
 
@@ -1931,6 +1936,10 @@ export function createApiRouter(
       res.status(500).json({ error: `Failed to update config: ${(err as Error).message}` });
       return;
     }
+
+    // Update in-memory map immediately — same reason as PUT handler above.
+    const deleteCfg = agentConfigs.get(agentId);
+    if (deleteCfg) delete deleteCfg.avatar;
 
     res.status(204).send();
   });
