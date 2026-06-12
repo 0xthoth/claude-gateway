@@ -158,6 +158,26 @@ export class GatewayRouter {
   }
 
   private setupRoutes(): void {
+    const allowedOrigins = this.gatewayConfig?.gateway?.api?.cors?.origins;
+    if (allowedOrigins?.length) {
+      const originSet = new Set(allowedOrigins);
+      this.app.use((req, res, next) => {
+        const origin = req.headers.origin;
+        if (origin && originSet.has(origin)) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
+          res.setHeader('Access-Control-Allow-Credentials', 'true');
+          res.setHeader('Access-Control-Max-Age', '86400');
+        }
+        if (req.method === 'OPTIONS') {
+          res.status(204).end();
+          return;
+        }
+        next();
+      });
+    }
+
     this.app.use(express.json());
 
     // Mount API router after body parser so req.body is populated

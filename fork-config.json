@@ -1,0 +1,358 @@
+{
+  "configVersion": "1.0.7",
+  "gateway": {
+    "logDir": "~/.claude-gateway/logs",
+    "timezone": "Asia/Bangkok",
+    "models": [
+      {
+        "id": "claude-fable-5",
+        "label": "Fable 5",
+        "alias": "fable",
+        "contextWindow": 1000000
+      },
+      {
+        "id": "claude-opus-4-8",
+        "label": "Opus 4.8",
+        "alias": "opus",
+        "contextWindow": 1000000
+      },
+      {
+        "id": "claude-opus-4-7",
+        "label": "Opus 4.7",
+        "alias": "opus47",
+        "contextWindow": 1000000,
+        "multiplier": 5
+      },
+      {
+        "id": "claude-opus-4-6",
+        "label": "Opus 4.6",
+        "alias": "opus46",
+        "contextWindow": 1000000,
+        "multiplier": 5
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "label": "Sonnet 4.6",
+        "alias": "sonnet",
+        "contextWindow": 1000000,
+        "multiplier": 1
+      },
+      {
+        "id": "claude-haiku-4-5-20251001",
+        "label": "Haiku 4.5",
+        "alias": "haiku",
+        "contextWindow": 200000,
+        "multiplier": 0.25
+      }
+    ],
+    "api": {
+      "keys": [
+        {
+          "key": "sk-ba9c4e5d60d5f3c5645fdd03d4726077366d73922e6aadbf203f116c987ce595",
+          "description": "GetPod API",
+          "agents": "*",
+          "write": true,
+          "admin": true
+        }
+      ],
+      "cors": {
+        "origins": [
+          "http://localhost:3000",
+          "http://localhost:3001",
+          "https://thoth-tunnel.getpod.ai",
+          "https://expiration-agreement-intent-induced.trycloudflare.com"
+        ]
+      }
+    },
+    "history": {
+      "retentionDays": 60,
+      "cleanupHour": 0,
+      "cleanupTimezone": "UTC"
+    }
+  },
+  "agents": [
+    {
+      "id": "buddy",
+      "description": "Buddy \u2014 in-game companion creature",
+      "workspace": "~/.claude-gateway/agents/buddy/workspace",
+      "env": "",
+      "claude": {
+        "model": "claude-haiku-4-5-20251001",
+        "dangerouslySkipPermissions": true,
+        "extraFlags": []
+      },
+      "session": {
+        "idleTimeoutMinutes": 60,
+        "maxConcurrent": 50
+      },
+      "signatureEmoji": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "sara1",
+      "description": "sara1 agent",
+      "workspace": "~/.claude-gateway/agents/sara1/workspace",
+      "env": "",
+      "telegram": {
+        "botToken": "${SARA1_BOT_TOKEN}"
+      },
+      "claude": {
+        "model": "claude-opus-4-6",
+        "dangerouslySkipPermissions": true,
+        "extraFlags": []
+      },
+      "signatureEmoji": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "allow_tools": true,
+      "history": {
+        "retentionDays": 90
+      },
+      "avatar": "avatar.png"
+    },
+    {
+      "id": "getpod",
+      "description": "GetPod \u2014 default AI assistant for GetPod.ai",
+      "workspace": "~/.claude-gateway/agents/getpod/workspace",
+      "env": "",
+      "claude": {
+        "model": "claude-haiku-4-5-20251001",
+        "dangerouslySkipPermissions": true,
+        "extraFlags": []
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 50
+      },
+      "signatureEmoji": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "allow_tools": true,
+      "history": {
+        "retentionDays": 90
+      },
+      "avatar": "avatar.png",
+      "telegram": {
+        "botToken": "8905957669:AAFbf7AI7mmU_S19NAKeeFTP5k5z0wKlxPE"
+      }
+    },
+    {
+      "id": "qa",
+      "description": "wiki docs",
+      "workspace": "~/.claude-gateway/agents/qa/workspace",
+      "env": "~/.claude-gateway/agents/qa/workspace/.env",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "getpod-qa",
+      "description": "GetPod QA \u2014 QA engineering assistant for the GetPod.ai platform",
+      "workspace": "~/.claude-gateway/agents/getpod-qa/workspace",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": true,
+        "extraFlags": []
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "signatureEmoji": "",
+      "allow_tools": true,
+      "env": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "test-111",
+      "description": "test",
+      "workspace": "~/.claude-gateway/agents/test-111/workspace",
+      "env": "~/.claude-gateway/agents/test-111/workspace/.env",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "coder",
+      "description": "Claude Code \u2014 coding assistant with full tool access",
+      "workspace": "~/.claude-gateway/agents/coder/workspace",
+      "env": "~/.claude-gateway/agents/coder/workspace/.env",
+      "claude": {
+        "model": "claude-opus-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "allow_tools": true,
+      "signatureEmoji": "",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "luffy",
+      "description": "getpod agent",
+      "workspace": "~/.claude-gateway/agents/luffy/workspace",
+      "env": "~/.claude-gateway/agents/luffy/workspace/.env",
+      "claude": {
+        "model": "claude-haiku-4-5-20251001",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "\u2601\ufe0f",
+      "avatar": "avatar.png",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "agent_react",
+      "description": "react developer",
+      "workspace": "~/.claude-gateway/agents/agent_react/workspace",
+      "env": "~/.claude-gateway/agents/agent_react/workspace/.env",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "\u269b\ufe0f",
+      "avatar": "avatar.png",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "chopper",
+      "description": "backend go developer",
+      "workspace": "~/.claude-gateway/agents/chopper/workspace",
+      "env": "~/.claude-gateway/agents/chopper/workspace/.env",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "\ud83e\udd8c",
+      "avatar": "avatar.png",
+      "telegram": {
+        "botToken": "8699512266:AAEUHMD8UC9kVo4HOaWPCerN6kftPIoHyY0"
+      },
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "test",
+      "description": "web develop",
+      "workspace": "~/.claude-gateway/agents/test/workspace",
+      "env": "~/.claude-gateway/agents/test/workspace/.env",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "\ud83c\udf10",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    },
+    {
+      "id": "feedback-me",
+      "description": "know getpod project and get feedback from user",
+      "workspace": "~/.claude-gateway/agents/feedback-me/workspace",
+      "env": "~/.claude-gateway/agents/feedback-me/workspace/.env",
+      "claude": {
+        "model": "claude-sonnet-4-6",
+        "dangerouslySkipPermissions": false,
+        "extraFlags": []
+      },
+      "signatureEmoji": "\ud83d\udcac",
+      "avatar": "avatar.png",
+      "heartbeat": {
+        "rateLimitMinutes": 30
+      },
+      "session": {
+        "idleTimeoutMinutes": 30,
+        "maxConcurrent": 20
+      },
+      "history": {
+        "retentionDays": 90
+      }
+    }
+  ]
+}
