@@ -1883,104 +1883,148 @@ export class AgentRunner extends EventEmitter {
     const dbChatId = `api-${chatId}`;    // historyDb uses full channel-chatId key
     const skipPersist = opts?.skipPersist ?? false;
 
+    // Dispatch on the first token so commands with arguments (e.g. "/model sonnet",
+    // "/stop now") resolve to their base command instead of falling through to the
+    // unknown-command branch. The router gate is prefix-based, so these already pass.
+    const cmd = command.trim().split(/\s+/)[0] ?? '';
+
+    // Validate BEFORE persisting anything. Reuse the same api-channel gate as the router
+    // so an unknown command throws with nothing written — no orphan user row is left, and
+    // the router surfaces the error/500 exactly as before. After token dispatch + the
+    // /sessions branch below, this is only reachable on a direct caller passing garbage.
+    if (!AgentRunner.isApiBuiltinCommand(cmd)) {
+      throw new Error(`Unknown command: ${cmd}`);
+    }
+
     // Register session in the api-{chatId} index on first use (same as sendApiMessageStream)
     await this.sessionStore.ensureApiSession(agentId, storeChatId, sessionId).catch((err: unknown) => {
       this.logger.warn('Failed to register API session in index for command', { agentId, chatId, sessionId, error: (err as Error).message });
     });
 
-    // Persist a chat message to both the session context and the permanent history DB.
-    // No-op when skipPersist (programmatic REST callers shouldn't touch chat history).
-    const persist = async (role: 'user' | 'assistant', content: string) => {
+    // Persist a command message to the permanent history DB ONLY — not the model's session
+    // context (sessionStore). historyDb is what the web history endpoint reads, so this is
+    // all the display + spinner fix needs. Keeping commands out of the JSONL context means
+    // /model replies aren't replayed into the model, /compact counts stay accurate, /clear
+    // leaves no dangling turn, and the api channel matches telegram (which persists commands
+    // nowhere).
+    //
+    // skipPersist (wire param store_user_message=false) suppresses BOTH the user command and
+    // the assistant reply: programmatic REST callers leave no trace in chat history at all.
+    const persist = (role: 'user' | 'assistant', content: string) => {
       if (skipPersist || !content) return;
-      const ts = Date.now();
-      await this.sessionStore
-        .appendMessage(agentId, sessionId, { role, content, ts })
-        .catch(() => {});
-      this.historyDb.insertMessage({ chatId: dbChatId, sessionId, source: 'api', role, content, ts });
+      this.historyDb.insertMessage({ chatId: dbChatId, sessionId, source: 'api', role, content, ts: Date.now() });
     };
 
-    // Persist user message before executing so it appears in history.
+    // Persist the full user command before executing so it appears in history.
     // Skip for /clear — clearSession() below wipes the table anyway; only the response survives.
-    if (command !== '/clear') {
-      await persist('user', command);
+    if (cmd !== '/clear') {
+      persist('user', command);
     }
 
     let result: Record<string, unknown>;
     let responseText: string;
-
-    if (command === '/model') {
-      const model = this.agentConfig.claude.model;
-      result = { model };
-      responseText = `Current model: ${model}`;
-    } else if (command === '/stop') {
-      const session = this.sessions.get(sessionId);
-      const stopped = session ? session.interrupt() : false;
-      result = { stopped };
-      responseText = stopped ? 'Session interrupted.' : 'No active session to stop.';
-    } else if (command === '/restart') {
-      this.restartProcess(sessionId).catch(() => {});
-      result = { restarting: true };
-      responseText = 'Session is restarting.';
-    } else if (command === '/session') {
-      const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
-      const meta = index?.sessions.find((s) => s.id === sessionId);
-      const effectiveModel = this.agentConfig.claude.model;
-      if (!meta) {
-        result = { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
-        responseText = `Session: (unnamed)\nMessages: 0\nContext used: 0%\nModel: ${effectiveModel}`;
-      } else {
+    try {
+      if (cmd === '/model') {
+        const model = this.agentConfig.claude.model;
+        result = { model };
+        responseText = `Current model: ${model}`;
+      } else if (cmd === '/stop') {
+        const session = this.sessions.get(sessionId);
+        const stopped = session ? session.interrupt() : false;
+        result = { stopped };
+        responseText = stopped ? 'Session interrupted.' : 'No active session to stop.';
+      } else if (cmd === '/restart') {
+        this.restartProcess(sessionId).catch(() => {});
+        result = { restarting: true };
+        responseText = 'Session is restarting.';
+      } else if (cmd === '/session') {
+        const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
+        const meta = index?.sessions.find((s) => s.id === sessionId);
+        const effectiveModel = this.agentConfig.claude.model;
+        if (!meta) {
+          result = { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
+          responseText = `Session: (unnamed)\nMessages: 0\nContext used: 0%\nModel: ${effectiveModel}`;
+        } else {
+          const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+          const modelConfig = availableModels.find((m) => m.id === effectiveModel);
+          const contextWindow = modelConfig?.contextWindow ?? 200000;
+          const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
+          result = { sessionId, sessionName: meta.name, messageCount: meta.messageCount, archivedCount: meta.archivedCount ?? 0, contextUsedPct, model: effectiveModel };
+          responseText = [
+            `Session: ${meta.name ?? '(unnamed)'}`,
+            `Messages: ${meta.messageCount}${(meta.archivedCount ?? 0) > 0 ? ` (${meta.archivedCount} archived)` : ''}`,
+            `Context used: ${contextUsedPct}%`,
+            `Model: ${effectiveModel}`,
+          ].join('\n');
+        }
+      } else if (cmd === '/sessions') {
+        // Advertised for the api channel (BUILTIN_COMMANDS), so handle it here — mirrors the
+        // telegram /sessions list. Marks the session this command runs in as (current).
+        const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
+        const list = index?.sessions ?? [];
+        result = {
+          sessions: list.map((s) => ({ id: s.id, name: s.name, messageCount: s.messageCount, current: s.id === sessionId })),
+          count: list.length,
+        };
+        if (!list.length) {
+          responseText = 'No sessions.';
+        } else {
+          const lines = list.map((s) => {
+            const n = s.messageCount;
+            const marker = s.id === sessionId ? ' (current)' : '';
+            return `• ${s.name ?? '(unnamed)'} — ${n} message${n === 1 ? '' : 's'}${marker}`;
+          });
+          responseText = `Sessions (${list.length}):\n${lines.join('\n')}`;
+        }
+      } else if (cmd === '/clear') {
+        const ch = 'api' as const;
+        await this.sessionStore.clearTelegramSessionHistory(agentId, storeChatId, sessionId, ch);
+        await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
+          totalTokensUsed: 0,
+          lastInputTokens: 0,
+          archivedCount: 0,
+          loadedAtSpawn: undefined,
+          messageCountAtSpawn: undefined,
+        }, ch);
+        const mediaPaths = this.historyDb.clearSession(dbChatId, sessionId);
+        MediaStore.deleteMediaFiles(this.agentsBaseDir, agentId, mediaPaths);
+        this.restartProcess(sessionId).catch(() => {});
+        result = { success: true };
+        responseText = 'Session cleared.';
+      } else if (cmd === '/compact') {
+        const ch = 'api' as const;
+        const compactEffectiveModel = this.agentConfig.claude.model;
         const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-        const modelConfig = availableModels.find((m) => m.id === effectiveModel);
+        const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
         const contextWindow = modelConfig?.contextWindow ?? 200000;
-        const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
-        result = { sessionId, sessionName: meta.name, messageCount: meta.messageCount, archivedCount: meta.archivedCount ?? 0, contextUsedPct, model: effectiveModel };
-        responseText = [
-          `Session: ${meta.name ?? '(unnamed)'}`,
-          `Messages: ${meta.messageCount}${(meta.archivedCount ?? 0) > 0 ? ` (${meta.archivedCount} archived)` : ''}`,
-          `Context used: ${contextUsedPct}%`,
-          `Model: ${effectiveModel}`,
-        ].join('\n');
+        const compactor = new SessionCompactor(this.sessionStore);
+        const compactResult = await compactor.compact(agentId, storeChatId, sessionId, compactEffectiveModel, contextWindow, ch);
+        await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
+          loadedAtSpawn: undefined,
+          archivedCount: undefined,
+          messageCountAtSpawn: undefined,
+        }, ch);
+        await this.restartProcess(sessionId);
+        result = { success: true, keptMessages: compactResult.afterMessages, archivedMessages: compactResult.beforeMessages - compactResult.afterMessages };
+        responseText = `Session compacted. Kept ${compactResult.afterMessages} messages, archived ${compactResult.beforeMessages - compactResult.afterMessages}.`;
+      } else {
+        // Passed the gate but has no dispatch branch — BUILTIN_COMMANDS drifted from this
+        // table. Throw so the failure surfaces (and ends history with an assistant turn via
+        // the catch below) rather than returning an empty response.
+        throw new Error(`Unhandled command: ${cmd}`);
       }
-    } else if (command === '/clear') {
-      const ch = 'api' as const;
-      await this.sessionStore.clearTelegramSessionHistory(agentId, storeChatId, sessionId, ch);
-      await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
-        totalTokensUsed: 0,
-        lastInputTokens: 0,
-        archivedCount: 0,
-        loadedAtSpawn: undefined,
-        messageCountAtSpawn: undefined,
-      }, ch);
-      const mediaPaths = this.historyDb.clearSession(dbChatId, sessionId);
-      MediaStore.deleteMediaFiles(this.agentsBaseDir, agentId, mediaPaths);
-      this.restartProcess(sessionId).catch(() => {});
-      result = { success: true };
-      responseText = 'Session cleared.';
-    } else if (command === '/compact') {
-      const ch = 'api' as const;
-      const compactEffectiveModel = this.agentConfig.claude.model;
-      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
-      const contextWindow = modelConfig?.contextWindow ?? 200000;
-      const compactor = new SessionCompactor(this.sessionStore);
-      const compactResult = await compactor.compact(agentId, storeChatId, sessionId, compactEffectiveModel, contextWindow, ch);
-      await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
-        loadedAtSpawn: undefined,
-        archivedCount: undefined,
-        messageCountAtSpawn: undefined,
-      }, ch);
-      await this.restartProcess(sessionId);
-      result = { success: true, keptMessages: compactResult.afterMessages, archivedMessages: compactResult.beforeMessages - compactResult.afterMessages };
-      responseText = `Session compacted. Kept ${compactResult.afterMessages} messages, archived ${compactResult.beforeMessages - compactResult.afterMessages}.`;
-    } else {
-      throw new Error(`Unknown command: ${command}`);
+    } catch (err: unknown) {
+      // Ensure history always ends with an assistant turn, even when execution fails midway
+      // (e.g. /compact throws after the user row is persisted). Otherwise the trailing user
+      // row re-triggers the web's stuck-spinner condition on reload. Rethrow so the router
+      // still emits its SSE error event / REST 500.
+      persist('assistant', `Command failed: ${(err as Error).message}`);
+      throw err;
     }
 
-    // Persist the command's human-readable response as an assistant message so the
-    // conversation ends with an assistant turn. Without this the trailing message is
-    // the user command, and the web's computeIsPendingResponse keeps the typing
-    // indicator on forever (last.role === 'user').
-    await persist('assistant', responseText);
+    // Persist the human-readable response as an assistant turn so the conversation ends with
+    // an assistant message (the web's computeIsPendingResponse needs last.role !== 'user').
+    persist('assistant', responseText);
 
     return { result, responseText };
   }
