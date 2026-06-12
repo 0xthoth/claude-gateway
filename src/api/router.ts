@@ -357,17 +357,11 @@ export function createApiRouter(
         ? timeout_ms
         : DEFAULT_TIMEOUT_MS;
 
-    // Built-in command dispatch — only intercept known commands, let everything else reach Claude.
-    // Image-only sends have an empty trimmedMessage and never match built-in commands.
-    if (trimmedMessage && AgentRunner.isApiBuiltinCommand(trimmedMessage)) {
-      try {
-        const result = await runner.executeApiCommand(sessionId, chatIdStr, trimmedMessage);
-        res.json({ command: trimmedMessage, session_id: sessionId, result });
-      } catch (err: unknown) {
-        res.status(500).json({ error: (err as Error).message ?? 'Command failed' });
-      }
-      return;
-    }
+    // Built-in commands (e.g. /model, /session) are intercepted and answered locally
+    // instead of being sent to Claude. They flow through the SAME response path as a
+    // normal message — same SSE events when stream, same JSON shape when sync — so the
+    // client treats a command reply exactly like any other assistant reply.
+    const isBuiltinCommand = !!trimmedMessage && AgentRunner.isApiBuiltinCommand(trimmedMessage);
 
     if (stream) {
       // SSE streaming mode
@@ -393,6 +387,33 @@ export function createApiRouter(
             } catch { /* client gone */ }
           },
         };
+        const openSseStream = () => {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          });
+          res.flushHeaders();
+        };
+
+        // Built-in command — emit its response through the same SSE callbacks as a
+        // normal reply. Commands bypass the 409 preflight (they must work mid-session,
+        // e.g. /stop) and never reach Claude.
+        if (isBuiltinCommand) {
+          openSseStream();
+          res.socket?.setNoDelay(true);
+          try {
+            const { responseText } = await runner.executeApiCommand(
+              sessionId, chatIdStr, trimmedMessage, { skipPersist: skipUserMessage },
+            );
+            sseCallbacks.onChunk({ type: 'text_delta', text: responseText } as import('../types').StreamEvent);
+            sseCallbacks.onDone(responseText, []);
+          } catch (err: unknown) {
+            sseCallbacks.onError(err as Error);
+          }
+          return;
+        }
 
         // Preflight conflict check — return 409 JSON before SSE headers are sent
         if (runner.hasActiveApiSession(sessionId)) {
@@ -400,13 +421,7 @@ export function createApiRouter(
           return;
         }
 
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        });
-        res.flushHeaders();
+        openSseStream();
         res.socket?.setNoDelay(true);
 
         const agentCfg = agentConfigs.get(agentId)!;
@@ -439,15 +454,24 @@ export function createApiRouter(
     } else {
       // Synchronous mode (existing behavior)
       try {
-        const agentCfgSync = agentConfigs.get(agentId)!;
-        const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
-        const { text: responseText, attachments } = await runner.sendApiMessage(sessionId, chatIdStr, trimmedMessage, {
-          timeoutMs,
-          allowTools: allowToolsSync,
-          mediaFiles: validatedMediaFiles,
-          model: modelStr,
-          skipUserMessage,
-        });
+        let responseText: string;
+        let attachments: import('../types').ApiAttachment[] = [];
+        if (isBuiltinCommand) {
+          // Built-in command — answer locally, return the same JSON shape as a normal reply.
+          ({ responseText } = await runner.executeApiCommand(
+            sessionId, chatIdStr, trimmedMessage, { skipPersist: skipUserMessage },
+          ));
+        } else {
+          const agentCfgSync = agentConfigs.get(agentId)!;
+          const allowToolsSync = agentCfgSync.allow_tools ?? !!apiKey.allow_tools;
+          ({ text: responseText, attachments } = await runner.sendApiMessage(sessionId, chatIdStr, trimmedMessage, {
+            timeoutMs,
+            allowTools: allowToolsSync,
+            mediaFiles: validatedMediaFiles,
+            model: modelStr,
+            skipUserMessage,
+          }));
+        }
         const syncResult: Record<string, unknown> = {
           request_id: requestId,
           agent_id: agentId,
@@ -2130,7 +2154,7 @@ export function createApiRouter(
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
     try {
-      const result = await runner.executeApiCommand(sessionId, chatId, '/clear');
+      const { result } = await runner.executeApiCommand(sessionId, chatId, '/clear', { skipPersist: true });
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -2146,7 +2170,7 @@ export function createApiRouter(
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
     try {
-      const result = await runner.executeApiCommand(sessionId, chatId, '/compact');
+      const { result } = await runner.executeApiCommand(sessionId, chatId, '/compact', { skipPersist: true });
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -2162,7 +2186,7 @@ export function createApiRouter(
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
     try {
-      const result = await runner.executeApiCommand(sessionId, chatId, '/stop');
+      const { result } = await runner.executeApiCommand(sessionId, chatId, '/stop', { skipPersist: true });
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
@@ -2178,7 +2202,7 @@ export function createApiRouter(
     const { runner, chatId } = ctx;
     const { sessionId } = req.params as { sessionId: string };
     try {
-      const result = await runner.executeApiCommand(sessionId, chatId, '/restart');
+      const { result } = await runner.executeApiCommand(sessionId, chatId, '/restart', { skipPersist: true });
       res.json(result);
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
