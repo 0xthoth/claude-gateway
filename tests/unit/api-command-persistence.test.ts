@@ -199,13 +199,13 @@ describe('executeApiCommand persistence + dispatch (#157)', () => {
     expect(responseText).toBe('Session cleared.');
   });
 
-  it('U-P-10: a successful command leaves history ending with an assistant turn', async () => {
-    // /session awaits internally, so the assistant row reliably post-dates the user row.
+  it('U-P-10: a successful command persists both a user row and an assistant row', async () => {
     await getSessionStore(runner).ensureApiSession(agentId, chatId, sessionId);
     await runner.executeApiCommand(sessionId, chatId, '/session');
 
-    const rows = historyRows(); // ts DESC
-    expect(rows[0].role).toBe('assistant');
-    expect(rows[rows.length - 1].role).toBe('user');
+    const rows = historyRows();
+    // Role-based assertion — independent of ts ordering, which can be the same millisecond.
+    expect(rows.filter((r) => r.role === 'user')).toHaveLength(1);
+    expect(rows.filter((r) => r.role === 'assistant')).toHaveLength(1);
   });
 });

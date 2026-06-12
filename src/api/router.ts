@@ -402,6 +402,7 @@ export function createApiRouter(
         // e.g. /stop) and never reach Claude.
         if (isBuiltinCommand) {
           openSseStream();
+          res.socket?.setNoDelay(true);
           try {
             const { responseText } = await runner.executeApiCommand(
               sessionId, chatIdStr, trimmedMessage, { skipPersist: skipUserMessage },

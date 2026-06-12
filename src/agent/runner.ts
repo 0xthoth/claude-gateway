@@ -1926,8 +1926,11 @@ export class AgentRunner extends EventEmitter {
     try {
       if (cmd === '/model') {
         const model = this.agentConfig.claude.model;
+        const hasArg = command.trim().includes(' ');
         result = { model };
-        responseText = `Current model: ${model}`;
+        responseText = hasArg
+          ? `Current model: ${model}\n(To switch models use the model picker or the /api/v1/agents/:id/model endpoint — argument ignored.)`
+          : `Current model: ${model}`;
       } else if (cmd === '/stop') {
         const session = this.sessions.get(sessionId);
         const stopped = session ? session.interrupt() : false;
@@ -2018,7 +2021,8 @@ export class AgentRunner extends EventEmitter {
       // (e.g. /compact throws after the user row is persisted). Otherwise the trailing user
       // row re-triggers the web's stuck-spinner condition on reload. Rethrow so the router
       // still emits its SSE error event / REST 500.
-      persist('assistant', `Command failed: ${(err as Error).message}`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      persist('assistant', `Command failed: ${errMsg}`);
       throw err;
     }
 
