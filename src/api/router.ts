@@ -364,25 +364,7 @@ export function createApiRouter(
         const { result, responseText } = await runner.executeApiCommand(
           sessionId, chatIdStr, trimmedMessage, { skipPersist: skipUserMessage },
         );
-        if (stream) {
-          // Return SSE so the web frontend's streamMessage generator can parse events,
-          // show the assistant response in real-time, and get session_id for history refresh.
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',
-          });
-          res.flushHeaders();
-          if (responseText) {
-            res.write(`data: ${JSON.stringify({ type: 'text_delta', text: responseText })}\n\n`);
-          }
-          res.write(`data: ${JSON.stringify({ type: 'result', text: responseText, session_id: sessionId, command: trimmedMessage, result })}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-        } else {
-          res.json({ command: trimmedMessage, session_id: sessionId, result });
-        }
+        res.json({ command: trimmedMessage, session_id: sessionId, result });
       } catch (err: unknown) {
         if (!res.headersSent) {
           res.status(500).json({ error: (err as Error).message ?? 'Command failed' });

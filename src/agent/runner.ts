@@ -1969,15 +1969,6 @@ export class AgentRunner extends EventEmitter {
       throw new Error(`Unknown command: ${command}`);
     }
 
-    // Persist assistant response to history
-    if (!skipPersist) {
-      const assistantTs = Date.now();
-      await this.sessionStore
-        .appendMessage(agentId, sessionId, { role: 'assistant', content: responseText, ts: assistantTs })
-        .catch(() => {});
-      this.historyDb.insertMessage({ chatId: dbChatId, sessionId, source: 'api', role: 'assistant', content: responseText, ts: assistantTs });
-    }
-
     return { result, responseText };
   }
 
