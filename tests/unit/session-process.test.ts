@@ -473,6 +473,99 @@ describe('SessionProcess', () => {
   });
 
   // --------------------------------------------------------------------------
+  // U-SP-11d: pty-shell does NOT append [1m] even when contextWindow >= 1M.
+  // The TUI 1M billing tier requires real account credits; without them the
+  // session silently drops to 200k mid-conversation, so we leave the model as-is.
+  // --------------------------------------------------------------------------
+  it('U-SP-11d: pty-shell does not append [1m] even when model contextWindow is 1M', async () => {
+    gatewayConfig.gateway.headless = false;
+    gatewayConfig.gateway.models = [
+      { id: 'claude-opus-4-8', label: 'Opus 4.8', alias: 'opus', contextWindow: 1_000_000 },
+    ];
+    agentConfig = makeAgentConfig({
+      workspace: agentConfig.workspace,
+      claude: { model: 'claude-opus-4-8', dangerouslySkipPermissions: false, extraFlags: [] },
+    });
+    const sp = new SessionProcess('chat:1md', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).not.toBe(-1);
+    expect(args[modelIdx + 1]).toBe('claude-opus-4-8');
+
+    await sp.stop();
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-11e: headless backend leaves model unchanged even with 1M contextWindow
+  // --------------------------------------------------------------------------
+  it('U-SP-11e: headless backend does not append [1m] even with 1M contextWindow', async () => {
+    gatewayConfig.gateway.models = [
+      { id: 'claude-opus-4-8', label: 'Opus 4.8', alias: 'opus', contextWindow: 1_000_000 },
+    ];
+    agentConfig = makeAgentConfig({
+      workspace: agentConfig.workspace,
+      claude: { model: 'claude-opus-4-8', dangerouslySkipPermissions: false, extraFlags: [] },
+    });
+    const sp = new SessionProcess('chat:1mh', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).not.toBe(-1);
+    expect(args[modelIdx + 1]).toBe('claude-opus-4-8');
+
+    await sp.stop();
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-11f: sub-1M model on pty-shell gets no suffix
+  // --------------------------------------------------------------------------
+  it('U-SP-11f: pty-shell does not append [1m] when model contextWindow is sub-1M', async () => {
+    gatewayConfig.gateway.headless = false;
+    gatewayConfig.gateway.models = [
+      { id: 'claude-haiku-4-5', label: 'Haiku 4.5', alias: 'haiku', contextWindow: 200_000 },
+    ];
+    agentConfig = makeAgentConfig({
+      workspace: agentConfig.workspace,
+      claude: { model: 'claude-haiku-4-5', dangerouslySkipPermissions: false, extraFlags: [] },
+    });
+    const sp = new SessionProcess('chat:haik', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).not.toBe(-1);
+    expect(args[modelIdx + 1]).toBe('claude-haiku-4-5');
+
+    await sp.stop();
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-11g: explicit [xxx] suffix in model string is passed verbatim (no double-append)
+  // --------------------------------------------------------------------------
+  it('U-SP-11g: pty-shell passes through a model that already has an explicit [...] suffix verbatim', async () => {
+    gatewayConfig.gateway.headless = false;
+    gatewayConfig.gateway.models = [
+      { id: 'claude-opus-4-8', label: 'Opus 4.8', alias: 'opus', contextWindow: 1_000_000 },
+    ];
+    agentConfig = makeAgentConfig({
+      workspace: agentConfig.workspace,
+      claude: { model: 'claude-opus-4-8[1m]', dangerouslySkipPermissions: false, extraFlags: [] },
+    });
+    const sp = new SessionProcess('chat:dbl', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).not.toBe(-1);
+    expect(args[modelIdx + 1]).toBe('claude-opus-4-8[1m]');
+
+    await sp.stop();
+  });
+
+  // --------------------------------------------------------------------------
   // U-SP-12: User-scoped stdio MCP servers merged into mcp-config.json
   // --------------------------------------------------------------------------
   it('U-SP-12: user-scoped stdio mcpServers are merged into mcp-config.json', async () => {

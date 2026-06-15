@@ -401,6 +401,12 @@ export class SessionProcess extends EventEmitter {
       ptyRealBin = claudeBinRaw.includes('claude-pty-shell') ? 'claude' : claudeBinRaw;
       claudeBin = process.execPath;
       allArgs = [wrapperPath, ...args];
+      // NOTE: the interactive TUI backend does NOT append a [1m] context suffix.
+      // Triggering the server-side 1M billing tier from the TUI requires real 1M
+      // credits on the account; without them the session silently drops back to
+      // 200k mid-conversation. Until credits are provisioned, the TUI runs at the
+      // standard context window. (A model string with an explicit [1m] suffix in
+      // config is still passed through verbatim by buildArgs.)
     } else if (this.gatewayConfig.gateway.headless === false && isAppAgent) {
       this.logger.warn('gateway.headless=false is not supported for app-agents — using headless backend', {
         sessionId: this.sessionId,

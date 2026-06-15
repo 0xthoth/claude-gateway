@@ -332,6 +332,12 @@ export function generateDashboardHtml(dashToken = ''): string {
     let ptyWs = null;
     let currentPtyAgent = null;
     let currentPtySession = null;
+    // Auto-reconnect state for the PTY viewer. The dashboard tab can lose its
+    // WebSocket to a gateway restart, an idle timeout, or a transient network
+    // blip; rather than make the user click View again, reconnect with backoff.
+    let ptyReconnectTimer = null;
+    let ptyReconnectAttempts = 0;
+    const PTY_RECONNECT_MAX_MS = 10000;
     // Streaming UTF-8 decoder. The PTY stream carries raw UTF-8 bytes (box-drawing
     // chars, spinner braille, emoji). Decoding them as latin1 mangles every
     // multi-byte char into noise — decode as UTF-8 with {stream:true} so sequences
@@ -398,14 +404,35 @@ export function generateDashboardHtml(dashToken = ''): string {
         term.reset();
       }
 
-      // Fresh decoder per session so a leftover partial byte from a previous
-      // viewing can't corrupt the first character of this stream.
+      await connectPtyWs(agentId, sessionId);
+    }
+
+    // (Re)establish the WebSocket for the session the viewer is currently showing.
+    // Split out from openPtyViewer so auto-reconnect can re-run just this part
+    // without tearing down the terminal or flickering the panel.
+    async function connectPtyWs(agentId, sessionId) {
+      // Guard against a stale reconnect firing after the user closed/switched.
+      if (currentPtySession !== sessionId) return;
+
+      // Fresh decoder per (re)connect so a leftover partial byte can't corrupt
+      // the first character of the freshly-replayed screen frame.
       utf8Decoder = new TextDecoder('utf-8');
 
-      const url = await wsPtyUrl(agentId, sessionId);
+      let url;
+      try {
+        url = await wsPtyUrl(agentId, sessionId);
+      } catch (e) {
+        // Ticket fetch failed (gateway momentarily unreachable) — retry.
+        schedulePtyReconnect(agentId, sessionId);
+        return;
+      }
+      // The session may have been closed/switched while awaiting the ticket.
+      if (currentPtySession !== sessionId) return;
+
       ptyWs = new WebSocket(url);
       ptyWs.binaryType = 'arraybuffer';
 
+      ptyWs.onopen = function() { ptyReconnectAttempts = 0; };
       ptyWs.onmessage = function(ev) {
         const data = ev.data instanceof ArrayBuffer
           ? utf8Decoder.decode(ev.data, { stream: true })
@@ -413,13 +440,44 @@ export function generateDashboardHtml(dashToken = ''): string {
         term.write(stripMouseModes(data));
       };
       ptyWs.onclose = function(ev) {
-        if (term) term.writeln('\\r\\n\\x1b[33m[disconnected: ' + (ev.reason || 'closed') + ']\\x1b[0m');
+        ptyWs = null;
+        // Viewer was closed or switched to another session — stop here.
+        if (currentPtySession !== sessionId) return;
+        // 4404 = the session is no longer running in PTY mode (it ended). No
+        // point reconnecting; the server will never accept this stream again.
+        if (ev.code === 4404) {
+          if (term) term.writeln('\\r\\n\\x1b[33m[session ended]\\x1b[0m');
+          return;
+        }
+        schedulePtyReconnect(agentId, sessionId);
       };
-      ptyWs.onerror = function() { if (term) term.writeln('\\r\\n\\x1b[31m[connection error]\\x1b[0m'); };
+      // onerror is always followed by onclose, which owns the reconnect logic.
+      ptyWs.onerror = function() {};
+    }
+
+    // Reconnect with capped exponential backoff (1s -> 10s). A single
+    // "reconnecting" notice is shown per disconnect burst; the server replays a
+    // clean frame on resubscribe, so the view redraws itself once we are back.
+    function schedulePtyReconnect(agentId, sessionId) {
+      if (ptyReconnectTimer) return;                // already pending
+      if (currentPtySession !== sessionId) return;  // viewer no longer wants this
+      if (ptyReconnectAttempts === 0 && term) {
+        term.writeln('\\r\\n\\x1b[33m[reconnecting\\u2026]\\x1b[0m');
+      }
+      const delay = Math.min(1000 * Math.pow(2, ptyReconnectAttempts), PTY_RECONNECT_MAX_MS);
+      ptyReconnectAttempts++;
+      ptyReconnectTimer = setTimeout(function() {
+        ptyReconnectTimer = null;
+        void connectPtyWs(agentId, sessionId);
+      }, delay);
     }
 
     function closePtyViewer() {
-      if (ptyWs) { ptyWs.close(); ptyWs = null; }
+      // Cancel any pending reconnect and suppress the handlers on the socket we
+      // are about to close intentionally, so it does not schedule a new one.
+      if (ptyReconnectTimer) { clearTimeout(ptyReconnectTimer); ptyReconnectTimer = null; }
+      ptyReconnectAttempts = 0;
+      if (ptyWs) { ptyWs.onclose = null; ptyWs.onerror = null; ptyWs.close(); ptyWs = null; }
       currentPtyAgent = null;
       currentPtySession = null;
       document.getElementById('pty-viewer').style.display = 'none';
@@ -575,13 +633,13 @@ export function generateDashboardHtml(dashToken = ''): string {
         const res = await fetch(apiUrl('/processes'));
         if (!res.ok) return;
         const data = await res.json();
-        renderProcessTree(data.processes || []);
+        renderProcessTree(data.processes || [], data.numCpus || 1);
       } catch(e) {
         document.getElementById('proc-tree').textContent = 'Error: ' + e.message;
       }
     }
 
-    function renderProcessTree(procs) {
+    function renderProcessTree(procs, numCpus) {
       if (!procs.length) {
         document.getElementById('proc-tree').textContent = '— no gateway processes found —';
         return;
@@ -591,14 +649,15 @@ export function generateDashboardHtml(dashToken = ''): string {
       procs.forEach(function(p) { pidMap[p.pid] = p; });
 
       // Aggregate resource usage across the whole gateway process tree.
-      // %CPU is ps's lifetime average per process (summed → total load share);
-      // RSS is summed and may slightly over-count shared pages, but is a good
-      // proxy for "memory used by the gateway".
-      let totalCpu = 0, totalRssKb = 0;
+      // ps %cpu is per-core (100% = 1 core), so divide by numCpus to get
+      // a normalized 0–100% load figure across all available cores.
+      // RSS is summed and may slightly over-count shared pages.
+      let rawCpuSum = 0, totalRssKb = 0;
       procs.forEach(function(p) {
-        totalCpu += Number(p.cpu) || 0;
+        rawCpuSum += Number(p.cpu) || 0;
         totalRssKb += Number(p.rssKb) || 0;
       });
+      const totalCpu = rawCpuSum / (numCpus || 1);
       const totalMemMb = totalRssKb / 1024;
       const memStr = totalMemMb >= 1024
         ? (totalMemMb / 1024).toFixed(2) + ' GB'

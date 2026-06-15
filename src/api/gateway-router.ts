@@ -3,6 +3,7 @@ import * as http from 'node:http';
 import { exec } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Server } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -398,7 +399,7 @@ export class GatewayRouter {
     this.app.get('/processes', (_req: Request, res: Response) => {
       const now = Date.now();
       if (this.processesCache && now - this.processesCache.ts < GatewayRouter.PROCESSES_CACHE_TTL_MS) {
-        res.json({ processes: this.processesCache.data });
+        res.json({ processes: this.processesCache.data, numCpus: os.cpus().length });
         return;
       }
       exec(
@@ -420,7 +421,7 @@ export class GatewayRouter {
             };
           }).filter(Boolean);
           this.processesCache = { data: processes, ts: Date.now() };
-          res.json({ processes });
+          res.json({ processes, numCpus: os.cpus().length });
         },
       );
     });
@@ -674,12 +675,25 @@ export class GatewayRouter {
 
   async stop(): Promise<void> {
     if (this.ticketPruner) clearInterval(this.ticketPruner);
-    this.wss?.close();
+    // Terminate live WebSocket clients first. The dashboard PTY viewer holds these
+    // open indefinitely; without an explicit terminate, server.close() below would
+    // wait forever for them to drain (the "Ctrl+C twice" hang).
+    if (this.wss) {
+      for (const client of this.wss.clients) {
+        client.terminate();
+      }
+      this.wss.close();
+    }
     return new Promise((resolve, reject) => {
       if (!this.server) {
         resolve();
         return;
       }
+      // Force-close idle and active keep-alive HTTP connections. The dashboard's
+      // 3s/6s polling keeps connections alive, so server.close() — which only stops
+      // accepting new connections and waits for existing ones — would otherwise hang.
+      // closeAllConnections() is available on Node 18.2+.
+      this.server.closeAllConnections?.();
       this.server.close((err) => {
         if (err) reject(err);
         else resolve();
