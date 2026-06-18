@@ -602,6 +602,25 @@ async function main(): Promise<void> {
     socketServer.stopApp(appName);
   };
 
+  // Compose has no host-reboot restart policy, so a running app's containers are
+  // down after a restart. Bring them up in the BACKGROUND — fire-and-forget so it
+  // never blocks the event loop or route wiring. Routes come up immediately below;
+  // until each app's containers finish `compose up --wait`, a request may briefly
+  // 502 (ECONNREFUSED), which self-heals within seconds. Non-fatal per app.
+  void appInstaller
+    .restoreRunningApps()
+    .then(({ attempted, failures }) => {
+      for (const f of failures) {
+        globalLogger.warn(`App store: failed to start "${f.app}" containers on restore (non-fatal): ${f.error}`);
+      }
+      if (attempted > 0) {
+        globalLogger.info(`App store: background container restore complete (${attempted - failures.length}/${attempted} started)`);
+      }
+    })
+    .catch((err) => {
+      globalLogger.warn('App store: background container restore failed (non-fatal)', { error: (err as Error).message });
+    });
+
   // Restore proxy routes, sockets, and agent entries for apps that were running before restart
   try {
     await router.loadProxyRoutes(appsRegistry);
