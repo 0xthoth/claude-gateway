@@ -11,6 +11,7 @@ import { createCronRouter } from './cron-router';
 import { createWorkspaceRouter } from './workspace-router';
 import { createSkillsRouter } from './skills-router';
 import { createPackagesRouter } from './packages';
+import { createConnectorsRouter } from './connectors-router';
 import { AppsRegistry } from '../apps/registry';
 import { AppInstaller } from '../apps/installer';
 import { RegistryClient } from '../apps/registry-client';
@@ -195,6 +196,15 @@ export class GatewayRouter {
     if (this.gatewayConfig?.gateway?.api?.keys?.length) {
       const packagesRouter = createPackagesRouter(this.gatewayConfig.gateway.api.keys);
       this.app.use('/api', packagesRouter);
+    }
+
+    // Mount connector management routes (catalog + secret store + config wiring)
+    if (this.gatewayConfig?.gateway?.api?.keys?.length) {
+      const connectorsRouter = createConnectorsRouter(
+        this.gatewayConfig.gateway.api.keys,
+        this.configPath,
+      );
+      this.app.use('/api', connectorsRouter);
     }
 
     // Mount cron manager routes with same API key auth as agent router

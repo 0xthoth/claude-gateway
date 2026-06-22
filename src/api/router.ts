@@ -493,6 +493,7 @@ export function createApiRouter(
         description: cfg.description,
         model: cfg.claude?.model ?? null,
         allow_tools: cfg.allow_tools ?? false,
+        connectors: cfg.connectors ?? {},
         avatarUrl: cfg.avatar ? `/api/v1/agents/${id}/avatar` : null,
         telegram_connected: !!cfg.telegram?.botToken,
         discord_connected: !!cfg.discord?.botToken,
@@ -1096,8 +1097,8 @@ export function createApiRouter(
       return;
     }
 
-    const body = req.body as { description?: unknown; model?: unknown; allow_tools?: unknown; telegram_bot_token?: unknown; discord_bot_token?: unknown };
-    const { description, model, allow_tools, telegram_bot_token, discord_bot_token } = body;
+    const body = req.body as { description?: unknown; model?: unknown; allow_tools?: unknown; telegram_bot_token?: unknown; discord_bot_token?: unknown; connectors?: unknown };
+    const { description, model, allow_tools, telegram_bot_token, discord_bot_token, connectors } = body;
     if (description !== undefined && (typeof description !== 'string' || !description.trim())) {
       res.status(400).json({ error: 'description must be a non-empty string' });
       return;
@@ -1117,6 +1118,22 @@ export function createApiRouter(
     if (discord_bot_token !== undefined && discord_bot_token !== null && typeof discord_bot_token !== 'string') {
       res.status(400).json({ error: 'discord_bot_token must be a string or null' });
       return;
+    }
+    // connectors: a partial map of { [connectorId]: { enabled: boolean } } to merge.
+    const connectorPatch: Record<string, { enabled: boolean }> = {};
+    if (connectors !== undefined) {
+      if (typeof connectors !== 'object' || connectors === null || Array.isArray(connectors)) {
+        res.status(400).json({ error: 'connectors must be an object' });
+        return;
+      }
+      for (const [id, val] of Object.entries(connectors as Record<string, unknown>)) {
+        const enabled = (val as { enabled?: unknown })?.enabled;
+        if (typeof enabled !== 'boolean') {
+          res.status(400).json({ error: `connectors.${id}.enabled must be a boolean` });
+          return;
+        }
+        connectorPatch[id] = { enabled };
+      }
     }
 
     try {
@@ -1143,6 +1160,10 @@ export function createApiRouter(
             const existing = agent.discord as Record<string, unknown> | undefined;
             agent.discord = { ...(existing ?? {}), botToken: (discord_bot_token as string).trim() };
           }
+        }
+        if (connectors !== undefined) {
+          const existing = (agent.connectors as Record<string, { enabled: boolean }>) ?? {};
+          agent.connectors = { ...existing, ...connectorPatch };
         }
       });
     } catch (err) {
@@ -1185,6 +1206,15 @@ export function createApiRouter(
         agentRunners.get(agentId)?.stopDiscordReceiver();
       }
     }
+    if (connectors !== undefined) {
+      cfg.connectors = { ...(cfg.connectors ?? {}), ...connectorPatch };
+      // Enablement is read at spawn — respawn live sessions so they pick it up.
+      const runner = agentRunners.get(agentId);
+      if (runner) {
+        runner.updateAgentConfig(cfg);
+        await runner.restartOrDefer();
+      }
+    }
 
     res.json({
       agent: {
@@ -1192,6 +1222,7 @@ export function createApiRouter(
         description: cfg.description,
         model: cfg.claude?.model,
         allow_tools: cfg.allow_tools ?? false,
+        connectors: cfg.connectors ?? {},
         telegram_connected: !!cfg.telegram?.botToken,
         discord_connected: !!cfg.discord?.botToken,
         telegram_token_preview: cfg.telegram?.botToken ? maskToken(cfg.telegram.botToken) : null,
