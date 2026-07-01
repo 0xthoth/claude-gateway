@@ -154,12 +154,27 @@ export type NormalizedLinePostback = { chatId: string; replyToken: string; data:
 export function normalizeLinePostback(event: webhook.Event): NormalizedLinePostback | null {
   if (event.type !== 'postback') return null;
   const source = event.source;
-  if (!source || source.type !== 'user' || !source.userId) return null;
+  if (!source) return null;
   const pe = event as webhook.PostbackEvent;
   const data = pe.postback?.data ?? '';
   const replyToken = typeof pe.replyToken === 'string' ? pe.replyToken : '';
   if (!data || !replyToken) return null;
-  return { chatId: source.userId, replyToken, data };
+
+  let chatId: string;
+  if (source.type === 'user') {
+    if (!source.userId) return null;
+    chatId = source.userId;
+  } else if (source.type === 'group') {
+    if (!source.groupId) return null;
+    chatId = source.groupId;
+  } else if (source.type === 'room') {
+    if (!source.roomId) return null;
+    chatId = source.roomId;
+  } else {
+    return null;
+  }
+
+  return { chatId, replyToken, data };
 }
 
 /** Find the agent that has LINE configured (POC: single line-enabled agent, or by id). */
@@ -249,8 +264,24 @@ export function createLineWebhookRouter(
       : null;
 
     for (const event of events) {
+      // Postback BEFORE access gate: a tap on our slow-LLM button must reach the
+      // cache even if the user's allowlist status changed since the button was sent.
+      // The postback data is opaque (request_id we issued), so bypassing the gate here
+      // is safe — only users who received the button can tap it.
+      const pb = normalizeLinePostback(event);
+      if (pb) {
+        try {
+          await runner.handleLinePostback(pb.chatId, pb.replyToken, pb.data);
+        } catch (err) {
+          logger.error('LINE webhook: postback handling failed', {
+            error: (err as Error).message,
+          });
+        }
+        continue;
+      }
+
       // Access gate (single choke point — mirrors hermes _dispatch_event):
-      // resolve the source once and gate before any postback/message handling.
+      // resolve the source once and gate before any message handling.
       // Closed by default for both DMs (dmPolicy/dmAllowlist) and groups/rooms
       // (groupPolicy/groupAllowlist). `'open'` restores answer-to-anyone.
       const resolved = resolveLineSource(event.source);
@@ -323,21 +354,7 @@ export function createLineWebhookRouter(
         continue;
       }
 
-      // Slow-LLM postback button tap → deliver the cached answer via the fresh
-      // reply token. Our refresh button is handled here and must NOT wake the
-      // agent; any other postback is dropped (nothing else consumes them).
-      const pb = normalizeLinePostback(event);
-      if (pb) {
-        try {
-          await runner.handleLinePostback(pb.chatId, pb.replyToken, pb.data);
-        } catch (err) {
-          logger.error('LINE webhook: postback handling failed', {
-            error: (err as Error).message,
-          });
-        }
-        continue;
-      }
-
+      // Normalize the event into our /channel intake format.
       const norm = normalizeLineEvent(event, resolved);
       if (!norm) continue;
       const userId = norm.meta.chat_id;

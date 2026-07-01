@@ -235,18 +235,18 @@ export class LineReplyManager {
       const messages = chunks
         .slice(0, LINE_MAX_MESSAGES_PER_REQUEST)
         .map((c) => this.textMessage(c));
+      // Flip to DELIVERED synchronously before any await so that a concurrent
+      // tap sees DELIVERED and short-circuits instead of double-sending.
+      this.markDelivered(requestId);
+      this.clearPendingButton(chatId, requestId);
       try {
         await this.client.replyMessage({ replyToken: freshToken, messages });
-        this.markDelivered(requestId);
-        this.clearPendingButton(chatId, requestId);
       } catch (err) {
         this.logger.warn('LINE: postback reply failed; falling back to push', {
           error: (err as Error).message,
         });
         try {
           await this.client.pushMessage({ to: chatId, messages });
-          this.markDelivered(requestId);
-          this.clearPendingButton(chatId, requestId);
         } catch (err2) {
           this.logger.error('LINE: postback push fallback failed', {
             error: (err2 as Error).message,

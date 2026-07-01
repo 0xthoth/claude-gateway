@@ -20,7 +20,8 @@ export function chunkText(text: string, limit = LINE_TEXT_LIMIT): string[] {
   let rest = text;
   while (rest.length > limit) {
     let cut = rest.lastIndexOf('\n', limit);
-    if (cut <= 0) cut = limit; // no newline in range — hard cut
+    if (cut < 0) cut = limit; // not found — hard cut
+    else if (cut === 0) { rest = rest.slice(1); continue; } // leading newline — skip, retry
     out.push(rest.slice(0, cut));
     rest = rest.slice(cut).replace(/^\n/, '');
   }

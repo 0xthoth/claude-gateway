@@ -1535,6 +1535,11 @@ export class AgentRunner extends EventEmitter {
   }
 
   private writeAutoForward(chatId: string, text: string, format: 'text' | 'html' = 'text'): void {
+    // LINE has no .forward consumer — route through LineReplyManager's push path.
+    if (this.channelFor(chatId) === 'line') {
+      if (this.lineReply) void this.lineReply.onAnswer(chatId, text);
+      return;
+    }
     const typingDir = this.getTypingDir(chatId);
     try {
       fs.mkdirSync(typingDir, { recursive: true });
@@ -1616,7 +1621,7 @@ export class AgentRunner extends EventEmitter {
 
   startLineReply(): void {
     const lineThreshold = this.agentConfig.line?.slowResponseThreshold ?? 45;
-    if (!this.agentConfig.line?.channelSecret || lineThreshold <= 0) return;
+    if (!this.agentConfig.line?.channelSecret || !this.agentConfig.line?.channelAccessToken || lineThreshold <= 0) return;
     if (this.lineReply) return; // already running
     this.lineReply = new LineReplyManager({
       agentId: this.agentConfig.id,
