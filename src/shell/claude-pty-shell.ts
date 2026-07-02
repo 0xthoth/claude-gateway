@@ -11,24 +11,44 @@
  * the PTY screen is used only for busy/idle/dialog liveness signals.
  */
 import * as fs from 'fs';
+import * as net from 'net';
 import * as readline from 'readline';
 import { translateArgs, sanitizeUserText } from './args';
-import { ScreenModel } from './screen';
+import { ScreenModel, MenuOption, parseMenuChoice, formatMenuPrompt, formatPermissionPrompt, extractChannelContent, isPtyActivelyWorking } from './screen';
 import { PtyHost } from './pty-host';
-import { TranscriptTailer, AssistantRecord, UsageInfo } from './tailer';
+import { TranscriptTailer, AssistantRecord, UsageInfo, hasInteractiveMenuToolUse } from './tailer';
 import { ProtocolEmitter } from './emitter';
 import { preTrustWorkspace, checkAuthStatus } from './trust';
+import { decideMenuCancel } from './menu-cancel';
 
 const POLL_MS = 200;
 const STARTUP_QUIET_MS = 600;
 // How often to touch the heartbeat file during an active turn (PTY mode keepalive).
 // Must be well under the receiver's STALLED_TIMEOUT_MS (300s) to prevent false warnings.
 const HEARTBEAT_INTERVAL_MS = 60_000;
+// Liveness window for the heartbeat: if the PTY produced output more recently than
+// this (and we're not parked at an idle prompt), Claude is considered actively
+// working even when the exact "esc to interrupt" busy marker isn't on screen.
+// Covers states where isBusy() goes false but work continues — context compaction,
+// large request assembly, and long sub-agent tasks whose spinner keeps animating
+// (ticking the elapsed-time counter) and so keeps emitting PTY bytes. Sized well
+// above the ~1s spinner tick and below the 60s beat interval, so a genuinely hung
+// or idle TUI (no output) still goes quiet → no beat → stalled detector fires.
+const HEARTBEAT_LIVENESS_QUIET_MS = 45_000;
 const SUBMIT_ENTER_DELAY_MS = 300;
 const SUBMIT_RETRY_AFTER_MS = 4000;
 const MAX_ENTER_RETRIES = 2;
 const FALLBACK_IDLE_QUIET_MS = 2000;
 const DIALOG_ACTION_COOLDOWN_MS = 2000;
+// An interactive select menu must be stable (no PTY output) this long before we
+// bridge it to chat — avoids racing a menu that's still rendering.
+const MENU_STABLE_QUIET_MS = 700;
+// After injecting the digit for a menu choice, wait this long, then send Enter
+// only if the menu is still on screen (some TUIs confirm on the digit alone).
+const MENU_SELECT_ENTER_DELAY_MS = 250;
+// Set PTY_SHELL_SKIP_MENU_BRIDGE=1 to disable bridging interactive menus to chat
+// (falls back to leaving the menu on the PTY — use if a TUI update breaks the matcher).
+const SKIP_MENU_BRIDGE = process.env.PTY_SHELL_SKIP_MENU_BRIDGE === '1';
 const STARTUP_TIMEOUT_MS = 120_000;
 const WATCHDOG_MS = process.env.PTY_SHELL_WATCHDOG_MS
   ? Number(process.env.PTY_SHELL_WATCHDOG_MS) || (30 * 60 * 1000)
@@ -67,6 +87,9 @@ interface ActiveTurn {
   dialogEscapes: number;
   /** Snapshot of tailer.seenRecords at turn start — used to detect per-turn output. */
   recordsAtStart: number;
+  /** Set once this turn invoked a menu-raising tool (AskUserQuestion/ExitPlanMode).
+   *  Gates menu bridging so only a transcript-backed menu is bridged to chat. */
+  menuToolSeen: boolean;
 }
 
 class Driver {
@@ -75,10 +98,32 @@ class Driver {
   private startedAt = Date.now();
   private queue: string[] = [];
   private turn: ActiveTurn | null = null;
+  // Set when an interactive menu has been bridged to chat and we're awaiting the
+  // user's choice. While set, the next stdin message is treated as a selection.
+  private pendingMenu: { options: MenuOption[] } | null = null;
+  // Set after ESC-cancelling a bridged menu in response to a free-text reply.
+  // The queued text is held until the TUI settles back to an idle prompt (driven
+  // by tick()), so the paste doesn't race Claude's cancellation redraw.
+  private menuCancel: { since: number; lastEscAt: number; escs: number } | null = null;
+  // Set after a /stop (SIGINT → ESC) interrupted the active turn. An interrupted
+  // turn writes no turn_duration record, so tick() ends it once the TUI is back to
+  // an idle prompt — otherwise a message queued right after /stop would hang behind
+  // a turn that never ends (until the watchdog). Reuses the menu-cancel settle
+  // decision (menuVisible is always false here, so it never re-sends ESC).
+  private interrupting: { since: number; lastEscAt: number; escs: number } | null = null;
+  // True once session_idle has been emitted for the current idle stretch. Reset on
+  // any new activity (turn start / assistant record). Drives the screen-driven idle
+  // reconciliation in tick() so typing is always torn down even when finishTurn()
+  // never ran (turn-tracking desync, external stop) — fires exactly once per idle.
+  private idleNotified = false;
+  // Guards the recoverable "Request too large (max 32MB)" handler so ESC isn't
+  // re-sent every poll while the error overlay lingers. Reset when a new turn begins.
+  private requestTooLargeHandled = false;
   private lastDialogActionAt = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private host!: PtyHost;
   private tailer!: TranscriptTailer;
+  private streamSocket: net.Socket | null = null;
 
   private readonly screen = new ScreenModel();
   private readonly emitter = new ProtocolEmitter();
@@ -105,17 +150,40 @@ class Driver {
     const [realBin, ...realBinArgs] = this.realBinParts;
     logDebug(`session=${this.args.sessionId} bin=${this.realBinParts.join(' ')} args=${this.args.claudeArgs.join(' ')}`);
 
+    const streamSocketPath = process.env.PTY_SHELL_STREAM_SOCKET;
+    if (streamSocketPath) {
+      const sock = net.createConnection(streamSocketPath);
+      sock.on('error', (err) => {
+        // Non-fatal: the registry socket may not be ready yet or was already closed.
+        // Log so timing issues are diagnosable without a restart.
+        logWarn(`stream socket error (${streamSocketPath}): ${err.message}`);
+      });
+      this.streamSocket = sock;
+    }
+
     this.host = new PtyHost(realBin, [...realBinArgs, ...this.args.claudeArgs], {
       cols: this.screen.cols,
       rows: this.screen.rows,
       cwd: process.cwd(),
-      onData: (d) => this.screen.write(d),
+      onData: (d) => {
+        this.screen.write(d);
+        if (this.streamSocket?.writable) {
+          // node-pty emits UTF-8-decoded strings, so re-encode as UTF-8 to keep
+          // multi-byte glyphs (box-drawing ─│╭╮, the braille spinner, emoji)
+          // intact. Writing as latin1 would truncate every code point > 0xFF to
+          // a single byte — those land in the 0x00-0x1F control range and
+          // scramble the viewer's cursor positioning. The client decodes the
+          // stream with TextDecoder('utf-8'), so this is the matching encoding.
+          try { this.streamSocket.write(d, 'utf8'); } catch { /* socket closed */ }
+        }
+      },
       onExit: (code) => this.onChildExit(code),
     });
 
     this.tailer = new TranscriptTailer(process.cwd(), this.args.sessionId, {
       onAssistant: (record) => this.onAssistant(record),
       onTurnEnd: (durationMs) => this.onTurnEnd(durationMs),
+      onRequestTooLarge: () => this.handleRequestTooLarge(),
       onError: (err) => logError(`tailer: ${err.message}`),
     });
     this.tailer.start();
@@ -161,6 +229,12 @@ class Driver {
         });
         return;
       }
+      // A menu is awaiting a choice — interpret this message as the selection
+      // (a typed number or a button tap, which both arrive as plain text).
+      if (this.pendingMenu) {
+        this.handleMenuReply(sanitized);
+        return;
+      }
       this.queue.push(sanitized);
       this.trySubmit();
     });
@@ -177,6 +251,18 @@ class Driver {
       if (this.turn) {
         logWarn('SIGINT → sending ESC to interrupt current turn');
         this.host.writeRaw('\x1b');
+        // Arm interrupt-settle so tick() ends the (now interrupted) turn once the
+        // TUI returns to an idle prompt, then drains anything queued after /stop.
+        // No-op if already armed (repeated SIGINTs during the same interrupt).
+        if (!this.interrupting) {
+          const t = Date.now();
+          this.interrupting = { since: t, lastEscAt: t, escs: 1 };
+        }
+      } else if (this.queue.length > 0) {
+        // No active turn: the message is still in the queue (not yet pasted into
+        // the PTY input). Drop it so /stop doesn't silently submit it later.
+        logWarn(`SIGINT with no active turn — dropping ${this.queue.length} queued message(s)`);
+        this.queue.length = 0;
       }
     });
     process.on('SIGTERM', () => {
@@ -191,11 +277,17 @@ class Driver {
     const usage = record.message.usage;
     if (usage) this.emitter.emitMessageStartShim(usage, this.args.sessionId);
     const text = this.emitter.emitAssistant(record, this.args.sessionId);
+    // New output = activity: re-arm idle reconciliation so a fresh session_idle is
+    // emitted once Claude settles, even if this record arrived outside a tracked turn.
+    this.idleNotified = false;
     if (this.turn) {
       this.turn.sawAssistant = true;
       this.turn.lastProgressAt = Date.now();
       if (text) this.turn.texts.push(text);
       if (usage) this.turn.usage = usage;
+      // Authoritative menu signal: this turn called a menu-raising tool, so a
+      // menu on screen now is real (not a quoted/rendered look-alike).
+      if (hasInteractiveMenuToolUse(record.message)) this.turn.menuToolSeen = true;
     } else {
       logDebug('assistant record outside an active turn (emitted anyway)');
     }
@@ -206,10 +298,42 @@ class Driver {
     if (this.turn) this.finishTurn(false);
   }
 
+  /**
+   * Authoritative recovery for the recoverable 32MB "Request too large" error.
+   * Fired by the transcript tailer when Claude Code writes its `<synthetic>`
+   * error record (NOT by scraping screen text — quoted/re-injected prose can't
+   * forge that record, so this never false-fires). The TUI is showing the
+   * "Double press esc to go back" overlay; dismiss it with ESC so the input
+   * prompt is usable again, then signal the gateway to notify the user and
+   * restart with a fresh context. Once per occurrence via requestTooLargeHandled
+   * (reset when a new turn begins).
+   *
+   * No screen-settle gate is needed here (the old screen-scrape path waited for
+   * quietMs to avoid transient redraws): the transcript record is only written
+   * when the error is real and the overlay rendered, so the signal is already
+   * settled by the time the tailer reads it. A stray ESC at a non-overlay prompt
+   * is harmless, and the guard prevents repeats.
+   */
+  private handleRequestTooLarge(): void {
+    if (this.requestTooLargeHandled) return;
+    this.requestTooLargeHandled = true;
+    logWarn('Request too large (32MB) — synthetic-error record in transcript; dismissing overlay and signalling restart');
+    this.host.writeRaw('\x1b'); // "Double press esc to go back" — send both.
+    this.host.writeRaw('\x1b');
+    this.emitter.emitRequestTooLarge(this.args.sessionId);
+    if (this.turn) {
+      this.finishTurn(true, 'Request too large (max 32MB) — the conversation exceeded Anthropic\'s 32MB request limit. Restarting with a fresh context.');
+    }
+  }
+
   private finishTurn(isError: boolean, errMsg?: string): void {
     const turn = this.turn;
     if (!turn) return;
     this.turn = null;
+    // Clear any armed interrupt-settle — the turn is ending now regardless of how
+    // (interrupt path, normal turn_duration, or error), so a stale flag must not
+    // linger and block the next trySubmit().
+    this.interrupting = null;
     this.tailer.flush(); // drain any records written in the last poll window
     const text = turn.texts.join('');
     this.emitter.emitResult({
@@ -221,14 +345,32 @@ class Driver {
     });
     if (isError) logError(`turn failed: ${errMsg ?? '(no detail)'}`);
     this.trySubmit();
+    // If no new turn started and the queue is empty, the session is truly idle.
+    // Emit session_idle so runner.ts can stop the typing indicator cleanly,
+    // without relying on the short per-result timer that fires during tool-call gaps.
+    if (!this.turn && this.queue.length === 0) {
+      this.idleNotified = true;
+      this.emitter.emitSessionIdle(this.args.sessionId);
+    }
   }
 
   // ---- turn submission -----------------------------------------------------
 
   private trySubmit(): void {
-    if (!this.ready || this.turn || this.queue.length === 0 || this.exiting) return;
+    // While menuCancel is armed, submission is deferred to tick() until the TUI
+    // settles after an ESC menu-cancel — don't let an event-driven trySubmit
+    // (e.g. a second incoming message) paste into the cancellation transition.
+    if (!this.ready || this.turn || this.queue.length === 0 || this.exiting || this.menuCancel || this.interrupting) return;
     const text = this.queue.shift() as string;
+    this.beginTurn();
+    void this.typeAndSubmit(text);
+  }
+
+  /** Initialize a fresh active turn (shared by normal submit and menu selection). */
+  private beginTurn(): void {
     const now = Date.now();
+    this.idleNotified = false;
+    this.requestTooLargeHandled = false;
     this.turn = {
       startedAt: now,
       submittedAt: 0,
@@ -240,11 +382,17 @@ class Driver {
       usage: null,
       dialogEscapes: 0,
       recordsAtStart: this.tailer.seenRecords,
+      menuToolSeen: false,
     };
-    void this.typeAndSubmit(text);
   }
 
   private async typeAndSubmit(text: string): Promise<void> {
+    // Pre-paste guard: if SIGINT already fired between beginTurn() and here, skip the
+    // paste entirely — no text lands in the PTY input so no clearing is needed.
+    if (this.interrupting || !this.turn) {
+      this.queue.length = 0;
+      return;
+    }
     if (NO_BRACKETED_PASTE) {
       // Fallback: sanitizeUserText() strips all CR, so '\r' below is the only
       // submit trigger — safe for multiline text without bracketed paste.
@@ -255,8 +403,23 @@ class Driver {
       await this.host.writeChunked(`\x1b[200~${text}\x1b[201~`);
     }
     await new Promise((r) => setTimeout(r, SUBMIT_ENTER_DELAY_MS));
+    // If interrupted while waiting (SIGINT arrived after paste but before Enter),
+    // clear the PTY input line instead of submitting — prevents stuck text in the
+    // prompt that would be prepended to the user's next message.
+    // Also clear the queue so any messages queued behind this one don't surface
+    // after the turn is abandoned (matches the SIGINT queue-drop logic above).
+    if (this.abortIfInterrupted()) return;
     this.host.writeRaw('\r');
     if (this.turn) this.turn.submittedAt = Date.now();
+  }
+
+  // Sends Ctrl+U to clear the PTY input line, drains the queue, and returns true.
+  // Call after writing to the PTY when an interrupt may have arrived mid-write.
+  private abortIfInterrupted(): boolean {
+    if (!this.interrupting && this.turn) return false;
+    this.host.writeRaw('\x15'); // Ctrl+U: clear input line
+    this.queue.length = 0;
+    return true;
   }
 
   // ---- periodic liveness poll ----------------------------------------------
@@ -294,15 +457,95 @@ class Driver {
       return;
     }
 
-    const turn = this.turn;
-    if (!turn || turn.submittedAt === 0) return;
-
-    // Touch heartbeat so the receiver's stalled detector doesn't fire during
-    // long sub-agent tasks where the PTY is busy but no JSON lines are emitted.
-    if (this.heartbeatPath && now - this.lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+    // Heartbeat follows PTY liveness, NOT turn tracking. During a long request
+    // assembly (the TUI shows "Baked for 6m…"), context compaction, a long
+    // sub-agent task, an interrupt/menu-cancel settle, or a turn-tracking desync,
+    // `this.turn` may be null or unsubmitted while Claude is genuinely working.
+    // isPtyActivelyWorking() treats the session as alive when the busy spinner is
+    // on screen OR the PTY emitted output recently — keeping the receiver's 5-min
+    // stalled detector from false-firing mid-work.
+    const ptyAlive = isPtyActivelyWorking(
+      { isBusy: this.screen.isBusy(), quietMs: this.screen.quietMs() },
+      HEARTBEAT_LIVENESS_QUIET_MS,
+    );
+    if (this.heartbeatPath
+        && ptyAlive
+        && now - this.lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
       this.lastHeartbeatAt = now;
       try { fs.writeFileSync(this.heartbeatPath, String(now)); } catch {}
     }
+
+    // Screen-driven idle reconciliation (typing-teardown safety net). If the TUI
+    // is sitting at a quiet idle prompt with no pending work, the session is idle —
+    // emit session_idle so runner.ts tears down the typing indicator. This covers
+    // turn-tracking desyncs where finishTurn() ended `this.turn` early (or never
+    // ran) while Claude kept working: without it the typing bubble + tool-call
+    // status stick forever. Fires once per idle stretch via the idleNotified guard.
+    if (!this.idleNotified
+        && !this.turn && !this.interrupting && !this.menuCancel && !this.pendingMenu
+        && this.queue.length === 0
+        && this.screen.hasPrompt() && !this.screen.isBusy()
+        && this.screen.quietMs() >= FALLBACK_IDLE_QUIET_MS) {
+      logDebug('screen idle with no pending work — emitting session_idle (reconciliation)');
+      this.idleNotified = true;
+      this.emitter.emitSessionIdle(this.args.sessionId);
+    }
+
+    // Waiting for the TUI to settle after ESC-cancelling a bridged menu (the user
+    // typed a free-text reply instead of a number). Submit the queued prompt only
+    // once the menu is gone and the prompt is idle — otherwise the paste races
+    // Claude's cancellation redraw and never lands (→ watchdog hang).
+    if (this.menuCancel) {
+      const action = decideMenuCancel(this.menuCancel, {
+        now,
+        menuVisible: this.screen.interactivePromptBlocking(),
+        hasPrompt: this.screen.hasPrompt(),
+        isBusy: this.screen.isBusy(),
+        quietMs: this.screen.quietMs(),
+      });
+      if (action === 'submit') {
+        logDebug('menu cancelled and TUI settled — submitting queued prompt');
+        this.menuCancel = null;
+        this.trySubmit();
+      } else if (action === 'resend-esc') {
+        this.menuCancel.escs++;
+        this.menuCancel.lastEscAt = now;
+        logWarn(`menu still on screen after cancel — re-sending ESC (${this.menuCancel.escs}/3)`);
+        this.host.writeRaw('\x1b');
+      }
+      return;
+    }
+
+    // Settling after a /stop interrupt (SIGINT → ESC). The interrupted turn is
+    // still active (Claude writes no turn_duration for an interrupted turn), so
+    // end it as soon as the TUI is back to a quiet idle prompt — finishTurn()
+    // emits the result (clearing the gateway's in-flight state) and trySubmit()
+    // drains anything the user queued after /stop. Without this, a turn interrupted
+    // before any assistant output never meets the fallback below and the next
+    // message hangs behind it until the watchdog. menuVisible is false here, so the
+    // shared decision never returns 'resend-esc' — only 'wait' or (settle/timeout)
+    // 'submit'.
+    if (this.interrupting) {
+      const action = decideMenuCancel(this.interrupting, {
+        now,
+        menuVisible: false,
+        hasPrompt: this.screen.hasPrompt(),
+        isBusy: this.screen.isBusy(),
+        quietMs: this.screen.quietMs(),
+      });
+      if (action === 'submit') {
+        logDebug('interrupt settled — ending interrupted turn');
+        this.interrupting = null;
+        this.finishTurn(false);
+      }
+      return;
+    }
+
+    const turn = this.turn;
+    if (!turn || turn.submittedAt === 0) return;
+
+    // (Heartbeat is written above, gated on the busy spinner — covers this active
+    // turn as well as settle/desync states where `this.turn` is null.)
 
     if (this.screen.consumeBusySeen() || this.screen.isBusy()) {
       turn.sawBusy = true;
@@ -310,9 +553,19 @@ class Driver {
       return;
     }
 
-    // Not busy. Possible: still rendering, swallowed Enter, dialog, or done
+    // Not busy. Possible: still rendering, swallowed Enter, dialog, menu, or done
     // (turn_duration normally ends the turn before we get here).
     this.maybeHandleDialog();
+
+    // Blocked on an interactive select menu → bridge it to chat and end the turn
+    // so the session goes idle (no watchdog kill) until the user picks an option.
+    if (this.maybeBridgeMenu(turn)) return;
+
+    // Blocked on a tool-permission prompt (e.g. the dangerous-rm circuit breaker
+    // that fires even under --dangerously-skip-permissions). Bridge the Yes/No to
+    // chat for a human to decide — never auto-accept — and end the turn so the
+    // session goes idle instead of wedging until the watchdog.
+    if (this.maybeBridgePermissionPrompt(turn)) return;
 
     if (!turn.sawBusy
         && now - turn.submittedAt > SUBMIT_RETRY_AFTER_MS
@@ -365,6 +618,154 @@ class Driver {
     }
   }
 
+  // ---- interactive menu bridging ------------------------------------------
+
+  /**
+   * If the TUI is blocked on an interactive select menu, emit it to the gateway
+   * (rendered as chat buttons / numbered text) and end the turn so the session
+   * goes idle while we await the user's choice. Returns true if it bridged.
+   *
+   * Never auto-selects — a destructive option must be a human decision. The
+   * bypass-permissions dialog also shows the menu footer, so it's excluded here
+   * and left to maybeHandleDialog()'s auto-accept.
+   */
+  private maybeBridgeMenu(turn: ActiveTurn): boolean {
+    if (SKIP_MENU_BRIDGE || this.pendingMenu) return false;
+    // Authoritative gate: only bridge when this turn actually invoked a menu tool
+    // (AskUserQuestion/ExitPlanMode). Without it, a reply or re-injected history
+    // that renders a numbered list + the menu footer would spawn a phantom menu.
+    // The transcript tool_use can't be forged by on-screen text. Fails safe: if a
+    // genuine non-tool menu ever exists it simply isn't bridged (no false buttons).
+    if (!turn.menuToolSeen) return false;
+    if (this.screen.quietMs() < MENU_STABLE_QUIET_MS) return false;
+    if (this.screen.detectDialog() === 'bypass-permissions') return false;
+    const options = this.screen.detectMenu();
+    if (!options) return false;
+
+    const prompt = formatMenuPrompt(options);
+    logWarn(`interactive menu detected (${options.length} options) — bridging to chat`);
+    this.bridgeChoiceToChat(turn, options, prompt);
+    return true;
+  }
+
+  /**
+   * Shared tail of maybeBridgeMenu / maybeBridgePermissionPrompt: emit the
+   * channel-native choice UI, carry the same text as the turn's result (API/no-
+   * button fallback + chat history), record the pending menu so the reply routes
+   * back to a selection, and end the turn so the session goes idle while awaiting
+   * the human's choice.
+   */
+  private bridgeChoiceToChat(turn: ActiveTurn, options: MenuOption[], text: string): void {
+    this.emitter.emitMenuPrompt({ sessionId: this.args.sessionId, prompt: text, options });
+    turn.texts.push((turn.texts.length ? '\n\n' : '') + text);
+    this.pendingMenu = { options };
+    this.finishTurn(false);
+  }
+
+  /**
+   * If the TUI is blocked on a tool-permission prompt, bridge it to chat as a
+   * Yes/No choice (reusing the menu machinery: emit → buttons → handleMenuReply)
+   * and end the turn so the session goes idle while awaiting the human's decision.
+   * Returns true if it bridged.
+   *
+   * This is the fix for the wedge: Claude Code keeps a few catastrophe guards
+   * (dangerous rm, root/home deletes) that prompt EVEN under
+   * --dangerously-skip-permissions, which the wrapper otherwise assumes never
+   * happens. Such a prompt is neither the startup bypass dialog nor an
+   * AskUserQuestion menu, so without this it is never surfaced and the PTY hangs
+   * at the Yes/No until the 30-min watchdog kills the session.
+   *
+   * NEVER auto-selects — a guarded/destructive operation must be a human decision.
+   * Unlike maybeBridgeMenu there is no transcript tool_use to gate on (the circuit
+   * breaker is CLI-internal UI, not written to the transcript), so detection rests
+   * on detectPermissionPrompt()'s region + multi-marker guard plus the settle
+   * gate. That is the same defense detectDialog() relies on, and bridging to a
+   * human is strictly safer than detectDialog()'s auto-keypress.
+   */
+  private maybeBridgePermissionPrompt(turn: ActiveTurn): boolean {
+    if (SKIP_MENU_BRIDGE || this.pendingMenu) return false;
+    if (this.screen.quietMs() < MENU_STABLE_QUIET_MS) return false;
+    // The bypass-permissions startup dialog is auto-accepted by maybeHandleDialog().
+    if (this.screen.detectDialog() === 'bypass-permissions') return false;
+    const prompt = this.screen.detectPermissionPrompt();
+    if (!prompt) return false;
+
+    const text = formatPermissionPrompt(prompt.context, prompt.options);
+    logWarn(`permission prompt detected (${prompt.options.length} options) — bridging to chat (never auto-accepted)`);
+    this.bridgeChoiceToChat(turn, prompt.options, text);
+    return true;
+  }
+
+  /** Route a user's menu reply (typed number or button tap) to a selection. */
+  private handleMenuReply(text: string): void {
+    const menu = this.pendingMenu;
+    if (!menu) return;
+    // Channel turns arrive wrapped in a <channel …>…</channel> envelope, so the
+    // bare "1" is buried inside it — unwrap before parsing the selection.
+    const choiceText = extractChannelContent(text);
+    // Explicit cancel from a "❌ Cancel" button (Telegram/Discord): send ESC to
+    // dismiss the menu cleanly without queuing any text into Claude's context.
+    // Unlike the "invalid text → ESC + re-queue" path, this leaves the queue
+    // empty so the session just returns to the idle prompt with no side-effects.
+    if (choiceText === '__MENU_CANCEL__') {
+      logWarn('menu cancel received — sending ESC to dismiss');
+      this.host.writeRaw('\x1b');
+      this.pendingMenu = null;
+      // No queue push, no menuCancel needed: ESC dismisses the TUI menu and
+      // Claude resumes normally. The session is simply idle again.
+      return;
+    }
+    const n = parseMenuChoice(choiceText, menu.options.length);
+    if (n === null) {
+      // Not a valid choice — cancel the menu and treat the text as a new prompt
+      // so the user can break out by typing an instruction instead of a number.
+      // Re-queue the ORIGINAL envelope so Claude still sees the full channel context.
+      //
+      // ESC makes Claude resume (it processes the menu cancellation), so the TUI
+      // is briefly busy/redrawing. Submitting the text immediately races that
+      // transition and the prompt never lands → 30-min watchdog hang. Instead we
+      // arm menuCancel and let tick() submit once the TUI is back to an idle
+      // prompt. trySubmit() is gated on !menuCancel so nothing fires early.
+      logWarn(`menu reply "${choiceText.slice(0, 40)}" is not a valid choice — cancelling menu`);
+      this.host.writeRaw('\x1b');
+      this.pendingMenu = null;
+      this.queue.push(text);
+      const now = Date.now();
+      this.menuCancel = { since: now, lastEscAt: now, escs: 1 };
+      return;
+    }
+    logDebug(`menu selection: ${n}`);
+    this.pendingMenu = null;
+    this.beginTurn();
+    void this.selectMenuOption(n);
+  }
+
+  /**
+   * Inject the keystrokes that select option `n`. Sends the digit, then Enter
+   * only if the menu is still on screen — self-correcting whether the TUI
+   * confirms on the digit alone or requires Enter.
+   */
+  private async selectMenuOption(n: number): Promise<void> {
+    // Pre-write guard: mirrors typeAndSubmit's pre-paste guard — if SIGINT already fired,
+    // skip the write entirely so no digit lands in the PTY input.
+    if (this.interrupting || !this.turn) {
+      this.queue.length = 0;
+      return;
+    }
+    this.host.writeRaw(String(n));
+    await new Promise((r) => setTimeout(r, MENU_SELECT_ENTER_DELAY_MS));
+    // If interrupted while waiting, erase the digit so it doesn't linger in the PTY
+    // input and get prepended to the user's next message.
+    if (this.abortIfInterrupted()) return;
+    // Send Enter only if a selectable prompt is still blocking at the bottom of the
+    // screen — covers both the AskUserQuestion menu and the permission prompt, and
+    // self-corrects when the digit alone already confirmed (prompt gone → no stray
+    // Enter). Bottom-region scoped so stale footer/option text left in scrollback by
+    // the just-answered prompt can't submit an empty line at the idle caret.
+    if (this.screen.interactivePromptBlocking()) this.host.writeRaw('\r');
+    if (this.turn) this.turn.submittedAt = Date.now();
+  }
+
   // ---- lifecycle ------------------------------------------------------------
 
   private onChildExit(code: number): void {
@@ -384,6 +785,7 @@ class Driver {
     this.exiting = true;
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.tailer.stop();
+    if (this.streamSocket) { try { this.streamSocket.destroy(); } catch { /* ignore */ } }
     this.host.kill();
     // PtyHost.onExit will exit(child code); this is the safety net.
     setTimeout(() => process.exit(code), 1500).unref();

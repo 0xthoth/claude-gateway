@@ -123,6 +123,16 @@ function getIdleCleaner(runner: AgentRunner): ReturnType<typeof setInterval> | u
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// Shrink the channel-coalescing debounce window file-wide so image POSTs flush
+// almost immediately — existing image tests assume a near-instant spawn. Tests
+// that exercise the debounce timing itself set their own larger value.
+beforeAll(() => {
+  process.env.CHANNEL_COALESCE_WINDOW_MS = '20';
+});
+afterAll(() => {
+  delete process.env.CHANNEL_COALESCE_WINDOW_MS;
+});
+
 describe('AgentRunner (session pool)', () => {
   let tmpDir: string;
   let agentConfig: AgentConfig;
@@ -264,6 +274,55 @@ describe('AgentRunner (session pool)', () => {
     }
 
     expect(getSessions(runner).size).toBe(0);
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-AR-TOOLARGE-02: the recovery counter is wired into spawn — a session
+  //   spawned while mid-escalation gets the shrunk historyLimit (ladder rung).
+  // --------------------------------------------------------------------------
+  it('U-AR-TOOLARGE-02: spawn applies the escalated historyLimit from the counter', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    // Simulate two prior 32MB recoveries on this chat (rung 2 = 30 messages).
+    (runner as unknown as { tooLargeRecoveries: Map<string, number> })
+      .tooLargeRecoveries.set('chat:esc', 2);
+
+    await sendChannelPost(port, 'chat:esc', 'hello again');
+    await new Promise(r => setTimeout(r, 100));
+
+    const sess = getSessions(runner).get('chat:esc')!;
+    expect(sess).toBeDefined();
+    expect(sess.historyLimit).toBe(30); // TOO_LARGE_HISTORY_LADDER[2]
+  }, 15000);
+
+  // --------------------------------------------------------------------------
+  // U-AR-TOOLARGE-03: a successful result clears the escalation counter so the
+  //   next 32MB starts fresh at the top of the ladder (full history again).
+  // --------------------------------------------------------------------------
+  it('U-AR-TOOLARGE-03: a successful result resets the recovery counter', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:reset', 'hi');
+    await new Promise(r => setTimeout(r, 100));
+
+    const internal = runner as unknown as {
+      tooLargeRecoveries: Map<string, number>;
+      tooLargeExhausted: Set<string>;
+    };
+    internal.tooLargeRecoveries.set('chat:reset', 3);
+    internal.tooLargeExhausted.add('chat:reset');
+
+    // A genuine successful result on this session must clear the escalation.
+    const sess = getSessions(runner).get('chat:reset')!;
+    sess.emit('output', JSON.stringify({ type: 'result', is_error: false, result: 'all good' }));
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(internal.tooLargeRecoveries.has('chat:reset')).toBe(false);
+    expect(internal.tooLargeExhausted.has('chat:reset')).toBe(false);
   }, 15000);
 });
 
@@ -434,6 +493,43 @@ describe('AgentRunner — restartOrDefer', () => {
     // Session should now be stopped and removed via deferredRestartReady listener
     expect(getSessions(runner).has('chat:defer')).toBe(false);
   }, 15000);
+
+  // --------------------------------------------------------------------------
+  // RS7: skipBusy — busy session is left running (no deferred restart),
+  //      idle session is still stopped immediately
+  // --------------------------------------------------------------------------
+  it('RS7: skipBusy leaves busy sessions running but still restarts idle ones', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const port = getCallbackPort(runner);
+    await sendChannelPost(port, 'chat:a', 'hi');
+    await new Promise(r => setTimeout(r, 100));
+    await sendChannelPost(port, 'chat:b', 'hi');
+    await new Promise(r => setTimeout(r, 100));
+
+    const sessA = getSessions(runner).get('chat:a')!;
+    const sessB = getSessions(runner).get('chat:b')!;
+    // sessA idle (turn completed), sessB busy (agent wrote MEMORY.md mid-turn)
+    sessA.setProcessing(false);
+    sessB.setProcessing(true);
+    const stopSpyB = jest.spyOn(sessB, 'stop');
+    const pendingSpyB = jest.spyOn(sessB, 'markPendingRestart');
+
+    await runner.restartOrDefer({ skipBusy: true });
+
+    // idle session restarted (stopped + removed)
+    expect(getSessions(runner).has('chat:a')).toBe(false);
+    // busy session untouched: not stopped, not armed for deferred restart
+    expect(getSessions(runner).has('chat:b')).toBe(true);
+    expect(stopSpyB).not.toHaveBeenCalled();
+    expect(pendingSpyB).not.toHaveBeenCalled();
+
+    // And completing its turn must NOT stop it (no footgun)
+    sessB.setProcessing(false);
+    await new Promise(r => setTimeout(r, 50));
+    expect(getSessions(runner).has('chat:b')).toBe(true);
+  }, 15000);
 });
 
 // ── Typing error notification tests ───────────────────────────────────────────
@@ -521,6 +617,49 @@ describe('AgentRunner — typing error notification', () => {
     expect(fs.existsSync(forwardFile)).toBe(true);
     const content = JSON.parse(fs.readFileSync(forwardFile, 'utf8'));
     expect(content).toEqual({ text: 'Hello <code>code</code>', format: 'html' });
+  });
+
+  // --------------------------------------------------------------------------
+  // U-AR-TOOLARGE-01: request_too_large recovery escalates the history ladder
+  //   (50→40→30→20→10→0) and pins at the last rung once 0-history still trips.
+  //   Covers Bug B (headless) + Bug A (PTY) — both route through this handler.
+  // --------------------------------------------------------------------------
+  it('U-AR-TOOLARGE-01: handleRequestTooLarge escalates, gives up, then stops churning', () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    const r = runner as unknown as {
+      handleRequestTooLarge: (mapKey: string, proc: { setProcessing: (b: boolean) => void }) => void;
+      tooLargeRecoveries: Map<string, number>;
+      tooLargeExhausted: Set<string>;
+      restartProcess: (chatId: string) => Promise<void>;
+    };
+    // Spy restartProcess to count restarts without touching the (empty) session pool.
+    const restartSpy = jest.spyOn(r, 'restartProcess').mockResolvedValue(undefined);
+    const proc = { setProcessing: jest.fn() };
+    const forwardFile = path.join(getTypingDir(), 'chat:big.forward');
+    const readForward = () => JSON.parse(fs.readFileSync(forwardFile, 'utf8')).text as string;
+
+    // Rungs 1..5 → counter climbs, each emits the "Restarting" resend notice + restarts.
+    for (let i = 1; i <= 5; i++) {
+      r.handleRequestTooLarge('chat:big', proc);
+      expect(r.tooLargeRecoveries.get('chat:big')).toBe(i);
+      expect(readForward()).toContain('32MB request limit');
+    }
+    expect(proc.setProcessing).toHaveBeenLastCalledWith(false);
+    expect(restartSpy).toHaveBeenCalledTimes(5);
+
+    // 6th: even 0-history tripped → pin at last rung (5), tell the user to /clear,
+    // and restart ONCE more to clear the wedged process (6 restarts total).
+    r.handleRequestTooLarge('chat:big', proc);
+    expect(r.tooLargeRecoveries.get('chat:big')).toBe(5);
+    expect(r.tooLargeExhausted.has('chat:big')).toBe(true);
+    expect(readForward()).toContain('/clear');
+    expect(restartSpy).toHaveBeenCalledTimes(6);
+
+    // 7th+: still exhausted → keep re-notifying /clear but NO further restart (no churn).
+    r.handleRequestTooLarge('chat:big', proc);
+    r.handleRequestTooLarge('chat:big', proc);
+    expect(readForward()).toContain('/clear');
+    expect(restartSpy).toHaveBeenCalledTimes(6);
   });
 
   // --------------------------------------------------------------------------
@@ -3318,4 +3457,363 @@ describe('AgentRunner — API attachment buffer', () => {
     expect(attachments[0].url).toBe('/v1/agents/alfred/media/api-sess/screen.jpg');
     expect(attachments[0].relPath).toBe('api-sess/screen.jpg');
   });
+});
+
+// ── getSessionsSummary: dedup respawned sessions ──────────────────────────────
+describe('AgentRunner — getSessionsSummary dedup', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-summary-'));
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    agentConfig = makeAgentConfig(workspace);
+    gatewayConfig = makeGatewayConfig();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  type HistoryEntry = { chatId: string; sessionId: string; source: string; mode: string; model: string; spawnedAt: number };
+  function internals(runner: AgentRunner) {
+    return runner as unknown as {
+      sessionHistory: HistoryEntry[];
+      sessions: Map<string, SessionProcess>;
+      apiChatIds: Map<string, string>;
+    };
+  }
+  function stubProc(spawnedAt: number, totalTokens: number): SessionProcess {
+    return { spawnedAt, totalTokens } as unknown as SessionProcess;
+  }
+  function entry(over: Partial<HistoryEntry>): HistoryEntry {
+    return { chatId: 'getpod', sessionId: 'sess-A', source: 'api', mode: 'pty-shell', model: 'sonnet-4-6', spawnedAt: 0, ...over };
+  }
+
+  it('collapses a respawned session (same sessionId) into one running row', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const internal = internals(runner);
+    // History is newest-first (unshift): the 10:34 respawn precedes the 10:32 spawn.
+    internal.sessionHistory.push(entry({ spawnedAt: 1_000_034_000 })); // newest = current incarnation
+    internal.sessionHistory.push(entry({ spawnedAt: 1_000_032_000 })); // stale pre-respawn entry
+    internal.sessions.set('getpod', stubProc(1_000_034_000, 47_000));
+
+    const rows = runner.getSessionsSummary();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sessionId).toBe('sess-A');
+    expect(rows[0].isRunning).toBe(true);
+    expect(rows[0].spawnedAt).toBe(1_000_034_000);
+    expect(rows[0].tokens).toBe(47_000);
+  });
+
+  it('a stale pre-respawn entry never borrows the live process running state', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const internal = internals(runner);
+    // Keep ONLY the stale entry in history; the live proc is a newer incarnation.
+    internal.sessionHistory.push(entry({ spawnedAt: 1_000_032_000 }));
+    internal.sessions.set('getpod', stubProc(1_000_034_000, 47_000)); // different spawnedAt
+
+    const rows = runner.getSessionsSummary();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].isRunning).toBe(false); // spawnedAt mismatch → not this incarnation
+    expect(rows[0].tokens).toBe(0); // stopped rows report 0 tokens
+  });
+
+  it('keeps genuinely distinct sessions as separate rows', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const internal = internals(runner);
+    internal.sessionHistory.push(entry({ chatId: 'chat:1', sessionId: 'sess-A', source: 'telegram', spawnedAt: 2_000 }));
+    internal.sessionHistory.push(entry({ chatId: 'chat:1', sessionId: 'sess-B', source: 'telegram', spawnedAt: 1_000 }));
+
+    const rows = runner.getSessionsSummary();
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map(r => r.sessionId))).toEqual(new Set(['sess-A', 'sess-B']));
+  });
+
+  it('reports a stopped session (no live process) as not running with 0 tokens', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const internal = internals(runner);
+    internal.sessionHistory.push(entry({ spawnedAt: 1_000_032_000 }));
+    // no proc in sessions map
+
+    const rows = runner.getSessionsSummary();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].isRunning).toBe(false);
+    expect(rows[0].tokens).toBe(0);
+  });
+});
+
+// ── writeMenuForward: atomic .menu file ────────────────────────────────────────
+describe('AgentRunner — writeMenuForward', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-menu-'));
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    agentConfig = makeAgentConfig(workspace);
+    gatewayConfig = makeGatewayConfig();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function callWriteMenu(runner: AgentRunner, chatId: string, text: string, options: Array<{ label: string }>): void {
+    (runner as unknown as { writeMenuForward(c: string, t: string, o: Array<{ label: string }>): void })
+      .writeMenuForward(chatId, text, options);
+  }
+
+  it('writes a .menu file with correct JSON content', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const chatId = '997170033';
+    callWriteMenu(runner, chatId, 'Pick one:', [{ label: 'Alpha' }, { label: 'Beta' }]);
+
+    const typingDir = (runner as unknown as { getTypingDir(c: string): string }).getTypingDir(chatId);
+    const menuPath = path.join(typingDir, `${chatId}.menu`);
+    expect(fs.existsSync(menuPath)).toBe(true);
+    const parsed = JSON.parse(fs.readFileSync(menuPath, 'utf8'));
+    expect(parsed.text).toBe('Pick one:');
+    expect(parsed.options).toEqual([{ label: 'Alpha' }, { label: 'Beta' }]);
+  });
+
+  it('leaves no .tmp file after successful write (atomic rename)', () => {
+    const runner = new AgentRunner(agentConfig, gatewayConfig);
+    const chatId = '997170033';
+    callWriteMenu(runner, chatId, 'Q', [{ label: 'X' }]);
+
+    const typingDir = (runner as unknown as { getTypingDir(c: string): string }).getTypingDir(chatId);
+    const tmpPath = path.join(typingDir, `${chatId}.menu.tmp`);
+    expect(fs.existsSync(tmpPath)).toBe(false);
+  });
+});
+
+// ── Idle eviction must not delete history-referenced media ─────────────────────
+//
+// Regression for the "Unavailable" screenshot bug: stopping an api session (idle
+// eviction or the idle cleaner) used to fs.rmSync the whole media/api-<sessionId>
+// dir, deleting files still referenced by rows in history.db. The DB row outlived
+// the file → GET /media 404 → the client rendered "Unavailable". Eviction must
+// only drop the in-memory chat-id mapping; media lives as long as its history.
+
+describe('AgentRunner — idle eviction preserves media', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-evict-media-'));
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    agentConfig = makeAgentConfig(workspace);
+    fs.mkdirSync(workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  function callEvict(r: AgentRunner, sessionId: string): void {
+    const runner = r as unknown as Record<string, unknown>;
+    if (typeof runner['evictApiSessionMapping'] !== 'function') {
+      throw new Error('evictApiSessionMapping not found — method may have been renamed');
+    }
+    (runner['evictApiSessionMapping'] as (s: string) => void)(sessionId);
+  }
+
+  function getApiChatIds(r: AgentRunner): Map<string, string> {
+    return (r as unknown as { apiChatIds: Map<string, string> }).apiChatIds;
+  }
+
+  // EM-01: evicting an api session keeps its media dir on disk
+  it('EM-01: evicting an api session does not delete its media dir', () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+
+    const sessionId = 'evict-1';
+    const mediaAbs = path.join(tmpDir, 'agents', 'alfred', 'media', `api-${sessionId}`, 'shot.jpg');
+    fs.mkdirSync(path.dirname(mediaAbs), { recursive: true });
+    fs.writeFileSync(mediaAbs, 'fake-image');
+
+    // Simulate a live mapping created during the turn, then evict.
+    getApiChatIds(runner).set(sessionId, 'test-chat');
+    callEvict(runner, sessionId);
+
+    // Media survives — history rows still reference it.
+    expect(fs.existsSync(mediaAbs)).toBe(true);
+    // In-memory mapping is cleared.
+    expect(getApiChatIds(runner).has(sessionId)).toBe(false);
+  });
+
+  // EM-02: non-api sessions are a safe no-op (mapping cleared, nothing else touched)
+  it('EM-02: evicting a non-api session is a safe no-op', () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+
+    const sessionId = 'chat:telegram-1';
+    const mediaAbs = path.join(tmpDir, 'agents', 'alfred', 'media', `api-${sessionId}`, 'shot.jpg');
+    fs.mkdirSync(path.dirname(mediaAbs), { recursive: true });
+    fs.writeFileSync(mediaAbs, 'fake-image');
+
+    getApiChatIds(runner).set(sessionId, 'chat:telegram-1');
+
+    expect(() => callEvict(runner, sessionId)).not.toThrow();
+    expect(getApiChatIds(runner).has(sessionId)).toBe(false);
+    // No files should be deleted — media dir still intact
+    expect(fs.existsSync(mediaAbs)).toBe(true);
+  });
+});
+
+// ── Channel message coalescing (image + text → one turn) ───────────────────────
+describe('AgentRunner — channel coalescing (US-IMG-COALESCE)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    // Use a deliberately wide window here so debounce timing is observable.
+    process.env.CHANNEL_COALESCE_WINDOW_MS = '300';
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-coalesce-'));
+    agentConfig = makeAgentConfig(path.join(tmpDir, 'workspace'));
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    process.env.CHANNEL_COALESCE_WINDOW_MS = '20'; // restore file-wide default
+    jest.clearAllMocks();
+  });
+
+  async function postImage(
+    port: number,
+    chatId: string,
+    imagePath: string,
+    content = '',
+    messageId = '1',
+  ): Promise<void> {
+    await fetch(`http://127.0.0.1:${port}/channel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content,
+        meta: { chat_id: chatId, message_id: messageId, user: 'testuser', ts: new Date().toISOString(), image_path: imagePath },
+      }),
+    });
+  }
+
+  function turnWritesOf(): string[] {
+    const proc = allProcesses.find(p => !p.killed && p.stdin!.write.mock.calls.length > 0);
+    return proc ? proc.stdin!.write.mock.calls.map((c: unknown[]) => String(c[0])) : [];
+  }
+
+  // CL-01: plain text takes the fast path — spawns immediately despite a wide window.
+  it('CL-01: plain text message is injected immediately (no debounce)', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:cl01', 'hello there');
+    // Well under the 300ms window — a buffered message would NOT be here yet.
+    await new Promise(r => setTimeout(r, 120));
+
+    expect(getSessions(runner).has('chat:cl01')).toBe(true);
+  }, 15000);
+
+  // CL-02: a message carrying an image is held until the debounce window elapses.
+  it('CL-02: image message is debounced until the window elapses', async () => {
+    const img = path.join(tmpDir, 'cl02.jpg');
+    fs.writeFileSync(img, Buffer.alloc(64));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await postImage(port, 'chat:cl02', img, 'look at this');
+    await new Promise(r => setTimeout(r, 120));
+    // Still inside the window → not flushed yet.
+    expect(getSessions(runner).has('chat:cl02')).toBe(false);
+
+    await new Promise(r => setTimeout(r, 350));
+    // Past the window → flushed and spawned.
+    expect(getSessions(runner).has('chat:cl02')).toBe(true);
+  }, 15000);
+
+  // CL-03: an image followed by a separate text message within the window are
+  // merged into ONE turn (the photo and its instruction land together).
+  it('CL-03: image then follow-up text merge into a single turn', async () => {
+    const img = path.join(tmpDir, 'merge-img.jpg');
+    fs.writeFileSync(img, Buffer.alloc(64));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await postImage(port, 'chat:cl03', img, '', '10');
+    await new Promise(r => setTimeout(r, 80)); // within window
+    await sendChannelPost(port, 'chat:cl03', 'MERGE_MARKER_TEXT');
+
+    await new Promise(r => setTimeout(r, 450)); // let the window flush
+
+    // Exactly one session for the chat.
+    expect(getSessions(runner).has('chat:cl03')).toBe(true);
+
+    // The injected turn carries BOTH the image and the text in a single write.
+    const writes = turnWritesOf();
+    const turn = writes.find(w => w.includes('merge-img.jpg'));
+    expect(turn).toBeDefined();
+    expect(turn).toContain('MERGE_MARKER_TEXT');
+  }, 15000);
+
+  // CL-04: an album burst (two rapid images) coalesces — both image paths in one turn.
+  it('CL-04: rapid image burst coalesces into one turn with both images', async () => {
+    const img1 = path.join(tmpDir, 'album-a.jpg');
+    const img2 = path.join(tmpDir, 'album-b.jpg');
+    fs.writeFileSync(img1, Buffer.alloc(64));
+    fs.writeFileSync(img2, Buffer.alloc(64));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await postImage(port, 'chat:cl04', img1, 'album caption', '20');
+    await postImage(port, 'chat:cl04', img2, '', '21');
+
+    await new Promise(r => setTimeout(r, 450));
+
+    const writes = turnWritesOf();
+    const turn = writes.find(w => w.includes('album-a.jpg'));
+    expect(turn).toBeDefined();
+    expect(turn).toContain('album-b.jpg');
+  }, 15000);
+
+  // CL-05: pending coalesce timers are cleared on stop() (no dangling buffers).
+  it('CL-05: stop() clears any pending coalesce buffer', async () => {
+    const img = path.join(tmpDir, 'cl05.jpg');
+    fs.writeFileSync(img, Buffer.alloc(64));
+
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await postImage(port, 'chat:cl05', img, 'pending');
+    await new Promise(r => setTimeout(r, 80)); // still buffered
+
+    const buffers = (runner as unknown as { channelCoalesce: Map<string, unknown> }).channelCoalesce;
+    expect(buffers.size).toBe(1);
+
+    await runner.stop();
+    expect(buffers.size).toBe(0);
+  }, 15000);
 });

@@ -118,12 +118,17 @@ const pendingChannels = []
 /**
  * Parse a channel message from a stream-json stdin injection line.
  * agent-runner wraps channelXml in: {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<channel ...>...</channel>"}]}}
+ * The channel XML may appear at the end of a bundled first turn (history + activation + channel XML),
+ * so we search anywhere in the text rather than anchoring to the start.
  */
 function parseChannelFromStdin(line) {
   try {
     const obj = JSON.parse(line)
     const text = obj?.message?.content?.[0]?.text ?? ''
-    const m = text.match(/^<channel([^>]*)>([\s\S]*?)<\/channel>/)
+    // Take the LAST match — the current user turn is always appended last,
+    // so if history happens to contain a <channel> string we skip it.
+    const allMatches = [...text.matchAll(/<channel([^>]*)>([\s\S]*?)<\/channel>/g)]
+    const m = allMatches.length > 0 ? allMatches[allMatches.length - 1] : null
     if (!m) return null
     const attrsStr = m[1]
     const content = m[2].trim()
@@ -174,10 +179,20 @@ async function main() {
     const trimmed = line.trim()
     if (!trimmed) return
 
-    // First line is always the initial prompt from agent-runner
+    // First line is always the initial prompt from agent-runner.
+    // When history is deferred and bundled with the first user message, the channel
+    // XML may be embedded at the end of this first line — parse it here too.
     if (!firstLineDone) {
       firstLineDone = true
       process.stdout.write(`[mock-claude-mcp] prompt: ${trimmed}\n`)
+      const ch = parseChannelFromStdin(trimmed)
+      if (ch) {
+        if (mcpReady) {
+          handleChannel(ch)
+        } else {
+          pendingChannels.push(ch)
+        }
+      }
       return
     }
 

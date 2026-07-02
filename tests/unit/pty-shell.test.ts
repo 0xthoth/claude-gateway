@@ -1,11 +1,22 @@
 import { translateArgs, sanitizeUserText } from '../../src/shell/args';
-import { projectSlug, transcriptPath } from '../../src/shell/tailer';
+import { projectSlug, transcriptPath, isSyntheticRequestTooLarge, hasInteractiveMenuToolUse } from '../../src/shell/tailer';
 import {
   ScreenModel,
   TUI_BUSY_MARKER,
   TUI_BYPASS_PERMS,
+  TUI_REQUEST_TOO_LARGE,
+  TUI_REQUEST_TOO_LARGE_DISMISS,
+  neutralizeTuiTriggers,
+  parseMenuChoice,
+  formatMenuPrompt,
+  formatPermissionPrompt,
+  extractChannelContent,
+  isPtyActivelyWorking,
 } from '../../src/shell/screen';
+import { ProtocolEmitter } from '../../src/shell/emitter';
+import { Writable } from 'stream';
 import { preTrustWorkspace, checkAuthStatus } from '../../src/shell/trust';
+import { decideMenuCancel, MenuCancelState } from '../../src/shell/menu-cancel';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -95,6 +106,98 @@ describe('ScreenModel TUI constants (Claude Code v2.1.x)', () => {
     expect(TUI_BYPASS_PERMS).toContain('Yes, I accept');
   });
 
+  it('REQUEST_TOO_LARGE matches the recoverable 32MB error prefix', () => {
+    expect(TUI_REQUEST_TOO_LARGE).toBe('Request too large (max');
+  });
+
+  it('REQUEST_TOO_LARGE_DISMISS matches the overlay dismiss footer', () => {
+    expect(TUI_REQUEST_TOO_LARGE_DISMISS).toBe('esc to go back');
+  });
+
+});
+
+describe('ScreenModel detectRequestTooLarge', () => {
+  it('detects the recoverable 32MB error overlay', async () => {
+    const screen = await renderScreen([
+      '  Read 1 file',
+      '',
+      '  Request too large (max 32MB). Double press esc to go back',
+      '',
+    ]);
+    expect(screen.detectRequestTooLarge()).toBe(true);
+  });
+
+  it('is false on a normal idle screen', async () => {
+    const screen = await renderScreen([
+      '❯ ',
+      'ready for input',
+    ]);
+    expect(screen.detectRequestTooLarge()).toBe(false);
+  });
+
+  it('does not false-positive on prose merely discussing the error', async () => {
+    // The matcher keys on the exact "(max" suffix the TUI renders, so an agent
+    // explaining the concept ("a request that is too large") never trips it.
+    const screen = await renderScreen([
+      'If a request is too large the API rejects it.',
+    ]);
+    expect(screen.detectRequestTooLarge()).toBe(false);
+  });
+
+  it('does not trip when the agent quotes the exact error text without the dismiss footer', async () => {
+    // Self-trigger guard: the agent's own reply may contain the verbatim error
+    // string (e.g. explaining this very bug). Detection requires the dismiss
+    // footer too, which only the real overlay renders — so quoted prose is inert.
+    const screen = await renderScreen([
+      'When the TUI shows "Request too large (max 32MB)" the session must restart.',
+      '❯ ',
+    ]);
+    expect(screen.detectRequestTooLarge()).toBe(false);
+  });
+
+  it('DOES trip on a verbatim overlay copy carrying the footer (the false-positive bug)', async () => {
+    // Reproduces the restart loop: the gateway once captured the whole overlay
+    // sentence — prefix AND footer — into a stored assistant message. Re-typed
+    // into the TUI on the next spawn, it renders both fragments → detection fires
+    // on a healthy session. The "require the footer" guard does NOT save us here.
+    const poison = 'Assistant: ...(กัน double-delete):Request too large (max 32MB). Double press esc to go back and try with a smaller file.';
+    const screen = await renderScreen([poison, '❯ ']);
+    expect(screen.detectRequestTooLarge()).toBe(true);
+  });
+});
+
+describe('neutralizeTuiTriggers (history detox)', () => {
+  const POISON =
+    'Assistant: ...(กัน double-delete):Request too large (max 32MB). Double press esc to go back and try with a smaller file.';
+
+  it('breaks both detector fragments in re-injected text', () => {
+    const out = neutralizeTuiTriggers(POISON);
+    expect(out).not.toContain(TUI_REQUEST_TOO_LARGE);        // 'Request too large (max'
+    expect(out).not.toContain(TUI_REQUEST_TOO_LARGE_DISMISS); // 'esc to go back'
+  });
+
+  it('keeps the prose human-readable (only a space is inserted)', () => {
+    const out = neutralizeTuiTriggers(POISON);
+    expect(out).toContain('Request too large ( max 32MB)');
+    expect(out).toContain('esc to go  back');
+    expect(out).toContain('กัน double-delete'); // surrounding content untouched
+  });
+
+  it('neutralized history no longer trips detection after a TUI round-trip', async () => {
+    // The actual fix: the same poisoned message, detoxed, rendered on screen WITH
+    // the idle caret present, must be inert — closing the restart loop at the source.
+    const screen = await renderScreen([neutralizeTuiTriggers(POISON), '❯ ']);
+    expect(screen.detectRequestTooLarge()).toBe(false);
+  });
+
+  it('is a no-op on text without the trigger fragments', () => {
+    const clean = 'User: เปิด PR ให้หน่อย\nAssistant: ได้เลยค่ะ';
+    expect(neutralizeTuiTriggers(clean)).toBe(clean);
+  });
+
+  it('handles empty input', () => {
+    expect(neutralizeTuiTriggers('')).toBe('');
+  });
 });
 
 // consumeBusySeen is set synchronously from raw PTY bytes — no xterm async needed.
@@ -128,6 +231,158 @@ describe('ScreenModel raw-chunk busy detection', () => {
     screen.write('hello');
     await new Promise((r) => setTimeout(r, 50));
     expect(screen.quietMs()).toBeGreaterThanOrEqual(40);
+  });
+});
+
+describe('isPtyActivelyWorking (heartbeat liveness)', () => {
+  const LIVENESS = 45_000; // mirrors HEARTBEAT_LIVENESS_QUIET_MS in claude-pty-shell.ts
+
+  it('alive when the busy spinner is on screen (fast path)', () => {
+    // Busy marker present → alive regardless of quietMs.
+    expect(isPtyActivelyWorking({ isBusy: true, quietMs: 999_999 }, LIVENESS)).toBe(true);
+  });
+
+  it('alive when the PTY emitted output recently (no busy marker)', () => {
+    // The core fix: compaction / large-request assembly / sub-agent runs drop the
+    // "esc to interrupt" marker (isBusy=false) but keep animating → quietMs stays low.
+    // This must hold even though recent Claude Code keeps the ❯ input caret on screen
+    // for queueing during a turn — hence NO hasPrompt gate.
+    expect(isPtyActivelyWorking({ isBusy: false, quietMs: 1_000 }, LIVENESS)).toBe(true);
+  });
+
+  it('NOT alive when genuinely quiet for longer than the liveness window (hung/idle)', () => {
+    // No spinner, no recent output → a settled idle prompt or a genuine hang. Both go
+    // quiet, so quietMs grows past the window and the receiver's stalled detector fires.
+    expect(isPtyActivelyWorking({ isBusy: false, quietMs: 60_000 }, LIVENESS)).toBe(false);
+  });
+
+  it('liveness window is a strict bound (quietMs === window is NOT alive)', () => {
+    expect(isPtyActivelyWorking({ isBusy: false, quietMs: LIVENESS }, LIVENESS)).toBe(false);
+    expect(isPtyActivelyWorking({ isBusy: false, quietMs: LIVENESS - 1 }, LIVENESS)).toBe(true);
+  });
+});
+
+// Feed a screen and let xterm's async write buffer flush before reading text().
+async function renderScreen(lines: string[]): Promise<ScreenModel> {
+  const screen = new ScreenModel();
+  screen.write(lines.join('\r\n'));
+  await new Promise((r) => setTimeout(r, 30));
+  return screen;
+}
+
+const MENU_FOOTER = 'Enter to select · ↑/↓ to navigate · Esc to cancel';
+
+describe('ScreenModel detectMenu', () => {
+  it('parses numbered options (with ❯ highlight + a divider) when the footer is present', async () => {
+    const screen = await renderScreen([
+      'Which option do you want?',
+      '',
+      '❯ 1. First choice',
+      '  2. Second choice',
+      '  3. Third choice',
+      '  ─────────────',
+      '  4. Chat about this',
+      '',
+      MENU_FOOTER,
+    ]);
+    const menu = screen.detectMenu();
+    expect(menu).not.toBeNull();
+    expect(menu!.map((o) => o.index)).toEqual([1, 2, 3, 4]);
+    expect(menu![0].label).toBe('First choice');
+    expect(menu![3].label).toBe('Chat about this');
+  });
+
+  it('ignores stale numbered scrollback above the live menu', async () => {
+    // Reproduces the live bug: a prior chat message rendered as "1. … 2. …"
+    // sat in scrollback above an AskUserQuestion menu, so detectMenu swept the
+    // phantom rows in — inflating the option list and shifting every index.
+    const screen = await renderScreen([
+      '1. restart gateway now',
+      '2. restart drops the running session',
+      '',
+      'Which option do you want?',
+      '',
+      '❯ 1. See the buttons',
+      '  2. Type the number',
+      '  3. Nothing showed up',
+      '',
+      MENU_FOOTER,
+    ]);
+    const menu = screen.detectMenu();
+    expect(menu).not.toBeNull();
+    // Only the real 1..3 run nearest the footer — phantom rows excluded.
+    expect(menu!.map((o) => o.index)).toEqual([1, 2, 3]);
+    expect(menu![0].label).toBe('See the buttons');
+    expect(menu!.map((o) => o.label)).not.toContain('restart gateway now');
+  });
+
+  it('returns null without the menu footer', async () => {
+    const screen = await renderScreen([
+      'Here is a numbered list in normal output:',
+      '1. not a menu',
+      '2. still not a menu',
+    ]);
+    expect(screen.detectMenu()).toBeNull();
+  });
+
+  it('returns null with the footer but fewer than two options', async () => {
+    const screen = await renderScreen([
+      'Confirm?',
+      '  1. Only choice',
+      MENU_FOOTER,
+    ]);
+    expect(screen.detectMenu()).toBeNull();
+  });
+});
+
+describe('parseMenuChoice', () => {
+  it('accepts a leading integer within range', () => {
+    expect(parseMenuChoice('1', 4)).toBe(1);
+    expect(parseMenuChoice('2.', 4)).toBe(2);
+    expect(parseMenuChoice('  3 pick this', 4)).toBe(3);
+  });
+
+  it('rejects non-numbers and out-of-range values', () => {
+    expect(parseMenuChoice('abc', 5)).toBeNull();
+    expect(parseMenuChoice('', 5)).toBeNull();
+    expect(parseMenuChoice('0', 5)).toBeNull();
+    expect(parseMenuChoice('9', 5)).toBeNull();
+  });
+});
+
+describe('extractChannelContent', () => {
+  it('unwraps a channel envelope so a menu reply parses as the bare choice', () => {
+    const xml = '<channel source="telegram" chat_id="997170033" message_id="42" user="boss" ts="2026-06-14T00:00:00.000Z">1</channel>';
+    expect(extractChannelContent(xml)).toBe('1');
+    // Regression: the whole reason taps/typed numbers failed — the envelope
+    // starts with "<", so parseMenuChoice on the raw XML returns null.
+    expect(parseMenuChoice(xml, 4)).toBeNull();
+    expect(parseMenuChoice(extractChannelContent(xml), 4)).toBe(1);
+  });
+
+  it('strips a nested <replied> block before the user content', () => {
+    const xml = '<channel source="discord" chat_id="9" message_id="1" user="u" ts="t"><replied message_id="7" user="bot">3. Pick C</replied>2</channel>';
+    expect(extractChannelContent(xml)).toBe('2');
+  });
+
+  it('returns plain text unchanged (raw API / typed reply)', () => {
+    expect(extractChannelContent('2')).toBe('2');
+    expect(extractChannelContent('  3 ')).toBe('  3 ');
+  });
+
+  it('ignores numeric noise in envelope attributes (chat_id, ts)', () => {
+    const xml = '<channel source="telegram" chat_id="997170033" ts="2026-06-14">4</channel>';
+    expect(extractChannelContent(xml)).toBe('4');
+    expect(parseMenuChoice(extractChannelContent(xml), 5)).toBe(4);
+  });
+});
+
+describe('formatMenuPrompt', () => {
+  it('renders a numbered list with the reply instruction', () => {
+    const text = formatMenuPrompt([{ index: 1, label: 'Alpha' }, { index: 2, label: 'Beta' }]);
+    expect(text).toContain('1. Alpha');
+    expect(text).toContain('2. Beta');
+    expect(text.toLowerCase()).toContain('reply with the number');
   });
 });
 
@@ -260,5 +515,432 @@ describe('pty-shell transcript path', () => {
     const uuid = '11111111-2222-3333-4444-555555555555';
     expect(transcriptPath('/tmp/pty-poc', uuid))
       .toBe(`${os.homedir()}/.claude/projects/-tmp-pty-poc/${uuid}.jsonl`);
+  });
+});
+
+describe('ScreenModel detectDialog (region-restricted)', () => {
+  const FILLER = (n: number) => Array.from({ length: n }, (_, i) => `conversation line ${i}`);
+
+  it('detects the bypass dialog when it renders at the bottom (real modal)', async () => {
+    const screen = await renderScreen([
+      ...FILLER(44),
+      '  Bypass Permissions mode',
+      '  Yes, I accept',
+    ]);
+    expect(screen.detectDialog()).toBe('bypass-permissions');
+  });
+
+  it('ignores the markers when they sit in the upper scrollback (quoted prose)', async () => {
+    // An agent explaining the dialog, or re-injected history: markers are near the
+    // top, above the bottom region detectDialog scans → no auto-accept keystroke.
+    const screen = await renderScreen([
+      'Assistant: ตอน "Bypass Permissions mode" โผล่ มันจะให้กด "Yes, I accept"',
+      ...FILLER(44),
+      '❯ ',
+    ]);
+    expect(screen.detectDialog()).toBeNull();
+    // Sanity: the markers ARE on screen — only the region guard excludes them.
+    expect(screen.text()).toContain('Bypass Permissions mode');
+    expect(screen.text()).toContain('Yes, I accept');
+  });
+
+  it('requires BOTH markers (one alone never triggers)', async () => {
+    const screen = await renderScreen([...FILLER(45), '  Bypass Permissions mode']);
+    expect(screen.detectDialog()).toBeNull();
+  });
+});
+
+describe('ScreenModel detectPermissionPrompt (region-restricted, never auto-accepts)', () => {
+  const FILLER = (n: number) => Array.from({ length: n }, (_, i) => `conversation line ${i}`);
+  // Claude Code's tool-permission footer — note "Tab to amend"/"to explain", which
+  // the select-menu footer ("↑/↓ to navigate") and the 32MB overlay never carry.
+  const PERM_FOOTER = 'Esc to cancel · Tab to amend · ctrl+e to explain';
+
+  it('detects the dangerous-rm circuit-breaker prompt (boxed) and parses Yes/No', async () => {
+    const screen = await renderScreen([
+      ...FILLER(38),
+      '╭──────────────────────────────────────────────────────────────╮',
+      '│ Dangerous rm operation on possibly-empty variable path: "$OLD"/*.sql',
+      '│',
+      '│ Do you want to proceed?',
+      '│ ❯ 1. Yes',
+      '│   2. No',
+      '╰──────────────────────────────────────────────────────────────╯',
+      PERM_FOOTER,
+    ]);
+    const prompt = screen.detectPermissionPrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
+    // Context echoes the guarded command (box borders stripped), not the filler.
+    expect(prompt!.context).toContain('Dangerous rm operation');
+    expect(prompt!.context).not.toContain('conversation line');
+  });
+
+  it('also parses an unboxed prompt (options indented, no box border)', async () => {
+    const screen = await renderScreen([
+      ...FILLER(42),
+      'Do you want to proceed?',
+      '  ❯ 1. Yes',
+      '    2. No',
+      PERM_FOOTER,
+    ]);
+    const prompt = screen.detectPermissionPrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
+  });
+
+  it('ignores the prompt when it sits in upper scrollback (quoted prose)', async () => {
+    // An agent explaining the wedge, or re-injected history: the question +
+    // footer tokens are near the top, above the bottom region → no false bridge.
+    const screen = await renderScreen([
+      'Assistant: it showed "Do you want to proceed?" 1. Yes 2. No (Tab to amend)',
+      ...FILLER(44),
+      '❯ ',
+    ]);
+    expect(screen.detectPermissionPrompt()).toBeNull();
+  });
+
+  it('requires a permission footer token (a plain numbered question never trips it)', async () => {
+    const screen = await renderScreen([
+      ...FILLER(43),
+      'Do you want to proceed?',
+      '❯ 1. Yes',
+      '  2. No',
+    ]);
+    // No "to amend"/"to explain" footer present → not a permission prompt.
+    expect(screen.detectPermissionPrompt()).toBeNull();
+  });
+
+  it('excludes the bypass-permissions startup dialog (handled by detectDialog)', async () => {
+    const screen = await renderScreen([
+      ...FILLER(40),
+      'Bypass Permissions mode',
+      'Do you want to proceed?',
+      '❯ 1. Yes, I accept',
+      '  2. No, exit',
+      PERM_FOOTER,
+    ]);
+    expect(screen.detectPermissionPrompt()).toBeNull();
+    expect(screen.detectDialog()).toBe('bypass-permissions');
+  });
+
+  it('requires a ❯/> selection caret — a numbered list in prose never trips it', async () => {
+    // Worst case for the footer gate: conversational text that happens to pair the
+    // question with a numbered list AND the verbatim footer phrase. With no live
+    // select caret on an option row it is still not a real prompt → no bridge.
+    const screen = await renderScreen([
+      ...FILLER(40),
+      'Do you want to proceed? Here is the plan I would run:',
+      '1. Back up the directory first',
+      '2. Then remove the old files',
+      PERM_FOOTER,
+    ]);
+    expect(screen.detectPermissionPrompt()).toBeNull();
+  });
+
+  it('binds context to the question NEAREST the options when an earlier one is quoted', async () => {
+    // A line higher in the bottom region quotes the question; the live boxed prompt
+    // sits below it. Using the LAST occurrence keeps the context anchored to the
+    // real dialog box (the guarded command), not emptied by the quote above.
+    const screen = await renderScreen([
+      ...FILLER(36),
+      'Note: earlier I asked "Do you want to proceed?" before — here is the real one:',
+      '╭──────────────────────────────────────────────────────────────╮',
+      '│ Dangerous rm operation on possibly-empty variable path: "$OLD"/*.sql',
+      '│ Do you want to proceed?',
+      '│ ❯ 1. Yes',
+      '│   2. No',
+      '╰──────────────────────────────────────────────────────────────╯',
+      PERM_FOOTER,
+    ]);
+    const prompt = screen.detectPermissionPrompt();
+    expect(prompt).not.toBeNull();
+    expect(prompt!.options.map((o) => o.label)).toEqual(['Yes', 'No']);
+    expect(prompt!.context).toContain('Dangerous rm operation');
+    expect(prompt!.context).not.toContain('conversation line');
+    expect(prompt!.context).not.toContain('earlier I asked');
+  });
+});
+
+describe('formatPermissionPrompt', () => {
+  it('leads with a warning, echoes context, and numbers the options', () => {
+    const text = formatPermissionPrompt(
+      'Dangerous rm operation on possibly-empty variable path: "$OLD"/*.sql',
+      [{ index: 1, label: 'Yes' }, { index: 2, label: 'No' }],
+    );
+    expect(text.toLowerCase()).toContain('permission');
+    expect(text).toContain('Dangerous rm operation');
+    expect(text).toContain('1. Yes');
+    expect(text).toContain('2. No');
+    expect(text.toLowerCase()).toContain('reply with the number');
+  });
+
+  it('omits the context block when there is none (no stray blank lines)', () => {
+    const text = formatPermissionPrompt('', [{ index: 1, label: 'Yes' }, { index: 2, label: 'No' }]);
+    expect(text).toContain('1. Yes');
+    expect(text).not.toContain('\n\n\n');
+  });
+});
+
+describe('hasInteractiveMenuToolUse (authoritative menu gate)', () => {
+  it('true when the record invokes AskUserQuestion', () => {
+    expect(hasInteractiveMenuToolUse({
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: 'AskUserQuestion', id: 't1', input: { questions: [] } }],
+    })).toBe(true);
+  });
+
+  it('true for the plan-approval ExitPlanMode tool', () => {
+    expect(hasInteractiveMenuToolUse({
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: 'ExitPlanMode', id: 't2', input: {} }],
+    })).toBe(true);
+  });
+
+  it('also accepts the legacy snake_case exit_plan_mode name', () => {
+    // Claude Code's binary carries both PascalCase and snake_case; the emitted
+    // tool name varies by model, so both must gate the bridge.
+    expect(hasInteractiveMenuToolUse({
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: 'exit_plan_mode', id: 't2b', input: {} }],
+    })).toBe(true);
+  });
+
+  it('false for a normal text reply (even if it mentions the tool name)', () => {
+    expect(hasInteractiveMenuToolUse({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'I will use AskUserQuestion to ask you.' }],
+    })).toBe(false);
+  });
+
+  it('false for an unrelated tool', () => {
+    expect(hasInteractiveMenuToolUse({
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: 'Bash', id: 't3', input: { command: 'ls' } }],
+    })).toBe(false);
+  });
+});
+
+describe('isSyntheticRequestTooLarge (authoritative 413 detection)', () => {
+  const overlayText = 'Request too large (max 32MB). Double press esc to go back and try with a smaller file.';
+
+  it('detects the genuine error: <synthetic> model + overlay text', () => {
+    expect(isSyntheticRequestTooLarge({
+      role: 'assistant',
+      model: '<synthetic>',
+      content: [{ type: 'text', text: overlayText }],
+    })).toBe(true);
+  });
+
+  it('ignores a real assistant reply that quotes the error verbatim (real model id)', () => {
+    // The "เนี่ย นายก็เป็น" case: an agent explaining this very bug in a live reply.
+    // Real model id ≠ <synthetic>, so it is never treated as a genuine error.
+    expect(isSyntheticRequestTooLarge({
+      role: 'assistant',
+      model: 'claude-opus-4-8',
+      content: [{ type: 'text', text: `อย่างที่เห็น TUI เด้ง "${overlayText}"` }],
+    })).toBe(false);
+  });
+
+  it('ignores a synthetic record without the overlay text (other API error)', () => {
+    expect(isSyntheticRequestTooLarge({
+      role: 'assistant',
+      model: '<synthetic>',
+      content: [{ type: 'text', text: 'API Error: 500 internal error' }],
+    })).toBe(false);
+  });
+
+  it('ignores a record with no model field', () => {
+    expect(isSyntheticRequestTooLarge({
+      role: 'assistant',
+      content: [{ type: 'text', text: overlayText }],
+    })).toBe(false);
+  });
+
+  it('tolerates content blocks without text (e.g. tool_use)', () => {
+    expect(isSyntheticRequestTooLarge({
+      role: 'assistant',
+      model: '<synthetic>',
+      content: [{ type: 'tool_use', id: 'x' }, { type: 'text', text: overlayText }],
+    })).toBe(true);
+  });
+});
+
+describe('pty-shell menu-cancel settle decision', () => {
+  // Models the bug: user types a free-text question while a bridged menu is up.
+  // The wrapper ESCs the menu, then must wait for the TUI to return to an idle
+  // prompt before submitting — submitting into Claude's cancellation redraw is
+  // what caused the 30-min watchdog hang.
+  const T0 = 100_000;
+  const baseState = (): MenuCancelState => ({ since: T0, lastEscAt: T0, escs: 1 });
+
+  it('waits while the TUI is still busy reacting to the ESC cancel', () => {
+    const action = decideMenuCancel(baseState(), {
+      now: T0 + 1000,            // past MIN_WAIT
+      menuVisible: false,        // menu dismissed
+      hasPrompt: false,          // but no idle prompt yet
+      isBusy: true,              // Claude is processing the cancellation
+      quietMs: 50,
+    });
+    expect(action).toBe('wait');
+  });
+
+  it('waits until the minimum delay after ESC has elapsed', () => {
+    const action = decideMenuCancel(baseState(), {
+      now: T0 + 300,             // < MIN_WAIT (800ms)
+      menuVisible: false,
+      hasPrompt: true,
+      isBusy: false,
+      quietMs: 1000,
+    });
+    expect(action).toBe('wait');
+  });
+
+  it('waits until the screen has been quiet long enough', () => {
+    const action = decideMenuCancel(baseState(), {
+      now: T0 + 1000,
+      menuVisible: false,
+      hasPrompt: true,
+      isBusy: false,
+      quietMs: 100,              // < SETTLE_QUIET (600ms)
+    });
+    expect(action).toBe('wait');
+  });
+
+  it('submits once the menu is gone and the prompt is idle and quiet', () => {
+    const action = decideMenuCancel(baseState(), {
+      now: T0 + 1200,
+      menuVisible: false,
+      hasPrompt: true,
+      isBusy: false,
+      quietMs: 700,
+    });
+    expect(action).toBe('submit');
+  });
+
+  it('re-sends ESC when the menu lingers (ESC swallowed) within the retry cap', () => {
+    const action = decideMenuCancel(
+      { since: T0, lastEscAt: T0, escs: 1 },
+      {
+        now: T0 + 2000,          // > ESC_RETRY (1500ms) since last ESC
+        menuVisible: true,       // menu still on screen
+        hasPrompt: false,
+        isBusy: false,
+        quietMs: 800,
+      },
+    );
+    expect(action).toBe('resend-esc');
+  });
+
+  it('stops re-sending ESC after the cap and just waits', () => {
+    const action = decideMenuCancel(
+      { since: T0, lastEscAt: T0, escs: 3 },   // at MAX_ESC
+      {
+        now: T0 + 5000,
+        menuVisible: true,
+        hasPrompt: false,
+        isBusy: false,
+        quietMs: 800,
+      },
+    );
+    expect(action).toBe('wait');
+  });
+
+  it('force-submits after the hard timeout so the session never hangs', () => {
+    const action = decideMenuCancel(baseState(), {
+      now: T0 + 16_000,          // > TIMEOUT (15s)
+      menuVisible: true,         // even if the menu is somehow still up
+      hasPrompt: false,
+      isBusy: true,
+      quietMs: 0,
+    });
+    expect(action).toBe('submit');
+  });
+});
+
+describe('pty-shell /stop interrupt settle decision', () => {
+  // Models the /stop bug: user issues /stop (SIGINT → ESC interrupts the turn),
+  // then sends another message. The interrupted turn writes no turn_duration, so
+  // the wrapper must end it once the TUI returns to an idle prompt before draining
+  // the queued message — otherwise it hangs behind a dead turn until the watchdog.
+  // The interrupt path reuses decideMenuCancel with menuVisible ALWAYS false, so it
+  // must never return 'resend-esc' (an ESC then would cancel something unrelated).
+  const T0 = 200_000;
+  const armed = (): MenuCancelState => ({ since: T0, lastEscAt: T0, escs: 1 });
+
+  it('waits while the TUI is still busy reacting to the ESC interrupt', () => {
+    const action = decideMenuCancel(armed(), {
+      now: T0 + 1000,            // past MIN_WAIT
+      menuVisible: false,        // no menu is involved in /stop
+      hasPrompt: false,          // not back to an idle prompt yet
+      isBusy: true,              // Claude is still cancelling the turn
+      quietMs: 50,
+    });
+    expect(action).toBe('wait');
+  });
+
+  it('ends the interrupted turn once the prompt is idle and quiet', () => {
+    const action = decideMenuCancel(armed(), {
+      now: T0 + 1200,
+      menuVisible: false,
+      hasPrompt: true,
+      isBusy: false,
+      quietMs: 700,
+    });
+    expect(action).toBe('submit');
+  });
+
+  it('never re-sends ESC during a /stop interrupt (no menu on screen)', () => {
+    // Even long after the ESC with the screen quiet but no prompt yet, a /stop
+    // settle must not emit ESC — menuVisible is false so resend-esc is impossible.
+    const action = decideMenuCancel(armed(), {
+      now: T0 + 5000,            // well past ESC_RETRY
+      menuVisible: false,
+      hasPrompt: false,
+      isBusy: false,
+      quietMs: 2000,
+    });
+    expect(action).toBe('wait');
+  });
+
+  it('force-ends after the hard timeout so /stop never wedges the queue', () => {
+    const action = decideMenuCancel(armed(), {
+      now: T0 + 16_000,          // > TIMEOUT (15s)
+      menuVisible: false,
+      hasPrompt: false,          // TUI never settled
+      isBusy: true,
+      quietMs: 0,
+    });
+    expect(action).toBe('submit');
+  });
+});
+
+describe('ProtocolEmitter signals', () => {
+  const SID = '11111111-2222-3333-4444-555555555555';
+
+  // Collect each newline-delimited JSON line the emitter writes.
+  function captureEmitter(): { emitter: ProtocolEmitter; lines: () => Record<string, unknown>[] } {
+    const out: string[] = [];
+    const sink = new Writable({
+      write(chunk, _enc, cb) { out.push(chunk.toString()); cb(); },
+    });
+    return {
+      emitter: new ProtocolEmitter(sink),
+      lines: () => out.join('').split('\n').filter(Boolean).map((l) => JSON.parse(l)),
+    };
+  }
+
+  it('emitRequestTooLarge emits a request_too_large system event', () => {
+    const { emitter, lines } = captureEmitter();
+    emitter.emitRequestTooLarge(SID);
+    expect(lines()).toEqual([
+      { type: 'system', subtype: 'request_too_large', session_id: SID },
+    ]);
+  });
+
+  it('emitSessionIdle emits a session_idle event runner uses to stop typing', () => {
+    const { emitter, lines } = captureEmitter();
+    emitter.emitSessionIdle(SID);
+    expect(lines()).toEqual([{ type: 'session_idle', session_id: SID }]);
   });
 });

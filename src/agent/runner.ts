@@ -6,14 +6,16 @@ import * as net from 'net';
 import * as path from 'path';
 import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment } from '../types';
 import { createLogger } from '../logger';
-import { SessionProcess } from '../session/process';
+import { SessionProcess, MAX_HISTORY_MESSAGES } from '../session/process';
 import { SessionStore, SessionNotInIndexError } from '../session/store';
 import { SessionCompactor } from '../session/compactor';
 import { TelegramReceiver } from '../telegram/receiver';
 import { DiscordReceiver } from '../discord/receiver';
+import { LineReplyManager } from './line-reply-manager';
 import { hasMarkdown, toTelegramHtml } from '../telegram/markdown';
 import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
 import { isBuiltinCommand } from './builtin-commands';
+import { TUI_REQUEST_TOO_LARGE } from '../shell/screen';
 import { HistoryDB } from '../history/db';
 import { MediaStore } from '../history/media-store';
 import { scheduleCleanup, resolveRetentionDays } from '../history/cleanup';
@@ -21,6 +23,17 @@ import type { HistorySource } from '../history/types';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;
+const ANTHROPIC_SOCKET_ERROR = 'socket connection was closed unexpectedly';
+
+// History re-injection ladder for request_too_large (32MB) recovery. Index =
+// number of consecutive 32MB recoveries on a session; the value is how many
+// history messages the NEXT spawn re-injects. Index 0 is the healthy default
+// (= MAX_HISTORY_MESSAGES, sourced from it so the two never drift); each retry
+// steps down a rung, shrinking the re-loaded context until it drops under
+// Anthropic's 32MB request ceiling. Past the last rung (0 history) the context
+// can't shrink further, so the runner stops escalating and asks the user to
+// /clear instead of looping forever.
+const TOO_LARGE_HISTORY_LADDER: readonly number[] = [MAX_HISTORY_MESSAGES, 40, 30, 20, 10, 0];
 
 export const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 
@@ -38,6 +51,12 @@ const PROTECTED_WORKSPACE_FILES = [
 ];
 
 const MAX_API_IMAGES = 5;
+
+// Trailing-edge window for coalescing channel messages that carry an image (or that
+// arrive while an image is already buffered) into a single turn. Reset on every new
+// related update, so an album burst or a client-split photo+caption is gathered
+// whole. Plain text with no pending buffer bypasses this entirely (zero added latency).
+export const CHANNEL_COALESCE_WINDOW_MS = 1200;
 
 /**
  * Move UI-uploaded files from staging (ui-upload/) to permanent per-session storage
@@ -96,15 +115,17 @@ export class AgentRunner extends EventEmitter {
   imageSize(chatId: string): number { return this.imageSizePerChat.get(chatId) ?? 0; }
   restartPending(chatId: string): boolean { return this.pendingRestarts.has(chatId); }
 
-  private channelFor(chatId: string): 'telegram' | 'discord' {
+  private channelFor(chatId: string): 'telegram' | 'discord' | 'line' {
     return this.channelSourceMap.get(chatId) ?? 'telegram';
   }
 
   // Session pool
   private readonly sessions = new Map<string, SessionProcess>();
-  private readonly channelSourceMap = new Map<string, 'telegram' | 'discord'>();
+  private readonly channelSourceMap = new Map<string, 'telegram' | 'discord' | 'line'>();
   private receiver: TelegramReceiver | null = null;
   private discordReceiver: DiscordReceiver | null = null;
+  // LINE slow-LLM postback button manager (null when LINE disabled or threshold=0).
+  private lineReply: LineReplyManager | null = null;
   private readonly sessionStore: SessionStore;
   private readonly idleTimeoutMs: number;
   private readonly maxConcurrent: number;
@@ -116,11 +137,48 @@ export class AgentRunner extends EventEmitter {
   // Serialises concurrent getOrSpawnSession calls for the same key to prevent double-spawn
   private readonly sessionSpawnLocks = new Map<string, Promise<SessionProcess>>();
 
+  // Consecutive request_too_large (32MB) recoveries per mapKey. Survives the
+  // session respawn (SessionProcess is recreated on each restart) so the history
+  // re-injection can escalate-shrink across retries (TOO_LARGE_HISTORY_LADDER).
+  // Reset to 0 on the next successful result; read by spawnSession.
+  private readonly tooLargeRecoveries = new Map<string, number>();
+  // mapKeys that exhausted the ladder (zero-history spawn still tripped 32MB).
+  // Once here, further 32MB events only re-notify "/clear" and do NOT restart —
+  // restarting would just churn a context that cannot shrink. Cleared together
+  // with the counter on a successful result and on /clear.
+  private readonly tooLargeExhausted = new Set<string>();
+
   // Tracks pending Telegram image paths per chatId (queue) for size accumulation after each turn.
   private readonly pendingImagePaths = new Map<string, string[]>();
 
+  // Coalescing buffer: collects channel messages that arrive close together so a
+  // photo and its instruction text (which Telegram may deliver as separate updates
+  // — long caption split, album burst, or photo sent before/after the text) are
+  // injected as ONE turn instead of two. Keyed by chatId. A trailing-edge timer
+  // flushes the buffer once no new related update has arrived for the window.
+  private readonly channelCoalesce = new Map<
+    string,
+    {
+      channelSource: 'telegram' | 'discord' | 'line';
+      entries: Array<{ content?: string; meta?: Record<string, string> }>;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+
+  // Trailing-edge debounce window for channelCoalesce, resolved once at construction.
+  // Overridable via the CHANNEL_COALESCE_WINDOW_MS env var (tests shrink it for speed).
+  private readonly coalesceWindowMs: number;
+
   // Buffers attachment file paths registered via api_reply tool for the current API session turn.
   private readonly pendingApiAttachments = new Map<string, string[]>();
+
+  // Session history ring-buffer (last 10 spawned, newest first)
+  private readonly sessionHistory: Array<{ chatId: string; sessionId: string; source: string; mode: string; model: string; spawnedAt: number }> = [];
+
+  // For API sessions the map key is the sessionId, so the real caller chatId
+  // (e.g. the app/agent identifier) is not captured at spawn. Record it here
+  // keyed by sessionId so the dashboard can show the actual chat id.
+  private readonly apiChatIds = new Map<string, string>();
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
@@ -159,6 +217,8 @@ export class AgentRunner extends EventEmitter {
     this.idleTimeoutMs =
       (agentConfig.session?.idleTimeoutMinutes ?? DEFAULT_IDLE_TIMEOUT_MINUTES) * 60 * 1000;
     this.maxConcurrent = agentConfig.session?.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+    this.coalesceWindowMs =
+      Number(process.env.CHANNEL_COALESCE_WINDOW_MS) || CHANNEL_COALESCE_WINDOW_MS;
   }
 
   /**
@@ -200,6 +260,11 @@ export class AgentRunner extends EventEmitter {
         }
 
         // Default: /channel — existing channel message handler
+        // Connection: close prevents keep-alive pool reuse: after the OS's
+        // keepAliveTimeout expires the server closes the TCP connection, and the
+        // receiver (Bun) can try to reuse the stale socket → "socket connection
+        // was closed unexpectedly". Closing per-request avoids the race entirely.
+        res.setHeader('Connection', 'close');
         res.writeHead(200);
         res.end('ok');
         try {
@@ -212,8 +277,23 @@ export class AgentRunner extends EventEmitter {
           const content = params.content ?? '';
 
           // Set channel early so all handlers (including session commands) have it
-          const channelSource = (meta['source'] === 'discord' ? 'discord' : 'telegram') as 'telegram' | 'discord';
+          const channelSource = (meta['source'] === 'discord'
+            ? 'discord'
+            : meta['source'] === 'line'
+              ? 'line'
+              : 'telegram') as 'telegram' | 'discord' | 'line';
           this.channelSourceMap.set(chatId, channelSource);
+
+          // LINE slow-LLM postback: stash this turn's reply token + arm the
+          // button timer before the token expires. In groups/rooms the shared
+          // button is disabled (armButton:false) — the token is still stashed so
+          // onAnswer delivers (reply→push), just without a button.
+          if (channelSource === 'line' && this.lineReply && meta['reply_token']) {
+            const chatType = meta['line_chat_type'];
+            this.lineReply.onInbound(chatId, meta['reply_token'], {
+              armButton: chatType === undefined || chatType === 'user',
+            });
+          }
 
           // Check if this is a built-in channel command
           const trimmedContent = content.trim();
@@ -227,91 +307,32 @@ export class AgentRunner extends EventEmitter {
             return;
           }
 
-          // Get active session ID and route message to it
-          this.sessionStore.getActiveSessionId(this.agentConfig.id, chatId, channelSource)
-            .then(async (sessionId) => {
-              // Append user message to the active session
-              const userContent = content || (meta['attachment_file_id'] ? '(photo)' : '');
-              const userTs = Date.now();
-              await this.sessionStore.appendTelegramMessage(this.agentConfig.id, chatId, sessionId, {
-                role: 'user',
-                content: userContent,
-                ts: userTs,
-              }, channelSource);
+          // Coalesce messages that carry an image (or that arrive while an image is
+          // already buffered) so a photo and its instruction text are injected as
+          // ONE turn — Telegram can split them across updates (long-caption split,
+          // album burst, or photo sent just before/after the text). Plain text with
+          // nothing buffered takes the fast path and is injected immediately.
+          const hasImage = !!meta['image_path'];
+          const pending = this.channelCoalesce.get(chatId);
+          if (hasImage || pending) {
+            const buf = pending ?? {
+              channelSource,
+              entries: [] as Array<{ content?: string; meta?: Record<string, string> }>,
+              timer: undefined as unknown as ReturnType<typeof setTimeout>,
+            };
+            buf.channelSource = channelSource;
+            buf.entries.push(params);
+            if (buf.timer) clearTimeout(buf.timer);
+            buf.timer = setTimeout(() => {
+              const flushed = this.channelCoalesce.get(chatId);
+              this.channelCoalesce.delete(chatId);
+              if (flushed) this.routeChannelTurn(chatId, flushed.channelSource, flushed.entries);
+            }, this.coalesceWindowMs);
+            this.channelCoalesce.set(chatId, buf);
+            return;
+          }
 
-              // Persist to permanent history DB (separate from session context)
-              const mediaFiles: string[] = [];
-              if (meta['image_path']) {
-                try {
-                  const rel = MediaStore.copyToMedia(this.agentsBaseDir, this.agentConfig.id, `${channelSource}-${chatId}`, meta['image_path']);
-                  mediaFiles.push(rel);
-                } catch {
-                  // Non-fatal — continue without media
-                }
-              }
-              this.historyDb.insertMessage({
-                chatId: `${channelSource}-${chatId}`,
-                sessionId,
-                source: channelSource as HistorySource,
-                role: 'user',
-                content: userContent,
-                senderName: meta['user'] ?? undefined,
-                senderId: meta['user_id'] ?? meta['chat_id'] ?? undefined,
-                platformMessageId: meta['message_id'] ?? undefined,
-                mediaFiles: mediaFiles.length > 0 ? mediaFiles : undefined,
-                ts: userTs,
-              });
-              // Restart session before this turn if accumulated image size exceeded threshold
-              if (this.pendingRestarts.has(chatId)) {
-                const existingSession = this.sessions.get(chatId);
-                if (existingSession) {
-                  await existingSession.stop();
-                  this.sessions.delete(chatId);
-                }
-                this.pendingRestarts.delete(chatId);
-                this.imageSizePerChat.delete(chatId);
-              }
-
-              // Route to session process (map key = chatId, actual sessionId passed separately)
-              // Channel sessions use agent-level model (not per-session)
-              const session = await this.getOrSpawnSession(chatId, channelSource, sessionId);
-              let channelXml = AgentRunner.buildChannelXml(params);
-
-              // Detect skill commands and inject skill content
-              const skillInvocation = detectSkillCommand(content, this.skillRegistry);
-              if (skillInvocation) {
-                channelXml += formatSkillContext(skillInvocation);
-                this.logger.info('Skill invoked', {
-                  skill: skillInvocation.skillKey,
-                  args: skillInvocation.args,
-                  chatId,
-                });
-              }
-
-              const imagePath = meta['image_path'];
-              if (imagePath) {
-                const queue = this.pendingImagePaths.get(chatId) ?? [];
-                queue.push(imagePath);
-                this.pendingImagePaths.set(chatId, queue);
-              }
-
-              session.setProcessing(true);
-              session.sendMessage(channelXml);
-              session.touch();
-              this.logger.debug('Injected channel turn into session', {
-                chatId,
-                sessionId,
-                user: meta['user'],
-              });
-            })
-            .catch((err) => {
-              this.logger.error('Failed to route message to session', {
-                chatId,
-                error: (err as Error).message,
-              });
-              const code = (err as Error).message.includes('pool full') ? 'POOL_FULL' : 'SPAWN_FAILED';
-              this.writeTypingError(chatId, code);
-            });
+          this.routeChannelTurn(chatId, channelSource, [params]);
         } catch (err) {
           this.logger.warn('Failed to parse channel callback body', {
             error: (err as Error).message,
@@ -547,6 +568,114 @@ export class AgentRunner extends EventEmitter {
     return paths;
   }
 
+  /**
+   * Inject one or more coalesced channel messages as a SINGLE turn. Each entry is
+   * still recorded individually (session history + permanent history DB), but their
+   * channel XML blocks are concatenated and delivered in one sendMessage() call so
+   * a photo and its instruction text are read together in the same turn.
+   */
+  private routeChannelTurn(
+    chatId: string,
+    channelSource: 'telegram' | 'discord' | 'line',
+    entries: Array<{ content?: string; meta?: Record<string, string> }>,
+  ): void {
+    if (entries.length === 0) return;
+    this.sessionStore.getActiveSessionId(this.agentConfig.id, chatId, channelSource)
+      .then(async (sessionId) => {
+        // Record each buffered message individually (history + session context).
+        for (const entry of entries) {
+          const meta = entry.meta ?? {};
+          const content = entry.content ?? '';
+          const userContent = content || (meta['attachment_file_id'] || meta['image_path'] ? '(photo)' : '');
+          const userTs = Date.now();
+          await this.sessionStore.appendTelegramMessage(this.agentConfig.id, chatId, sessionId, {
+            role: 'user',
+            content: userContent,
+            ts: userTs,
+          }, channelSource);
+
+          // Persist to permanent history DB (separate from session context)
+          const mediaFiles: string[] = [];
+          if (meta['image_path']) {
+            try {
+              const rel = MediaStore.copyToMedia(this.agentsBaseDir, this.agentConfig.id, `${channelSource}-${chatId}`, meta['image_path']);
+              mediaFiles.push(rel);
+            } catch {
+              // Non-fatal — continue without media
+            }
+          }
+          this.historyDb.insertMessage({
+            chatId: `${channelSource}-${chatId}`,
+            sessionId,
+            source: channelSource as HistorySource,
+            role: 'user',
+            content: userContent,
+            senderName: meta['user'] ?? undefined,
+            senderId: meta['user_id'] ?? meta['chat_id'] ?? undefined,
+            platformMessageId: meta['message_id'] ?? undefined,
+            mediaFiles: mediaFiles.length > 0 ? mediaFiles : undefined,
+            ts: userTs,
+          });
+        }
+
+        // Restart session before this turn if accumulated image size exceeded threshold
+        if (this.pendingRestarts.has(chatId)) {
+          const existingSession = this.sessions.get(chatId);
+          if (existingSession) {
+            await existingSession.stop();
+            this.sessions.delete(chatId);
+          }
+          this.pendingRestarts.delete(chatId);
+          this.imageSizePerChat.delete(chatId);
+        }
+
+        // Route to session process (map key = chatId, actual sessionId passed separately)
+        // Channel sessions use agent-level model (not per-session)
+        const session = await this.getOrSpawnSession(chatId, channelSource, sessionId);
+
+        // Merge buffered messages into one turn: concat channel XML blocks, append
+        // any skill context, and accumulate image paths for size tracking.
+        const blocks: string[] = [];
+        for (const entry of entries) {
+          let channelXml = AgentRunner.buildChannelXml(entry);
+          const skillInvocation = detectSkillCommand(entry.content ?? '', this.skillRegistry);
+          if (skillInvocation) {
+            channelXml += formatSkillContext(skillInvocation);
+            this.logger.info('Skill invoked', {
+              skill: skillInvocation.skillKey,
+              args: skillInvocation.args,
+              chatId,
+            });
+          }
+          blocks.push(channelXml);
+
+          const imagePath = entry.meta?.['image_path'];
+          if (imagePath) {
+            const queue = this.pendingImagePaths.get(chatId) ?? [];
+            queue.push(imagePath);
+            this.pendingImagePaths.set(chatId, queue);
+          }
+        }
+
+        session.setProcessing(true);
+        session.sendMessage(blocks.join('\n'));
+        session.touch();
+        this.logger.debug('Injected channel turn into session', {
+          chatId,
+          sessionId,
+          messages: entries.length,
+        });
+      })
+      .catch((err) => {
+        this.logger.error('Failed to route message to session', {
+          chatId,
+          error: (err as Error).message,
+        });
+        const code = (err as Error).message.includes('pool full') ? 'POOL_FULL' : 'SPAWN_FAILED';
+        this.writeTypingError(chatId, code);
+      });
+  }
+
   private static buildChannelXml(params: {
     content?: string;
     meta?: Record<string, string>;
@@ -558,6 +687,8 @@ export class AgentRunner extends EventEmitter {
       'attachment_kind',
       'attachment_mime',
       'attachment_name',
+      'user_id',     // LINE: the userId the session passes back to line_reply
+      'reply_token', // LINE: single-use reply token (push is preferred; surfaced for completeness)
     ]
       .filter(k => meta[k])
       .map(k => ` ${k}="${meta[k]!.replace(/"/g, '&quot;')}"`)
@@ -589,7 +720,7 @@ export class AgentRunner extends EventEmitter {
 
   private async getOrSpawnSession(
     mapKey: string,              // Map lookup key (chatId for telegram/discord, sessionId for API)
-    source: 'telegram' | 'discord' | 'api',
+    source: 'telegram' | 'discord' | 'line' | 'api',
     sessionId?: string,          // actual session UUID (only for channel sessions; equals mapKey for API)
     modelOverride?: string,      // per-session model override from SessionMeta
   ): Promise<SessionProcess> {
@@ -637,7 +768,7 @@ export class AgentRunner extends EventEmitter {
 
   private async spawnSession(
     mapKey: string,
-    source: 'telegram' | 'discord' | 'api',
+    source: 'telegram' | 'discord' | 'line' | 'api',
     sessionId?: string,
     modelOverride?: string,
   ): Promise<SessionProcess> {
@@ -651,7 +782,7 @@ export class AgentRunner extends EventEmitter {
       if (idleEntry) {
         await idleEntry[1].stop();
         this.sessions.delete(idleEntry[0]);
-        this.cleanupApiSessionMediaDir(idleEntry[0], idleEntry[1].source);
+        this.evictApiSessionMapping(idleEntry[0]);
         this.logger.info('Evicted idle session', { sessionId: idleEntry[0] });
       } else {
         throw new Error(`Session pool full: ${this.maxConcurrent} concurrent sessions`);
@@ -673,6 +804,20 @@ export class AgentRunner extends EventEmitter {
     // Apply per-session model override (caller already normalized to undefined when == agent default)
     if (modelOverride) proc.modelOverride = modelOverride;
 
+    // request_too_large (32MB) recovery: shrink the re-injected history on each
+    // consecutive retry so a pathological context eventually fits. recoveryCount
+    // is 0 for healthy sessions → ladder rung 0 = MAX_HISTORY_MESSAGES (same as
+    // the SessionProcess default), so applying it unconditionally is a no-op for
+    // healthy sessions and the only path that sets historyLimit for recovering ones.
+    const recoveryCount = this.tooLargeRecoveries.get(mapKey) ?? 0;
+    const ladderIdx = Math.min(recoveryCount, TOO_LARGE_HISTORY_LADDER.length - 1);
+    proc.historyLimit = TOO_LARGE_HISTORY_LADDER[ladderIdx];
+    if (recoveryCount > 0) {
+      this.logger.info('Spawning with reduced history after request_too_large', {
+        mapKey, recoveryCount, historyLimit: proc.historyLimit,
+      });
+    }
+
     await proc.start();
 
     // Forward all session output lines so listeners on AgentRunner (GatewayRouter,
@@ -684,6 +829,9 @@ export class AgentRunner extends EventEmitter {
       proc.once('failed', () => {
         this.writeTypingError(mapKey, 'PROCESS_FAILED');
         this.sessions.delete(mapKey);
+        // LINE: surface an error for any outstanding postback button so a tap
+        // returns the interrupted notice instead of a stale "still thinking".
+        if (!proc.queryMode) this.lineReply?.markInterrupted(mapKey);
       });
       // Stop typing loop when Claude's turn truly ends.
       // Typing done is delayed 3s after result event — if new output arrives within
@@ -691,9 +839,17 @@ export class AgentRunner extends EventEmitter {
       // Auto-forward result text to channel if agent didn't call reply tool.
       let replyCalled = false;
       let replyToolUseId: string | null = null; // track id to detect failed tool calls
+      // Set when an interactive-menu prompt was rendered to the channel this turn,
+      // so the result's plain-text auto-forward is skipped (no duplicate message).
+      let menuSentThisTurn = false;
       let typingDoneTimer: ReturnType<typeof setTimeout> | null = null;
       const TYPING_DONE_DELAY_MS = 3000;
-      const replyToolName = source === 'discord' ? 'mcp__gateway__discord_reply' : 'mcp__gateway__telegram_reply';
+      const replyToolName =
+        source === 'discord'
+          ? 'mcp__gateway__discord_reply'
+          : source === 'line'
+            ? 'mcp__gateway__line_reply'
+            : 'mcp__gateway__telegram_reply';
 
       proc.on('output', (line: string) => {
         try {
@@ -725,6 +881,12 @@ export class AgentRunner extends EventEmitter {
                       content: replyText,
                       ts: Date.now(),
                     });
+                    // LINE: the MCP line_reply tool's send is suppressed in
+                    // refresh mode; the gateway delivers (free reply, or cache +
+                    // postback button when slow). See LineReplyManager.
+                    if (channelSrc === 'line' && this.lineReply) {
+                      void this.lineReply.onAnswer(mapKey, replyText);
+                    }
                   }
                 }
               }
@@ -741,6 +903,38 @@ export class AgentRunner extends EventEmitter {
                 }
               }
             }
+          }
+          // Interactive select menu blocking the PTY: render it as channel-native
+          // UI (inline buttons). This output handler only runs for Telegram/Discord
+          // sessions; API uses a separate path and falls back to the result text's
+          // numbered list (no buttons), as intended.
+          if (obj['type'] === 'system' && obj['subtype'] === 'menu_prompt') {
+            const promptText = typeof obj['prompt'] === 'string' ? obj['prompt'] : '';
+            const rawOptions = Array.isArray(obj['options']) ? obj['options'] as Array<{ label?: unknown }> : [];
+            const options = rawOptions
+              .map((o) => ({ label: typeof o?.label === 'string' ? o.label : '' }))
+              .filter((o) => o.label);
+            if (promptText && options.length) {
+              this.writeMenuForward(mapKey, promptText, options);
+              menuSentThisTurn = true;
+              // Persist the question to chat history so it's visible in the transcript.
+              const channelSrc = this.channelSourceMap.get(mapKey) ?? 'telegram';
+              this.historyDb.insertMessage({
+                chatId: `${channelSrc}-${mapKey}`,
+                sessionId: actualSessionId,
+                source: channelSrc as HistorySource,
+                role: 'assistant',
+                content: promptText,
+                ts: Date.now(),
+              });
+            }
+          }
+          // PTY shell hit the recoverable "Request too large (max 32MB)" error.
+          // The transcript tailer emits this from the authoritative <synthetic>
+          // record (Bug A fix). Recovery is unified in handleRequestTooLarge()
+          // so the headless path (Bug B) gets identical treatment.
+          if (obj['type'] === 'system' && obj['subtype'] === 'request_too_large') {
+            this.handleRequestTooLarge(mapKey, proc);
           }
           if (obj['type'] === 'result') {
             proc.setProcessing(false);
@@ -773,7 +967,32 @@ export class AgentRunner extends EventEmitter {
             // so the raw API error must not reach the user's chat or the history DB.
             const isThinkingCorruption =
               obj['is_error'] === true && SessionProcess.isThinkingCorruptionError(resultText);
-            if (resultText.trim() && !proc.queryMode && !replyCalled && !isThinkingCorruption) {
+            // Detect Anthropic API socket drop — Claude CLI emits this as is_error:false
+            // with "API Error: The socket connection was closed unexpectedly". The error
+            // bypasses the replyCalled gate so the user always gets notified, even when
+            // the agent already called the reply tool earlier in the same turn.
+            const isSocketError = !proc.queryMode && resultText.includes(ANTHROPIC_SOCKET_ERROR);
+            if (isSocketError) {
+              this.writeAutoForward(mapKey, '⚡ Connection to Anthropic API dropped. Please resend your message.');
+            }
+            // Bug B: headless (claude --print) reports a too-large request as a
+            // synthetic `result` (is_error + "Request too large (max"), NOT as the
+            // PTY `system/request_too_large` event. Previously this result was only
+            // suppressed — the long-lived process stayed alive and rejected every
+            // turn forever ("typing then silent"). Route it through the SAME unified
+            // recovery (notify + escalate-shrink history + restart) as the PTY path.
+            const isRequestTooLarge = obj['is_error'] === true && resultText.includes(TUI_REQUEST_TOO_LARGE);
+            if (isRequestTooLarge) {
+              this.handleRequestTooLarge(mapKey, proc);
+            } else if (obj['is_error'] !== true) {
+              // Genuine successful turn — clear any request_too_large escalation so
+              // the next 32MB (if any) starts fresh at the top of the ladder.
+              this.tooLargeRecoveries.delete(mapKey);
+              this.tooLargeExhausted.delete(mapKey);
+            }
+            // Skip when a menu was rendered to buttons this turn — the result
+            // text is the same numbered list and would duplicate the menu message.
+            if (!isSocketError && !isRequestTooLarge && resultText.trim() && !proc.queryMode && !replyCalled && !isThinkingCorruption && !menuSentThisTurn) {
               const text = resultText.trim();
               const channelSrcForResult = this.channelSourceMap.get(mapKey) ?? 'telegram';
               // Persist assistant reply to permanent history DB
@@ -785,8 +1004,12 @@ export class AgentRunner extends EventEmitter {
                 content: text,
                 ts: Date.now(),
               });
-              // Forward to channel
-              if (channelSrcForResult !== 'discord' && hasMarkdown(text)) {
+              // Forward to channel. LINE has no .forward consumer — the gateway
+              // delivers via LineReplyManager (free reply, or cache + postback
+              // button when slow) instead of writeAutoForward.
+              if (channelSrcForResult === 'line' && this.lineReply) {
+                void this.lineReply.onAnswer(mapKey, text);
+              } else if (channelSrcForResult !== 'discord' && hasMarkdown(text)) {
                 this.writeAutoForward(mapKey, toTelegramHtml(text), 'html');
               } else {
                 this.writeAutoForward(mapKey, text);
@@ -794,7 +1017,24 @@ export class AgentRunner extends EventEmitter {
             }
             replyCalled = false; // reset for next turn
             replyToolUseId = null;
-            // Delay typing done — agent may continue with more work
+            menuSentThisTurn = false;
+            // In pty-shell mode, a `result` fires after every Claude API sub-turn
+            // (there can be many per user message, separated by tool-call gaps of
+            // arbitrary length). Starting the typing-done timer here would stop
+            // the indicator during those inter-turn gaps. Instead, pty-shell emits
+            // `session_idle` once it is truly done; headless mode only produces
+            // one `result` per message, so the timer pattern still applies there.
+            if (proc.backend !== 'pty-shell') {
+              typingDoneTimer = setTimeout(() => {
+                this.writeTypingDone(mapKey);
+                typingDoneTimer = null;
+              }, TYPING_DONE_DELAY_MS);
+            }
+          }
+          // PTY shell signals "truly idle" (no active turn, empty queue) with this
+          // event. Start the typing-done timer here so the indicator stays alive
+          // through multi-turn tool-call sequences and only stops when all work is done.
+          if (obj['type'] === 'session_idle' && proc.backend === 'pty-shell') {
             typingDoneTimer = setTimeout(() => {
               this.writeTypingDone(mapKey);
               typingDoneTimer = null;
@@ -832,14 +1072,28 @@ export class AgentRunner extends EventEmitter {
         }, this.channelFor(mapKey)).catch(() => {});
       }
 
-      // Clean up pending typing-done timer when session stops
-      proc.once('exit', () => {
+      // Tear down per-chat typing/processing state whenever the subprocess dies.
+      // Uses `on` (not `once`): a single SessionProcess can auto-restart its child
+      // multiple times over its lifetime, and each death that lacks a final
+      // result/session_idle would otherwise leave the typing indicator stuck until
+      // the 5-min stalled detector fires. writeTypingDone/setProcessing(false) are
+      // idempotent, so firing on every exit is safe.
+      proc.on('exit', () => {
         proc.setProcessing(false);
         if (typingDoneTimer) {
           clearTimeout(typingDoneTimer);
           typingDoneTimer = null;
         }
         this.writeTypingDone(mapKey);
+        // LINE: a process exit with a button whose answer never arrived (crash /
+        // teardown mid-turn) → surface the interrupted notice so a tap returns it
+        // instead of a stale "still thinking". markInterrupted no-ops on a READY
+        // entry, so an already-answered, untapped button stays deliverable. Then
+        // clear the armed timer + stashed reply token for this chat.
+        if (!proc.queryMode) {
+          this.lineReply?.markInterrupted(mapKey);
+          this.lineReply?.disposeChat(mapKey);
+        }
       });
 
       // Deferred restart: stop session after its current turn completes
@@ -851,6 +1105,8 @@ export class AgentRunner extends EventEmitter {
     }
 
     this.sessions.set(mapKey, proc);
+    this.sessionHistory.unshift({ chatId: mapKey, sessionId: proc.sessionId, source: proc.source, mode: proc.backend, model: proc.model, spawnedAt: proc.spawnedAt });
+    if (this.sessionHistory.length > 10) this.sessionHistory.length = 10;
     if (source === 'telegram' || source === 'discord') {
       this.channelSourceMap.set(mapKey, source);
     }
@@ -1019,6 +1275,11 @@ export class AgentRunner extends EventEmitter {
     // Delete persisted media files for this chat
     MediaStore.clearChatMedia(this.agentsBaseDir, agentId, historyChatId);
 
+    // Reset any request_too_large escalation — the context is now empty, so the
+    // next spawn should start fresh at the top of the history ladder.
+    this.tooLargeRecoveries.delete(chatId);
+    this.tooLargeExhausted.delete(chatId);
+
     // Kill old process so next message spawns fresh
     this.restartProcess(chatId).catch(() => {});
   }
@@ -1097,6 +1358,63 @@ export class AgentRunner extends EventEmitter {
   }
 
   /**
+   * Unified recovery for the recoverable "Request too large (max 32MB)" error.
+   * Reached from two backends that surface the SAME error differently:
+   *  - PTY shell (headless=false): a `system/request_too_large` event emitted by
+   *    the transcript tailer from the authoritative <synthetic> record (Bug A).
+   *  - Headless (headless=true): claude --print emits a synthetic `result`
+   *    (is_error + "Request too large (max"); the long-lived process otherwise
+   *    stays alive and rejects every subsequent turn forever (Bug B).
+   *
+   * Each consecutive recovery shrinks the history re-injected on the next spawn
+   * (TOO_LARGE_HISTORY_LADDER: 50→40→30→20→10→0) so a pathological context drops
+   * under the 32MB ceiling. The respawn happens on the user's NEXT message (no
+   * auto-loop), and the counter resets on the next successful result. Once even a
+   * zero-history spawn still trips 32MB, stop escalating and ask the user to
+   * /clear rather than climb the ladder again.
+   */
+  private handleRequestTooLarge(mapKey: string, proc: SessionProcess): void {
+    proc.setProcessing(false);
+    const count = (this.tooLargeRecoveries.get(mapKey) ?? 0) + 1;
+    const lastRung = TOO_LARGE_HISTORY_LADDER.length - 1; // index of the 0-history rung
+
+    if (count > lastRung) {
+      // Even the zero-history spawn tripped 32MB — context can't shrink further.
+      // Pin the counter at the last rung and always surface the /clear next step.
+      this.tooLargeRecoveries.set(mapKey, lastRung);
+      this.logger.error('Request too large persists with zero re-injected history', { mapKey, count });
+      this.writeAutoForward(
+        mapKey,
+        '⚠️ ยังเกิน 32MB แม้จะล้าง context จนว่างแล้ว — พิมพ์ /clear เพื่อเริ่มเซสชันใหม่ หรือ /restart ค่ะ',
+      );
+      // Restart ONCE to clear the wedged process the first time the ladder is
+      // exhausted; thereafter stop restarting (no churn) and let the user /clear.
+      if (!this.tooLargeExhausted.has(mapKey)) {
+        this.tooLargeExhausted.add(mapKey);
+        void this.restartProcess(mapKey);
+      }
+      return;
+    }
+
+    this.tooLargeRecoveries.set(mapKey, count);
+    this.logger.warn('Request too large (32MB) — restarting with reduced history', {
+      mapKey, attempt: count, nextHistoryLimit: TOO_LARGE_HISTORY_LADDER[count],
+    });
+    // Ordering matters and makes the notice delivery race-free: writeAutoForward
+    // persists the `.forward` file synchronously HERE, before restartProcess()
+    // begins its async stop/kill. The typing-loop tear-down (stop() in typing.ts)
+    // drains and sends `.forward` synchronously before it removes the typing
+    // signal, so by the time the proc exit fires and the loop stops, the file is
+    // already on disk and is delivered — no dependency on poll timing. Do not
+    // reorder restartProcess() ahead of writeAutoForward().
+    this.writeAutoForward(
+      mapKey,
+      '⚠️ Context too large — hit Anthropic\'s 32MB request limit (usually from large images or files in context). Restarting this session with a fresh context. Your last message was not processed — please resend it.',
+    );
+    void this.restartProcess(mapKey);
+  }
+
+  /**
    * Stop all idle session subprocesses so they re-spawn with the latest
    * system prompt on the next incoming message.
    *
@@ -1107,13 +1425,28 @@ export class AgentRunner extends EventEmitter {
    *
    * Used by the skills hot-reload path so that SKILL.md changes take effect
    * without kicking users out of in-flight turns.
+   *
+   * @param opts.skipBusy When true, busy sessions are left running and NOT
+   *   marked for a deferred restart. Use this when the change came from a file
+   *   the agent writes itself mid-turn (e.g. MEMORY.md): deferring a restart
+   *   there would stop the very session that produced the change the moment its
+   *   turn completes (the self-restart footgun). Idle sessions are still
+   *   restarted so the change reaches them on their next spawn. The recomposed
+   *   CLAUDE.md is already on disk, so a skipped busy session picks up the
+   *   change on its own next natural spawn.
    */
-  async restartOrDefer(): Promise<void> {
+  async restartOrDefer(opts?: { skipBusy?: boolean }): Promise<void> {
+    const skipBusy = opts?.skipBusy ?? false;
     let immediate = 0;
     let deferred = 0;
+    let skipped = 0;
     const toStopNow: string[] = [];
     for (const [id, proc] of this.sessions) {
       if (proc.isProcessing) {
+        if (skipBusy) {
+          skipped++;
+          continue;
+        }
         proc.markPendingRestart();
         deferred++;
       } else {
@@ -1127,7 +1460,7 @@ export class AgentRunner extends EventEmitter {
       this.sessions.delete(id);
       immediate++;
     }
-    this.logger.info('restartOrDefer: sessions restarted', { immediate, deferred });
+    this.logger.info('restartOrDefer: sessions restarted', { immediate, deferred, skipped });
   }
 
   /**
@@ -1202,12 +1535,38 @@ export class AgentRunner extends EventEmitter {
   }
 
   private writeAutoForward(chatId: string, text: string, format: 'text' | 'html' = 'text'): void {
+    // LINE has no .forward consumer — route through LineReplyManager's push path.
+    if (this.channelFor(chatId) === 'line') {
+      if (this.lineReply) void this.lineReply.onAnswer(chatId, text);
+      return;
+    }
     const typingDir = this.getTypingDir(chatId);
     try {
       fs.mkdirSync(typingDir, { recursive: true });
       fs.writeFileSync(path.join(typingDir, `${chatId}.forward`), JSON.stringify({ text, format }));
     } catch {
       // Non-fatal
+    }
+  }
+
+  /**
+   * Signal the channel receiver to render an interactive menu as native UI
+   * (inline buttons on Telegram/Discord). The receiver maps each option to a
+   * `choice:N` callback whose tap arrives back as a normal "N" message — the
+   * same as the user typing the number.
+   */
+  private writeMenuForward(chatId: string, text: string, options: Array<{ label: string }>): void {
+    const typingDir = this.getTypingDir(chatId);
+    try {
+      fs.mkdirSync(typingDir, { recursive: true });
+      // Write atomically (tmp + rename): the receiver polls this directory every
+      // second, so a non-atomic write could be read mid-flush as truncated JSON.
+      const finalPath = path.join(typingDir, `${chatId}.menu`);
+      const tmpPath = `${finalPath}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify({ text, options }));
+      fs.renameSync(tmpPath, finalPath);
+    } catch {
+      // Non-fatal — the result text still carries the numbered list as a fallback.
     }
   }
 
@@ -1218,7 +1577,7 @@ export class AgentRunner extends EventEmitter {
           this.logger.info('Stopping idle session', { sessionId: id });
           await proc.stop();
           this.sessions.delete(id);
-          this.cleanupApiSessionMediaDir(id, proc.source);
+          this.evictApiSessionMapping(id);
         }
       }
     }, 5 * 60 * 1000);
@@ -1243,6 +1602,10 @@ export class AgentRunner extends EventEmitter {
       );
       this.discordReceiver.start();
     }
+    // LINE slow-LLM postback button: gateway-side token lifecycle + cache.
+    // Enabled for any LINE agent unless its threshold is 0 (then the MCP
+    // line_reply tool keeps the plain reply-first → push-fallback path).
+    this.startLineReply();
     this.startIdleCleaner();
     this._startCleanupScheduler();
     this.logger.info('AgentRunner started', { agentId: this.agentConfig.id });
@@ -1250,6 +1613,32 @@ export class AgentRunner extends EventEmitter {
 
   updateAgentConfig(newConfig: AgentConfig): void {
     this.agentConfig = newConfig;
+    // Restart LineReplyManager if the LINE config changed so the live instance
+    // picks up a new access token, threshold, or labels without a full restart.
+    this.stopLineReply();
+    this.startLineReply();
+  }
+
+  startLineReply(): void {
+    const lineThreshold = this.agentConfig.line?.slowResponseThreshold ?? 45;
+    if (!this.agentConfig.line?.channelSecret || !this.agentConfig.line?.channelAccessToken || lineThreshold <= 0) return;
+    if (this.lineReply) return; // already running
+    this.lineReply = new LineReplyManager({
+      agentId: this.agentConfig.id,
+      logDir: this.gatewayConfig.gateway.logDir,
+      accessToken: this.agentConfig.line.channelAccessToken,
+      thresholdSeconds: lineThreshold,
+      buttonLabel: this.agentConfig.line.slowButtonLabel,
+      pendingText: this.agentConfig.line.slowPendingText,
+    });
+    this.logger.info('LineReplyManager hot-started', { agentId: this.agentConfig.id });
+  }
+
+  stopLineReply(): void {
+    if (!this.lineReply) return;
+    this.lineReply.disposeAll();
+    this.lineReply = null;
+    this.logger.info('LineReplyManager stopped', { agentId: this.agentConfig.id });
   }
 
   getAgentConfig(): AgentConfig {
@@ -1308,10 +1697,25 @@ export class AgentRunner extends EventEmitter {
       srv.closeAllConnections?.();
       await new Promise<void>((resolve) => srv.close(() => resolve()));
     }
+    for (const buf of this.channelCoalesce.values()) {
+      clearTimeout(buf.timer);
+    }
+    this.channelCoalesce.clear();
     this.receiver?.stop();
     this.discordReceiver?.stop();
+    this.stopLineReply();
     await Promise.all([...this.sessions.values()].map((s) => s.stop()));
     this.sessions.clear();
+  }
+
+  /**
+   * Deliver a tapped LINE postback (the slow-LLM "Get answer" button).
+   * Returns true when it was our refresh button (caller must NOT forward it to
+   * the agent); false for any other postback.
+   */
+  async handleLinePostback(chatId: string, replyToken: string, data: string): Promise<boolean> {
+    if (!this.lineReply) return false;
+    return this.lineReply.handlePostback(chatId, replyToken, data);
   }
 
   private _startCleanupScheduler(): void {
@@ -1345,6 +1749,34 @@ export class AgentRunner extends EventEmitter {
     return this.receiver?.isRunning() ?? false;
   }
 
+  getSessionsSummary(): Array<{ chatId: string; sessionId: string; source: string; mode: string; model: string; isRunning: boolean; spawnedAt: number; uptimeSec: number; tokens: number }> {
+    const now = Date.now();
+    // A single logical session can appear multiple times in the ring buffer: a
+    // restart / model-switch / error-recovery respawn pushes a fresh entry with
+    // the SAME sessionId but a new spawnedAt. History is newest-first (unshift),
+    // so the first occurrence of a (source, sessionId, chatId) is the current
+    // incarnation — collapse to it so the dashboard shows one row per session
+    // instead of duplicating it.
+    const seen = new Set<string>();
+    const out: Array<{ chatId: string; sessionId: string; source: string; mode: string; model: string; isRunning: boolean; spawnedAt: number; uptimeSec: number; tokens: number }> = [];
+    for (const e of this.sessionHistory) {
+      const dedupKey = `${e.source}:${e.sessionId}:${e.chatId}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+      const proc = this.sessions.get(e.chatId);
+      // Running only when the live process IS this incarnation: a stale entry
+      // from before a respawn must not borrow the new process's running state.
+      const isRunning = !!proc && proc.spawnedAt === e.spawnedAt;
+      // For API sessions the ring-buffer chatId equals the sessionId (the map key);
+      // surface the real caller chatId instead when we have it.
+      const chatId = e.source === 'api' ? (this.apiChatIds.get(e.sessionId) ?? e.chatId) : e.chatId;
+      // Live context-window token usage from the running process (0 when stopped).
+      const tokens = isRunning ? (proc?.totalTokens ?? 0) : 0;
+      out.push({ ...e, chatId, isRunning, uptimeSec: Math.floor((now - e.spawnedAt) / 1000), tokens });
+    }
+    return out;
+  }
+
   /**
    * Send a message to an API session and wait for the response.
    *
@@ -1374,6 +1806,7 @@ export class AgentRunner extends EventEmitter {
 
     // Use model from request body if provided, otherwise use agent default
     const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
+    this.apiChatIds.set(sessionId, chatId);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFiles = opts.mediaFiles?.length
@@ -1577,6 +2010,7 @@ export class AgentRunner extends EventEmitter {
 
     // Use model from request body if provided, otherwise use agent default
     const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
+    this.apiChatIds.set(sessionId, chatId);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFilesStream = opts.mediaFiles?.length
@@ -1812,14 +2246,18 @@ export class AgentRunner extends EventEmitter {
       .filter((a): a is ApiAttachment => a !== null);
   }
 
-  private cleanupApiSessionMediaDir(sessionId: string, source: string): void {
-    if (source !== 'api') return;
-    const mediaDir = path.join(this.agentsBaseDir, this.agentConfig.id, 'media', `api-${sessionId}`);
-    try {
-      fs.rmSync(mediaDir, { recursive: true, force: true });
-    } catch {
-      // best-effort — log nothing, just don't crash the cleaner
-    }
+  private evictApiSessionMapping(sessionId: string): void {
+    // Evict the in-memory chat-id mapping only — safe no-op for non-api sessions.
+    //
+    // IMPORTANT: do NOT delete the session's media dir here. Stopping a session
+    // (idle eviction or the idle cleaner) is a lifecycle event decoupled from
+    // history. The screenshots under media/api-<sessionId>/ are referenced by
+    // rows in history.db that outlive the running process, so removing them
+    // here leaves dangling references → GET /media returns 404 → the client
+    // renders "Unavailable". Media is correctly reclaimed elsewhere, tied to
+    // history lifetime: MediaStore.clearChatMedia (/clear) and the daily
+    // retention sweep (deleteMediaFiles for messages pruned by pruneOlderThan).
+    this.apiChatIds.delete(sessionId);
   }
 
   getAgentsBaseDir(): string {
@@ -1838,83 +2276,179 @@ export class AgentRunner extends EventEmitter {
     return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
   }
 
-  async listSessionsForChat(chatId: string, channel: 'telegram' | 'discord'): Promise<import('../types').SessionIndex> {
+  async listSessionsForChat(chatId: string, channel: 'telegram' | 'discord' | 'line'): Promise<import('../types').SessionIndex> {
     return this.sessionStore.listSessions(this.agentConfig.id, chatId, channel);
   }
 
-  async executeApiCommand(sessionId: string, chatId: string, command: string): Promise<Record<string, unknown>> {
+  async executeApiCommand(
+    sessionId: string,
+    chatId: string,
+    command: string,
+    opts?: { skipPersist?: boolean },
+  ): Promise<{ result: Record<string, unknown>; responseText: string }> {
     const agentId = this.agentConfig.id;
     const storeChatId = chatId;           // sessionStore adds channel prefix internally
     const dbChatId = `api-${chatId}`;    // historyDb uses full channel-chatId key
+    const skipPersist = opts?.skipPersist ?? false;
 
-    if (command === '/model') {
-      return { model: this.agentConfig.claude.model };
+    // Dispatch on the first token so commands with arguments (e.g. "/model sonnet",
+    // "/stop now") resolve to their base command instead of falling through to the
+    // unknown-command branch. The router gate is prefix-based, so these already pass.
+    const cmd = command.trim().split(/\s+/)[0] ?? '';
+
+    // Validate BEFORE persisting anything. Reuse the same api-channel gate as the router
+    // so an unknown command throws with nothing written — no orphan user row is left, and
+    // the router surfaces the error/500 exactly as before. After token dispatch + the
+    // /sessions branch below, this is only reachable on a direct caller passing garbage.
+    if (!AgentRunner.isApiBuiltinCommand(cmd)) {
+      throw new Error(`Unknown command: ${cmd}`);
     }
 
-    if (command === '/stop') {
-      const session = this.sessions.get(sessionId);
-      const stopped = session ? session.interrupt() : false;
-      return { stopped };
+    // Register session in the api-{chatId} index on first use (same as sendApiMessageStream)
+    await this.sessionStore.ensureApiSession(agentId, storeChatId, sessionId).catch((err: unknown) => {
+      this.logger.warn('Failed to register API session in index for command', { agentId, chatId, sessionId, error: (err as Error).message });
+    });
+
+    // Persist a command message to the permanent history DB ONLY — not the model's session
+    // context (sessionStore). historyDb is what the web history endpoint reads, so this is
+    // all the display + spinner fix needs. Keeping commands out of the JSONL context means
+    // /model replies aren't replayed into the model, /compact counts stay accurate, /clear
+    // leaves no dangling turn, and the api channel matches telegram (which persists commands
+    // nowhere).
+    //
+    // skipPersist (wire param store_user_message=false) suppresses BOTH the user command and
+    // the assistant reply: programmatic REST callers leave no trace in chat history at all.
+    const persist = (role: 'user' | 'assistant', content: string) => {
+      if (skipPersist || !content) return;
+      this.historyDb.insertMessage({ chatId: dbChatId, sessionId, source: 'api', role, content, ts: Date.now() });
+    };
+
+    // Persist the full user command before executing so it appears in history.
+    // Skip for /clear — clearSession() below wipes the table anyway; only the response survives.
+    if (cmd !== '/clear') {
+      persist('user', command);
     }
 
-    if (command === '/restart') {
-      this.restartProcess(sessionId).catch(() => {});
-      return { restarting: true };
+    let result: Record<string, unknown>;
+    let responseText: string;
+    try {
+      if (cmd === '/model') {
+        const model = this.agentConfig.claude.model;
+        const hasArg = command.trim().includes(' ');
+        result = { model };
+        responseText = hasArg
+          ? `Current model: ${model}\n(To switch models use the model picker or the /api/v1/agents/:id/model endpoint — argument ignored.)`
+          : `Current model: ${model}`;
+      } else if (cmd === '/stop') {
+        const session = this.sessions.get(sessionId);
+        const stopped = session ? session.interrupt() : false;
+        result = { stopped };
+        responseText = stopped ? 'Session interrupted.' : 'No active session to stop.';
+      } else if (cmd === '/restart') {
+        this.restartProcess(sessionId).catch(() => {});
+        result = { restarting: true };
+        responseText = 'Session is restarting.';
+      } else if (cmd === '/session') {
+        const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
+        const meta = index?.sessions.find((s) => s.id === sessionId);
+        const effectiveModel = this.agentConfig.claude.model;
+        // The api append path doesn't maintain the index messageCount, so count the flat store
+        // (the real conversation) directly rather than trusting meta.messageCount.
+        const messageCount = (await this.sessionStore.loadSession(agentId, sessionId).catch(() => [])).length;
+        if (!meta) {
+          result = { sessionId, sessionName: null, messageCount, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
+          responseText = `Session: (unnamed)\nMessages: ${messageCount}\nContext used: 0%\nModel: ${effectiveModel}`;
+        } else {
+          const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+          const modelConfig = availableModels.find((m) => m.id === effectiveModel);
+          const contextWindow = modelConfig?.contextWindow ?? 200000;
+          const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
+          result = { sessionId, sessionName: meta.name, messageCount, archivedCount: meta.archivedCount ?? 0, contextUsedPct, model: effectiveModel };
+          responseText = [
+            `Session: ${meta.name ?? '(unnamed)'}`,
+            `Messages: ${messageCount}${(meta.archivedCount ?? 0) > 0 ? ` (${meta.archivedCount} archived)` : ''}`,
+            `Context used: ${contextUsedPct}%`,
+            `Model: ${effectiveModel}`,
+          ].join('\n');
+        }
+      } else if (cmd === '/sessions') {
+        // Advertised for the api channel (BUILTIN_COMMANDS), so handle it here — mirrors the
+        // telegram /sessions list. Marks the session this command runs in as (current).
+        const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
+        const list = index?.sessions ?? [];
+        // Count each session's flat store directly — the api append path doesn't keep the
+        // index messageCount in sync.
+        const withCounts = await Promise.all(
+          list.map(async (s) => ({
+            id: s.id,
+            name: s.name,
+            messageCount: (await this.sessionStore.loadSession(agentId, s.id).catch(() => [])).length,
+            current: s.id === sessionId,
+          })),
+        );
+        result = { sessions: withCounts, count: withCounts.length };
+        if (!withCounts.length) {
+          responseText = 'No sessions.';
+        } else {
+          const lines = withCounts.map((s) => {
+            const n = s.messageCount;
+            const marker = s.current ? ' (current)' : '';
+            return `• ${s.name ?? '(unnamed)'} — ${n} message${n === 1 ? '' : 's'}${marker}`;
+          });
+          responseText = `Sessions (${withCounts.length}):\n${lines.join('\n')}`;
+        }
+      } else if (cmd === '/clear') {
+        const ch = 'api' as const;
+        await this.sessionStore.clearTelegramSessionHistory(agentId, storeChatId, sessionId, ch);
+        await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
+          totalTokensUsed: 0,
+          lastInputTokens: 0,
+          archivedCount: 0,
+          loadedAtSpawn: undefined,
+          messageCountAtSpawn: undefined,
+        }, ch);
+        const mediaPaths = this.historyDb.clearSession(dbChatId, sessionId);
+        MediaStore.deleteMediaFiles(this.agentsBaseDir, agentId, mediaPaths);
+        this.restartProcess(sessionId).catch(() => {});
+        result = { success: true };
+        responseText = 'Session cleared.';
+      } else if (cmd === '/compact') {
+        const ch = 'api' as const;
+        const compactEffectiveModel = this.agentConfig.claude.model;
+        const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
+        const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
+        const contextWindow = modelConfig?.contextWindow ?? 200000;
+        const compactor = new SessionCompactor(this.sessionStore);
+        const compactResult = await compactor.compact(agentId, storeChatId, sessionId, compactEffectiveModel, contextWindow, ch);
+        await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
+          loadedAtSpawn: undefined,
+          archivedCount: undefined,
+          messageCountAtSpawn: undefined,
+        }, ch);
+        await this.restartProcess(sessionId);
+        result = { success: true, keptMessages: compactResult.afterMessages, archivedMessages: compactResult.beforeMessages - compactResult.afterMessages };
+        responseText = `Session compacted. Kept ${compactResult.afterMessages} messages, archived ${compactResult.beforeMessages - compactResult.afterMessages}.`;
+      } else {
+        // Passed the gate but has no dispatch branch — BUILTIN_COMMANDS drifted from this
+        // table. Throw so the failure surfaces (and ends history with an assistant turn via
+        // the catch below) rather than returning an empty response.
+        throw new Error(`Unhandled command: ${cmd}`);
+      }
+    } catch (err: unknown) {
+      // Ensure history always ends with an assistant turn, even when execution fails midway
+      // (e.g. /compact throws after the user row is persisted). Otherwise the trailing user
+      // row re-triggers the web's stuck-spinner condition on reload. Rethrow so the router
+      // still emits its SSE error event / REST 500.
+      const errMsg = err instanceof Error ? err.message : String(err);
+      persist('assistant', `Command failed: ${errMsg}`);
+      throw err;
     }
 
-    if (command === '/session') {
-      const index = await this.sessionStore.listSessions(agentId, storeChatId, 'api').catch(() => null);
-      const meta = index?.sessions.find((s) => s.id === sessionId);
-      const effectiveModel = this.agentConfig.claude.model;
-      if (!meta) return { sessionId, sessionName: null, messageCount: 0, archivedCount: 0, contextUsedPct: 0, model: effectiveModel };
-      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const modelConfig = availableModels.find((m) => m.id === effectiveModel);
-      const contextWindow = modelConfig?.contextWindow ?? 200000;
-      const contextUsedPct = Math.round(((meta.lastInputTokens ?? 0) / contextWindow) * 100);
-      return {
-        sessionId,
-        sessionName: meta.name,
-        messageCount: meta.messageCount,
-        archivedCount: meta.archivedCount ?? 0,
-        contextUsedPct,
-        model: effectiveModel,
-      };
-    }
+    // Persist the human-readable response as an assistant turn so the conversation ends with
+    // an assistant message (the web's computeIsPendingResponse needs last.role !== 'user').
+    persist('assistant', responseText);
 
-    if (command === '/clear') {
-      const ch = 'api' as const;
-      await this.sessionStore.clearTelegramSessionHistory(agentId, storeChatId, sessionId, ch);
-      await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
-        totalTokensUsed: 0,
-        lastInputTokens: 0,
-        archivedCount: 0,
-        loadedAtSpawn: undefined,
-        messageCountAtSpawn: undefined,
-      }, ch);
-      const mediaPaths = this.historyDb.clearSession(dbChatId, sessionId);
-      MediaStore.deleteMediaFiles(this.agentsBaseDir, agentId, mediaPaths);
-      this.restartProcess(sessionId).catch(() => {});
-      return { success: true };
-    }
-
-    if (command === '/compact') {
-      const ch = 'api' as const;
-      const compactEffectiveModel = this.agentConfig.claude.model;
-      const availableModels = this.gatewayConfig.gateway.models ?? DEFAULT_MODELS;
-      const modelConfig = availableModels.find((m) => m.id === compactEffectiveModel);
-      const contextWindow = modelConfig?.contextWindow ?? 200000;
-      const compactor = new SessionCompactor(this.sessionStore);
-      const result = await compactor.compact(agentId, storeChatId, sessionId, compactEffectiveModel, contextWindow, ch);
-      await this.sessionStore.updateSessionMeta(agentId, storeChatId, sessionId, {
-        loadedAtSpawn: undefined,
-        archivedCount: undefined,
-        messageCountAtSpawn: undefined,
-      }, ch);
-      await this.restartProcess(sessionId);
-      return { success: true, keptMessages: result.afterMessages, archivedMessages: result.beforeMessages - result.afterMessages };
-    }
-
-    throw new Error(`Unknown command: ${command}`);
+    return { result, responseText };
   }
 
   async setModel(newModel: string): Promise<void> {
@@ -2014,7 +2548,7 @@ export class AgentRunner extends EventEmitter {
    */
   async sendMessageToSession(
     rawChatId: string,
-    channel: 'telegram' | 'discord',
+    channel: 'telegram' | 'discord' | 'line',
     sessionId: string,
     message: string,
     senderName: string | undefined,

@@ -17,9 +17,22 @@ export async function sendMessage(
     replyTo?: string;
     files?: string[];
     useEmbed?: boolean;
+    components?: unknown[];
   } = {},
 ): Promise<SentMessage[]> {
   const sent: SentMessage[] = [];
+
+  // Interactive menu: send the text with button rows attached to the first message.
+  if (options.components && options.components.length) {
+    const chunks = chunkText(text, MAX_MESSAGE_LENGTH);
+    for (let i = 0; i < chunks.length; i++) {
+      const last = i === chunks.length - 1;
+      const sendOpts: Parameters<SendableChannel['send']>[0] = { content: chunks[i] };
+      if (last) sendOpts.components = options.components;
+      sent.push(await channel.send(sendOpts));
+    }
+    return sent;
+  }
 
   if (text.length > MAX_MESSAGE_LENGTH && options.useEmbed) {
     const embedText = text.slice(0, MAX_EMBED_DESCRIPTION);
@@ -53,6 +66,34 @@ export async function sendMessage(
   }
 
   return sent;
+}
+
+/**
+ * Build Discord action-row components for an interactive menu. Each option
+ * becomes a Secondary button labelled "N. label" whose custom_id is `choice:N`
+ * (≤5 buttons per row, ≤5 rows). Uses raw component JSON to keep this module
+ * free of a discord.js import (matching the rest of the file).
+ */
+export function buildChoiceComponents(options: Array<{ label: string }>): unknown[] {
+  const rows: unknown[] = [];
+  for (let i = 0; i < options.length && rows.length < 5; i += 5) {
+    const buttons = options.slice(i, i + 5).map((o, j) => {
+      const n = i + j + 1;
+      return {
+        type: 2, // Button
+        style: 2, // Secondary
+        label: `${n}. ${o.label}`.slice(0, 80),
+        custom_id: `choice:${n}`,
+      };
+    });
+    rows.push({ type: 1, components: buttons }); // ActionRow
+  }
+  // Always append a cancel button (Danger style) so the user can dismiss the
+  // menu cleanly. Sends ESC to the PTY without injecting text into Claude's context.
+  if (rows.length > 0 && rows.length < 5) {
+    rows.push({ type: 1, components: [{ type: 2, style: 4, label: '❌ Cancel', custom_id: 'menu:cancel' }] });
+  }
+  return rows;
 }
 
 export function chunkText(text: string, limit: number): string[] {

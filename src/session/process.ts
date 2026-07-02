@@ -7,6 +7,8 @@ import chokidar from 'chokidar';
 import { AgentConfig, GatewayConfig } from '../types';
 import { SessionStore } from './store';
 import { createLogger } from '../logger';
+import { ptyStreamRegistry } from '../shell/pty-stream-registry';
+import { neutralizeTuiTriggers } from '../shell/screen';
 import {
   CODING_TOOLS,
   TOOL_LABELS,
@@ -14,7 +16,7 @@ import {
   truncateDetail,
 } from '../utils/tool-labels';
 
-const MAX_HISTORY_MESSAGES = 50;
+export const MAX_HISTORY_MESSAGES = 50;
 const AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_RESTARTS = 3;
 // Bound how many times a single session may auto-respawn to recover from a
@@ -26,10 +28,19 @@ const CHANNELS_ACTIVATION_PROMPT =
 export class SessionProcess extends EventEmitter {
   readonly sessionId: string;
   readonly chatId: string;
-  readonly source: 'telegram' | 'discord' | 'api';
-  private readonly sessionChannel: 'telegram' | 'discord';
+  readonly source: 'telegram' | 'discord' | 'line' | 'api';
+  private readonly sessionChannel: 'telegram' | 'discord' | 'line';
   lastActivityAt = Date.now(); // accessible by AgentRunner for eviction sort
+  readonly spawnedAt = Date.now();
+  /** Backend used to run the subprocess. Set during start(); 'headless' until then. */
+  backend: 'pty-shell' | 'headless' = 'headless';
   modelOverride?: string; // per-session model override (set by runner from SessionMeta)
+  // Per-spawn cap on how many history messages buildInitialPrompt re-injects.
+  // Defaults to MAX_HISTORY_MESSAGES; the runner lowers it (set before start())
+  // when recovering from a repeated request_too_large (32MB) so each retry
+  // re-loads less context until it drops under Anthropic's request ceiling.
+  // 0 = inject no history at all (fully fresh context).
+  historyLimit: number = MAX_HISTORY_MESSAGES;
   spawnContext: { loadedAtSpawn: number; archivedCount: number; messageCountAtSpawn: number } | null = null;
   private process: ChildProcess | null = null;
   private stopping = false;
@@ -45,6 +56,10 @@ export class SessionProcess extends EventEmitter {
   private readonly configPath: string;
   private readonly restartSignalPath: string;
   queryMode = false;
+  // Latest context-window token usage (input context + output) for the most
+  // recent turn. Surfaced read-only for the status dashboard. Best-effort —
+  // reset to 0 until the first tokenUsage event fires.
+  private lastTotalTokens = 0;
   private thinkingRecoveryCount = 0;
   private _queryResolve?: (text: string) => void;
   private _queryBuffer = '';
@@ -55,7 +70,7 @@ export class SessionProcess extends EventEmitter {
 
   constructor(
     sessionId: string,
-    source: 'telegram' | 'discord' | 'api',
+    source: 'telegram' | 'discord' | 'line' | 'api',
     agentConfig: AgentConfig,
     gatewayConfig: GatewayConfig,
     sessionStore: SessionStore,
@@ -65,7 +80,8 @@ export class SessionProcess extends EventEmitter {
     this.sessionId = sessionId;
     this.source = source;
     this.chatId = chatId ?? sessionId;
-    this.sessionChannel = source === 'discord' ? 'discord' : 'telegram';
+    this.sessionChannel =
+      source === 'discord' ? 'discord' : source === 'line' ? 'line' : 'telegram';
     this.agentConfig = agentConfig;
     this.gatewayConfig = gatewayConfig;
     this.sessionStore = sessionStore;
@@ -75,7 +91,7 @@ export class SessionProcess extends EventEmitter {
     );
     // config.json lives 3 levels above workspace: <base>/<agentId>/workspace → <base>/config.json
     this.configPath = path.resolve(agentConfig.workspace, '..', '..', '..', 'config.json');
-    const stateSubDir = source === 'discord' ? '.discord-state' : '.telegram-state';
+    const stateSubDir = source === 'discord' ? '.discord-state' : source === 'line' ? '.line-state' : '.telegram-state';
     this.restartSignalPath = path.join(agentConfig.workspace, stateSubDir, `restart-${sessionId}`);
   }
 
@@ -84,7 +100,7 @@ export class SessionProcess extends EventEmitter {
    * Priority: per-session override > config.json on disk > cached agentConfig.
    */
   private get typingDir(): string {
-    const sub = this.source === 'discord' ? '.discord-state' : '.telegram-state';
+    const sub = this.source === 'discord' ? '.discord-state' : this.source === 'line' ? '.line-state' : '.telegram-state';
     return path.join(this.agentConfig.workspace, sub, 'typing');
   }
 
@@ -92,6 +108,16 @@ export class SessionProcess extends EventEmitter {
     return this.source !== 'api'
       ? this.sessionStore.appendTelegramMessage(this.agentConfig.id, this.chatId, this.sessionId, msg, this.sessionChannel)
       : this.sessionStore.appendMessage(this.agentConfig.id, this.sessionId, msg);
+  }
+
+  /** Public accessor for the model this session currently resolves to (for status/UI). */
+  get model(): string {
+    return this.readFreshModel();
+  }
+
+  /** Latest context-window token usage for this session (for status/UI). */
+  get totalTokens(): number {
+    return this.lastTotalTokens;
   }
 
   private readFreshModel(): string {
@@ -159,15 +185,21 @@ export class SessionProcess extends EventEmitter {
     // so the model retains context from before the truncation window.
     const SUMMARY_MARKER = '[Conversation Summary]';
     const firstMsg = history[0];
+    // Clamp to a sane range; the runner uses this to escalate-shrink history on
+    // repeated request_too_large (50→40→30→20→10→0). limit === 0 → no history.
+    const limit = Math.max(0, this.historyLimit);
     const hasSummary =
-      history.length > MAX_HISTORY_MESSAGES &&
+      limit > 1 &&
+      history.length > limit &&
       firstMsg?.role === 'system' &&
       typeof firstMsg.content === 'string' &&
       firstMsg.content.trimStart().startsWith(SUMMARY_MARKER);
 
-    const recent = hasSummary
-      ? [firstMsg, ...history.slice(-(MAX_HISTORY_MESSAGES - 1))]
-      : history.slice(-MAX_HISTORY_MESSAGES);
+    const recent = limit <= 0
+      ? []
+      : hasSummary
+        ? [firstMsg, ...history.slice(-(limit - 1))]
+        : history.slice(-limit);
 
     const loadedAtSpawn = recent.length;
     const archivedCount = history.length - recent.length;
@@ -192,7 +224,13 @@ export class SessionProcess extends EventEmitter {
       .join('\n');
 
     return {
-      historyPrompt: `[Conversation history with this user:\n${historyText}]`,
+      // Defense-in-depth: defang any verbatim 32MB-overlay text captured into past
+      // messages before it is re-typed into the TUI. The primary fix routes the real
+      // error off the screen-scraper to the transcript's `<synthetic>` record (see
+      // TranscriptTailer.onRequestTooLarge), so detectRequestTooLarge() is no longer
+      // wired into the trigger — but neutralizing the re-injected copy keeps the
+      // poisoned overlay text off the screen entirely and out of any future scraper.
+      historyPrompt: `[Conversation history with this user:\n${neutralizeTuiTriggers(historyText)}]`,
       loadedAtSpawn,
       archivedCount,
       messageCountAtSpawn,
@@ -264,6 +302,17 @@ export class SessionProcess extends EventEmitter {
             DISCORD_CHANNEL_ALLOWLIST: (this.agentConfig.discord?.channelAllowlist ?? []).join(','),
             DISCORD_DM_POLICY: this.agentConfig.discord?.dmPolicy ?? 'disabled',
             DISCORD_DM_ALLOWLIST: (this.agentConfig.discord?.dmAllowlist ?? []).join(','),
+            // LINE outbound: line_reply pushes via the Messaging API. The MCP
+            // subprocess only sees the env we hand it, so the token must be
+            // forwarded explicitly. The SDK targets api.line.me by default.
+            LINE_CHANNEL_ACCESS_TOKEN: this.agentConfig.line?.channelAccessToken ?? '',
+            // Refresh mode (slow-LLM postback button): when on, the gateway is the
+            // sole LINE sender, so line_reply must NOT send from the subprocess.
+            // Mirrors the runner's `slowResponseThreshold > 0` gate.
+            LINE_REPLY_REFRESH:
+              this.agentConfig.line && (this.agentConfig.line.slowResponseThreshold ?? 45) > 0
+                ? '1'
+                : '',
             GATEWAY_AGENT_ID: this.agentConfig.id,
             // Must be the base URL without /api suffix (e.g. http://127.0.0.1:10850).
             // MCP tools append /api/v1/... themselves — a trailing /api here causes double-prefix 404s.
@@ -369,6 +418,7 @@ export class SessionProcess extends EventEmitter {
     // App-agents always stay headless: the wrapper (node-pty) lives on the
     // host and cannot wrap a binary inside a docker-exec container.
     const usePtyShell = this.gatewayConfig.gateway.headless === false && !isAppAgent;
+    this.backend = usePtyShell ? 'pty-shell' : 'headless';
     let ptyRealBin: string | null = null;
     // Pre-calculate heartbeat path so we can pass it to the PTY shell before spawn.
     // API sessions are excluded: the stalled detector is receiver-side (Telegram/Discord)
@@ -382,6 +432,12 @@ export class SessionProcess extends EventEmitter {
       ptyRealBin = claudeBinRaw.includes('claude-pty-shell') ? 'claude' : claudeBinRaw;
       claudeBin = process.execPath;
       allArgs = [wrapperPath, ...args];
+      // NOTE: the interactive TUI backend does NOT append a [1m] context suffix.
+      // Triggering the server-side 1M billing tier from the TUI requires real 1M
+      // credits on the account; without them the session silently drops back to
+      // 200k mid-conversation. Until credits are provisioned, the TUI runs at the
+      // standard context window. (A model string with an explicit [1m] suffix in
+      // config is still passed through verbatim by buildArgs.)
     } else if (this.gatewayConfig.gateway.headless === false && isAppAgent) {
       this.logger.warn('gateway.headless=false is not supported for app-agents — using headless backend', {
         sessionId: this.sessionId,
@@ -419,6 +475,14 @@ export class SessionProcess extends EventEmitter {
         ]
       : allArgs;
 
+    let ptyStreamSocketPath: string | null = null;
+    if (usePtyShell) {
+      // Key the stream by sessionId, not agentId: one agent may run several
+      // concurrent sessions, each needing its own isolated PTY mirror.
+      ptyStreamSocketPath = ptyStreamRegistry.socketPath(this.sessionId);
+      ptyStreamRegistry.listen(this.sessionId, ptyStreamSocketPath);
+    }
+
     const proc = spawn(spawnBin, spawnArgs, {
       env: {
         ...process.env,
@@ -427,6 +491,7 @@ export class SessionProcess extends EventEmitter {
         GATEWAY_RESTART_SIGNAL_PATH: this.restartSignalPath,
         ...(ptyRealBin ? { CLAUDE_REAL_BIN: ptyRealBin } : {}),
         ...(ptyHeartbeatPath ? { PTY_SHELL_HEARTBEAT_PATH: ptyHeartbeatPath } : {}),
+        ...(ptyStreamSocketPath ? { PTY_SHELL_STREAM_SOCKET: ptyStreamSocketPath } : {}),
       },
       cwd: this.agentConfig.workspace,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -440,11 +505,22 @@ export class SessionProcess extends EventEmitter {
     // first API turn and cause sendApiMessage to resolve with the wrong result.
     // Instead, if there is conversation history to restore (model-switch respawn),
     // stash it in pendingInitialPrompt so sendMessage() prepends it to the first turn.
+    //
+    // Non-API sessions with history also use pendingInitialPrompt to avoid a
+    // double-response bug: if the session died while an interactive menu was pending
+    // (e.g. ExitPlanMode Pre-flight Summary), sending history + activation immediately
+    // makes Claude respond to that context as Turn 1, then the user's reply (e.g. "Y")
+    // becomes Turn 2 — two separate responses forwarded to the channel. Deferring
+    // history to sendMessage() bundles [history + activation + user reply] into a
+    // single turn so Claude produces exactly one response.
     if (this.source !== 'api') {
-      const initialPrompt = historyPrompt
-        ? `${historyPrompt}\n\n${CHANNELS_ACTIVATION_PROMPT}`
-        : CHANNELS_ACTIVATION_PROMPT;
-      proc.stdin?.write(SessionProcess.toStreamJsonTurn(initialPrompt) + '\n');
+      if (historyPrompt) {
+        // Has history: defer to first incoming user message to prevent double-response.
+        this.pendingInitialPrompt = `${historyPrompt}\n\n${CHANNELS_ACTIVATION_PROMPT}`;
+      } else {
+        // No history: send activation-only prompt immediately (fresh session).
+        proc.stdin?.write(SessionProcess.toStreamJsonTurn(CHANNELS_ACTIVATION_PROMPT) + '\n');
+      }
     } else if (historyPrompt) {
       this.pendingInitialPrompt = historyPrompt;
     }
@@ -603,6 +679,7 @@ export class SessionProcess extends EventEmitter {
               const outputTokens = usage?.output_tokens ?? 0;
               const totalTokens = lastMessageStartContext + outputTokens;
               if (lastMessageStartContext > 0) {
+                this.lastTotalTokens = totalTokens;
                 this.emit('tokenUsage', { inputTokens: lastMessageStartContext, outputTokens, totalTokens });
               }
               lastMessageStartContext = 0;
@@ -624,7 +701,16 @@ export class SessionProcess extends EventEmitter {
         signal,
         sessionId: this.sessionId,
       });
+      if (ptyStreamSocketPath) ptyStreamRegistry.close(ptyStreamSocketPath);
       this.process = null;
+      // Notify listeners that the underlying subprocess died. The runner relies
+      // on this to tear down per-chat typing/processing state when a session is
+      // stopped or restarted mid-turn (without a final result/session_idle).
+      // Without it the typing indicator stays stuck until the 5-min stalled
+      // detector fires. Idempotent on the listener side (writeTypingDone uses
+      // rmSync(force)), so emitting on every child exit — including auto-restart
+      // — is safe.
+      this.emit('exit', code, signal);
       if (!this.stopping) this.scheduleRestart();
     });
 

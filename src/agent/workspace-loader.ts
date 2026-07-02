@@ -170,17 +170,69 @@ export async function loadWorkspace(workspaceDir: string, opts?: LoadWorkspaceOp
 const WATCH_DEBOUNCE_MS = 300;
 
 /**
+ * Canonical workspace files the agent is authorized to write itself, per the
+ * memory rule (see MEMORY_RULE above). When ONLY these change, a busy session
+ * must not be force-restarted: the change most likely came from that very
+ * session mid-turn, and a deferred restart would stop it the moment the turn
+ * completes (the self-restart footgun). Idle sessions are still restarted so
+ * the change reaches them on their next spawn, and the recomposed CLAUDE.md
+ * carries the change into every future spawn regardless.
+ */
+export const AGENT_WRITABLE_FILES = new Set<string>([
+  'MEMORY.md',
+  'USER.md',
+  'SOUL.md',
+  'AGENTS.md',
+]);
+
+/**
+ * Normalize a changed file path to its canonical uppercase basename, resolving
+ * legacy lowercase aliases (e.g. memory.md → MEMORY.md).
+ */
+function canonicalWorkspaceName(filePath: string): string {
+  const base = path.basename(filePath);
+  return LOWERCASE_TO_UPPERCASE[base] ?? base;
+}
+
+/**
  * Watch a workspace directory for changes.
- * Calls onChange when any .md file changes (debounced 300ms).
+ * Calls onChange (debounced 300ms) with the de-duplicated list of canonical
+ * filenames that changed (e.g. ['MEMORY.md', 'SOUL.md']).
  * If a file matching a known lowercase alias is added, it is auto-renamed to
  * its uppercase canonical name before triggering onChange.
  * Returns a WatchHandle with a close() method.
  */
-export function watchWorkspace(workspaceDir: string, onChange: () => void): WatchHandle {
+export function watchWorkspace(
+  workspaceDir: string,
+  onChange: (changedFiles: string[]) => void,
+): WatchHandle {
+  const claudeMdPath = path.join(workspaceDir, 'CLAUDE.md');
   return createWatcher({
     paths: [path.join(workspaceDir, '*.md')],
     debounceMs: WATCH_DEBOUNCE_MS,
-    chokidarOpts: { ignored: path.join(workspaceDir, 'CLAUDE.md') },
+    // Only the top-level *.md files matter here. `depth: 0` and the `ignored`
+    // function do TWO DISTINCT jobs — neither is redundant:
+    //   • depth:0 stops chokidar from recursing into workspace subdirectories
+    //     (.telegram-state / .discord-state / memory / …). That accidental
+    //     recursion fanned out one inotify watcher per nested dir across every
+    //     agent and could exhaust the system limit (ENOSPC), crashing the
+    //     gateway. depth:0 alone does NOT filter top-level entries.
+    //   • ignored filters the top-level entries the *.md glob still matches:
+    //     CLAUDE.md (excluded so its reload-driven rewrite can't self-trigger a
+    //     loop) and dot-prefixed files. NB: chokidar's *.md glob DOES match
+    //     leading-dot files (verified — `.foo.md` fires an add event), so
+    //     without this a top-level dotfile would spuriously trigger reloads.
+    // The dot test is computed relative to workspaceDir on purpose — a naive
+    // dot-segment match against the absolute path would also match the parent
+    // `.claude-gateway` dir and silently ignore the entire tree.
+    chokidarOpts: {
+      depth: 0,
+      ignored: (p: string) => {
+        if (p === claudeMdPath) return true;
+        const rel = path.relative(workspaceDir, p);
+        return rel !== '' && rel.startsWith('.');
+      },
+    },
     onAddSync: (filePath: string) => {
       const filename = path.basename(filePath);
       const upperName = LOWERCASE_TO_UPPERCASE[filename];
@@ -194,7 +246,10 @@ export function watchWorkspace(workspaceDir: string, onChange: () => void): Watc
         }
       }
     },
-    onChange,
+    onChange: (changedPaths: string[]) => {
+      const names = Array.from(new Set(changedPaths.map(canonicalWorkspaceName)));
+      onChange(names);
+    },
   });
 }
 

@@ -77,6 +77,25 @@ function failingSpawn(failOn: string) {
   });
 }
 
+/** Async spawn mock (used by the boot-time container restore path). */
+const successAsyncSpawn = jest.fn(
+  async (_cmd: string, _args: string[], _opts?: object) => ({
+    stdout: '',
+    stderr: '',
+    status: 0,
+  }),
+);
+
+/** Async spawn mock that fails on matching command */
+function failingAsyncSpawn(failOn: string) {
+  return jest.fn(async (_cmd: string, args: string[], _opts?: object) => {
+    if (args.some((a) => a.includes(failOn))) {
+      return { stdout: '', stderr: `mocked error: ${failOn}`, status: 1 };
+    }
+    return { stdout: '', stderr: '', status: 0 };
+  });
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe('AppInstaller', () => {
@@ -97,13 +116,15 @@ describe('AppInstaller', () => {
     callbacks = makeCallbacks();
   });
 
-  function makeInstaller(spawnFn = successSpawn) {
+  function makeInstaller(spawnFn = successSpawn, asyncSpawnFn = successAsyncSpawn) {
     return new AppInstaller(
       registry,
       new RegistryClient(),
       callbacks,
       spawnFn,
       appsDir,
+      undefined, // agentManager
+      asyncSpawnFn as unknown as ConstructorParameters<typeof AppInstaller>[6],
     );
   }
 
@@ -359,6 +380,95 @@ services:
       await installer.startStopRestart('my-app', 'start');
       const entry = await registry.get('my-app');
       expect(entry?.status).toBe('running');
+    });
+  });
+
+  // ─── restoreRunningApps() ─────────────────────────────────────────────────
+
+  describe('restoreRunningApps()', () => {
+    it('brings up containers for apps marked running (via the async spawn seam)', async () => {
+      const appDir = makeAppDir(srcDir, 'my-app');
+      const installer = makeInstaller();
+      await waitForJob(installer, installer.install({ localPath: appDir }), 5000);
+
+      // Restore runs through the async (non-blocking) spawn, NOT the sync one.
+      const calls: string[][] = [];
+      const trackAsyncSpawn = jest.fn(async (cmd: string, args: string[]) => {
+        calls.push([cmd, ...args]);
+        return { stdout: '', stderr: '', status: 0 };
+      });
+      const installer2 = makeInstaller(successSpawn, trackAsyncSpawn);
+
+      const { attempted, failures } = await installer2.restoreRunningApps();
+      expect(failures).toEqual([]);
+      expect(attempted).toBe(1);
+      expect(calls.some((c) => c.includes('up'))).toBe(true);
+    });
+
+    it('skips apps that are not running', async () => {
+      const appDir = makeAppDir(srcDir, 'my-app');
+      const installer = makeInstaller();
+      await waitForJob(installer, installer.install({ localPath: appDir }), 5000);
+      await installer.startStopRestart('my-app', 'stop');
+
+      const calls: string[][] = [];
+      const trackAsyncSpawn = jest.fn(async (cmd: string, args: string[]) => {
+        calls.push([cmd, ...args]);
+        return { stdout: '', stderr: '', status: 0 };
+      });
+      const installer2 = makeInstaller(successSpawn, trackAsyncSpawn);
+
+      const { attempted, failures } = await installer2.restoreRunningApps();
+      expect(failures).toEqual([]);
+      expect(attempted).toBe(0);
+      expect(calls.some((c) => c.includes('up'))).toBe(false);
+    });
+
+    it('is non-fatal: collects failures without throwing when compose up fails', async () => {
+      const appDir = makeAppDir(srcDir, 'my-app');
+      const installer = makeInstaller();
+      await waitForJob(installer, installer.install({ localPath: appDir }), 5000);
+
+      const installer2 = makeInstaller(successSpawn, failingAsyncSpawn('up'));
+
+      const { attempted, failures } = await installer2.restoreRunningApps();
+      expect(attempted).toBe(1);
+      expect(failures).toHaveLength(1);
+      expect(failures[0].app).toBe('my-app');
+    });
+
+    it('caps concurrency at RESTORE_MAX_CONCURRENCY while starting every app', async () => {
+      // Install 6 running apps — more than the concurrency cap of 4.
+      const names = ['app-a', 'app-b', 'app-c', 'app-d', 'app-e', 'app-f'];
+      for (let i = 0; i < names.length; i++) {
+        const dir = makeAppDir(srcDir, names[i], 5001 + i);
+        const inst = makeInstaller();
+        await waitForJob(inst, inst.install({ localPath: dir }), 5000);
+      }
+
+      // Async spawn that holds each `up` briefly so workers genuinely overlap,
+      // tracking the peak number in flight at once.
+      let inFlight = 0;
+      let maxInFlight = 0;
+      let started = 0;
+      const trackAsyncSpawn = jest.fn(async (_cmd: string, args: string[]) => {
+        if (args.includes('up')) {
+          inFlight++;
+          started++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((r) => setTimeout(r, 10));
+          inFlight--;
+        }
+        return { stdout: '', stderr: '', status: 0 };
+      });
+      const installer2 = makeInstaller(successSpawn, trackAsyncSpawn);
+
+      const { attempted, failures } = await installer2.restoreRunningApps();
+      expect(attempted).toBe(6);
+      expect(failures).toEqual([]);
+      expect(started).toBe(6); // every app was started
+      expect(maxInFlight).toBeLessThanOrEqual(4); // never exceeded the cap
+      expect(maxInFlight).toBeGreaterThan(1); // and it actually parallelised
     });
   });
 

@@ -24,9 +24,31 @@ class MockAgentRunner extends EventEmitter {
   ) => Promise<() => void>;
   private _activeApiSessions = new Set<string>();
 
+  // Builtin-command handler (#157). Defaults to a simple echo; override per-test.
+  executeApiCommandImpl: (
+    sessionId: string,
+    chatId: string,
+    command: string,
+    opts?: { skipPersist?: boolean },
+  ) => Promise<{ result: Record<string, unknown>; responseText: string }> =
+    async (_sid, _cid, command) => ({ result: { command }, responseText: `ran ${command}` });
+
+  // Records the args of the last executeApiCommand call so tests can assert wiring.
+  lastCommandCall?: { sessionId: string; chatId: string; command: string; opts?: { skipPersist?: boolean } };
+
   constructor(impl: (sessionId: string, chatId: string, message: string, opts?: { allowTools?: boolean }) => Promise<{ text: string; attachments: import('../../src/types').ApiAttachment[] }>) {
     super();
     this.sendApiMessageImpl = impl;
+  }
+
+  async executeApiCommand(
+    sessionId: string,
+    chatId: string,
+    command: string,
+    opts?: { skipPersist?: boolean },
+  ): Promise<{ result: Record<string, unknown>; responseText: string }> {
+    this.lastCommandCall = { sessionId, chatId, command, opts };
+    return this.executeApiCommandImpl(sessionId, chatId, command, opts);
   }
 
   async sendApiMessage(
@@ -812,5 +834,136 @@ describe('POST /api/v1/agents/:agentId/messages (stream: true)', () => {
 
     // Verify stream ends with [DONE]
     expect(data.trimEnd()).toMatch(/data: \[DONE\]$/);
+  });
+});
+
+// ── Builtin command response path (#157) ─────────────────────────────────────
+//
+// Builtin commands (/model, /session, /clear, …) are answered locally via
+// executeApiCommand but flow through the SAME response path as a normal message:
+// SSE events when streaming, the normal JSON shape when sync. They also bypass
+// the 409 preflight (so /stop works mid-session) and never reach Claude.
+
+function buildCommandApp(
+  execImpl?: MockAgentRunner['executeApiCommandImpl'],
+): { app: express.Express; runner: MockAgentRunner } {
+  // If the command path ever falls through to Claude, these impls throw → test fails.
+  const runner = new MockAgentRunner(async () => { throw new Error('command leaked to sendApiMessage'); });
+  runner.sendApiMessageStreamImpl = async () => { throw new Error('command leaked to sendApiMessageStream'); };
+  if (execImpl) runner.executeApiCommandImpl = execImpl;
+  const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
+  const configs = new Map([[AGENT_ID, agentConfig]]);
+  const app = express();
+  app.use(express.json());
+  app.use('/api', createApiRouter(runners, configs, apiKeys));
+  return { app, runner };
+}
+
+function parseSSE(data: string): Array<Record<string, unknown>> {
+  return data.split('\n')
+    .filter(l => l.startsWith('data: '))
+    .map(l => l.slice(6))
+    .filter(s => s !== '[DONE]')
+    .map(s => JSON.parse(s) as Record<string, unknown>);
+}
+
+describe('POST /api/v1/agents/:agentId/messages — builtin commands (#157)', () => {
+  // ── stream: true ──────────────────────────────────────────────────────────
+  it('C1: stream command emits text_delta + result + [DONE]', async () => {
+    const { app } = buildCommandApp(async () => ({ result: { model: 'opus' }, responseText: 'Current model: opus' }));
+    const { status, headers, data } = await collectSSE(app, { message: '/model', chat_id: 'c1', session_id: 's1', stream: true });
+
+    expect(status).toBe(200);
+    expect(headers['content-type']).toBe('text/event-stream');
+
+    const events = parseSSE(data);
+    const delta = events.find(e => e.type === 'text_delta');
+    const result = events.find(e => e.type === 'result');
+    expect(delta?.text).toBe('Current model: opus');
+    expect(result?.text).toBe('Current model: opus');
+    expect(result?.session_id).toBe('s1');
+    expect(data.trimEnd()).toMatch(/data: \[DONE\]$/);
+  });
+
+  it('C2: stream command with arguments resolves and reaches executeApiCommand verbatim', async () => {
+    const { app, runner } = buildCommandApp(async () => ({ result: {}, responseText: 'ok' }));
+    await collectSSE(app, { message: '/model sonnet', chat_id: 'c2', stream: true });
+
+    // The full command text (not just the base token) is handed to the runner.
+    expect(runner.lastCommandCall?.command).toBe('/model sonnet');
+  });
+
+  it('C3: stream command failure emits an SSE error event', async () => {
+    const { app } = buildCommandApp(async () => { throw new Error('Not enough messages'); });
+    const { data } = await collectSSE(app, { message: '/compact', chat_id: 'c3', stream: true });
+
+    const events = parseSSE(data);
+    const errorEvent = events.find(e => e.type === 'error');
+    expect(errorEvent?.message).toBe('Not enough messages');
+  });
+
+  it('C4: stream command bypasses the 409 preflight (works mid-session)', async () => {
+    const { app, runner } = buildCommandApp(async () => ({ result: { stopped: true }, responseText: 'Session interrupted.' }));
+    runner.markSessionActive('busy-session'); // a normal message here would 409
+
+    const { status, data } = await collectSSE(app, { message: '/stop', chat_id: 'c4', session_id: 'busy-session', stream: true });
+
+    expect(status).toBe(200);
+    expect(parseSSE(data).find(e => e.type === 'result')?.text).toBe('Session interrupted.');
+  });
+
+  it('C5: stream command forwards skipPersist=true when store_user_message=false', async () => {
+    const { app, runner } = buildCommandApp(async () => ({ result: {}, responseText: 'ok' }));
+    // store_user_message:false requires a write/admin key.
+    await collectSSE(app, { message: '/model', chat_id: 'c5', stream: true, store_user_message: false }, 'Bearer sk-test-write');
+
+    expect(runner.lastCommandCall?.opts?.skipPersist).toBe(true);
+  });
+
+  // ── stream: false (sync) ────────────────────────────────────────────────────
+  it('C6: sync command returns the normal reply JSON shape', async () => {
+    const { app } = buildCommandApp(async () => ({ result: { model: 'opus' }, responseText: 'Current model: opus' }));
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ message: '/model', chat_id: 'c6', session_id: 's6', stream: false });
+
+    expect(res.status).toBe(200);
+    expect(res.body.response).toBe('Current model: opus');
+    expect(res.body.agent_id).toBe(AGENT_ID);
+    expect(res.body.session_id).toBe('s6');
+    expect(typeof res.body.request_id).toBe('string');
+    expect(typeof res.body.duration_ms).toBe('number');
+  });
+
+  it('C7: sync command failure returns 500', async () => {
+    const { app } = buildCommandApp(async () => { throw new Error('boom'); });
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ message: '/compact', chat_id: 'c7', stream: false });
+
+    expect(res.status).toBe(500);
+  });
+
+  // ── regression: non-builtin text is NOT intercepted ──────────────────────────
+  it('C8: a non-builtin slash message falls through to Claude (not intercepted)', async () => {
+    // executeApiCommand throws if called; sendApiMessage answers normally.
+    const runner = new MockAgentRunner(async () => ({ text: 'claude answer', attachments: [] }));
+    runner.executeApiCommandImpl = async () => { throw new Error('should not intercept /foobar'); };
+    const runners = new Map([[AGENT_ID, runner as unknown as import('../../src/agent/runner').AgentRunner]]);
+    const configs = new Map([[AGENT_ID, agentConfig]]);
+    const app = express();
+    app.use(express.json());
+    app.use('/api', createApiRouter(runners, configs, apiKeys));
+
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ message: '/foobar', chat_id: 'c8', stream: false });
+
+    expect(res.status).toBe(200);
+    expect(res.body.response).toBe('claude answer');
+    expect(runner.lastCommandCall).toBeUndefined();
   });
 });
