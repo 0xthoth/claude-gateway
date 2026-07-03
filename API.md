@@ -1040,7 +1040,7 @@ response.
 
 | Status | When |
 |--------|------|
-| 401 | Missing/invalid `x-line-signature`, or no `channelSecret` configured for the resolved agent |
+| 401 | Missing or invalid `x-line-signature` (the resolved agent always has `channelSecret` set — see the 404 row below) |
 | 404 | No LINE-enabled agent found — no agent has `line.channelSecret` set, or the given `:agentId` doesn't |
 
 **Access control:** DMs and groups/rooms are closed by default (`dmPolicy` /
