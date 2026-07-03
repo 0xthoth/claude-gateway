@@ -42,6 +42,21 @@
  *                          arrow key; the probe must exhaust its round budget
  *                          and give up cleanly, the turn completing normally
  *                          via the transcript.
+ *   TASK_WAIT           — a non-sidechain tool_use (Task) lands, then the
+ *                          screen goes idle-looking (no busy marker, ❯
+ *                          prompt) for LONGER than FALLBACK_IDLE_QUIET_MS
+ *                          while the sub-agent works invisibly. The wrapper
+ *                          must NOT end the turn until the matching
+ *                          tool_result lands, even though the screen alone
+ *                          looks done the whole time.
+ *   TASK_WAIT_SIDECHAIN — like TASK_WAIT, but a SIDECHAIN tool_result for the
+ *                          same id lands first and must be ignored (it must
+ *                          not clear the gate); only the later main-chain
+ *                          tool_result completes the turn.
+ *   TASK_ORPHAN         — a Task tool_use lands but no tool_result ever
+ *                          arrives. The watchdog must end the turn with an
+ *                          error WITHOUT killing the session (run with a
+ *                          shortened PTY_SHELL_WATCHDOG_MS).
  *   …SWALLOW_ONCE…      — (substring anywhere in the text) the first Enter
  *                          is swallowed: the draft stays in the input line
  *                          ("❯ <text>"), never busy, no transcript. The
@@ -62,6 +77,7 @@ const {
   handleAuthShim,
   parseSessionId,
   makeTranscriptWriter,
+  makeRawTranscriptAppender,
   makeFileLogger,
   startStdinMachine,
 } = require('./mock-tui-core');
@@ -70,6 +86,7 @@ const args = process.argv.slice(2);
 handleAuthShim(args);
 
 const writeTranscript = makeTranscriptWriter(parseSessionId(args));
+const appendRecord = makeRawTranscriptAppender(parseSessionId(args));
 const logInput = makeFileLogger('FAKE_TUI_INPUT_LOG');
 const logEvent = makeFileLogger('FAKE_TUI_EVENT_LOG');
 
@@ -158,6 +175,84 @@ function submit(text) {
       // would have exhausted its round budget, so the turn still ends.
       setTimeout(() => finishScenario('no-react-result'), 4000);
     }
+    return;
+  }
+  if (trimmed === 'TASK_WAIT') {
+    // Simulates a Task-tool sub-agent run: a non-sidechain tool_use lands,
+    // then the screen goes idle-looking (busy marker gone, ❯ prompt visible)
+    // for LONGER than FALLBACK_IDLE_QUIET_MS (2000ms) while the sub-agent
+    // works invisibly (its own records would be sidechain — not written
+    // here, since claude-pty-shell.ts must never depend on seeing them).
+    // Pre-fix, the fallback idle-detection heuristic would end the turn
+    // right here, at ~2s, orphaning the real final answer written below.
+    scenario = null;
+    render('esc to interrupt\r\n❯ ');
+    setTimeout(() => {
+      appendRecord({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'task-1', name: 'Task', input: {} }] },
+      });
+      idle(); // busy marker gone — screen looks done, but the tool_use is still pending
+    }, 150);
+    // 4500ms (not ~2s) leaves a wide margin either side of the test's 2600ms
+    // "not done yet" assertion window, so the two-process wall-clock race
+    // doesn't flake under CI load.
+    setTimeout(() => {
+      appendRecord({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'task-1', content: 'sub-agent done' }] },
+      });
+      writeTranscript('task-wait-final-result');
+    }, 4500);
+    return;
+  }
+  if (trimmed === 'TASK_WAIT_SIDECHAIN') {
+    // Like TASK_WAIT, but a SIDECHAIN tool_result for the same id lands first
+    // (a sub-agent's own internal tool call). The tailer must filter it out —
+    // it must NOT clear the pendingToolUseIds gate. The turn stays open until
+    // the real, main-chain tool_result arrives.
+    scenario = null;
+    render('esc to interrupt\r\n❯ ');
+    setTimeout(() => {
+      appendRecord({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'task-1', name: 'Task', input: {} }] },
+      });
+      idle();
+    }, 150);
+    setTimeout(() => {
+      // Sidechain result — must be ignored by the gate.
+      appendRecord({
+        type: 'user',
+        isSidechain: true,
+        message: { content: [{ type: 'tool_result', tool_use_id: 'task-1', content: 'inner tool' }] },
+      });
+    }, 2600);
+    setTimeout(() => {
+      // Real main-chain result — clears the gate, turn completes.
+      appendRecord({
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'task-1', content: 'sub-agent done' }] },
+      });
+      writeTranscript('task-sidechain-final-result');
+    }, 4500);
+    return;
+  }
+  if (trimmed === 'TASK_ORPHAN') {
+    // A Task tool_use lands but its tool_result NEVER arrives (sub-agent crash,
+    // abnormal exit) and no turn_duration is written. The fallback stays
+    // blocked; the watchdog must end the turn with an error WITHOUT killing the
+    // PTY session (run with a shortened PTY_SHELL_WATCHDOG_MS). The wrapper
+    // stays alive and can take the next turn.
+    scenario = null;
+    render('esc to interrupt\r\n❯ ');
+    setTimeout(() => {
+      appendRecord({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'task-1', name: 'Task', input: {} }] },
+      });
+      idle(); // then silence — no tool_result, no turn_duration, ever.
+    }, 150);
     return;
   }
 
