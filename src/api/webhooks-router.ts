@@ -50,9 +50,14 @@ export function createWebhooksRouter(
   };
 
   const resolve = (req: Request, res: Response): WebhookAppHandler | null => {
-    const handler = handlers[req.params.app];
+    const app = req.params.app;
+    // Object.prototype.hasOwnProperty guards against `app` being a prototype-chain
+    // key (e.g. "__proto__", "constructor", "toString") — those resolve `handlers[app]`
+    // to a truthy non-handler object, which would bypass the 404 below and then throw
+    // on the missing verify/handlePost call.
+    const handler = Object.prototype.hasOwnProperty.call(handlers, app) ? handlers[app] : undefined;
     if (!handler) {
-      res.status(404).json({ error: `unknown webhook app: ${req.params.app}` });
+      res.status(404).json({ error: `unknown webhook app: ${app}` });
       return null;
     }
     return handler;

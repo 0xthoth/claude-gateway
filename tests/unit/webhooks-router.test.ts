@@ -46,4 +46,26 @@ describe('webhooks dispatcher', () => {
     expect(res.status).toBe(404);
     expect(res.body.error).toContain('no LINE-enabled agent');
   });
+
+  // `app` is attacker-controlled (`:app` path segment, no auth on this zone). A
+  // plain-object lookup with no own-property guard would resolve these to a
+  // truthy prototype-chain value instead of undefined, bypassing the 404 below
+  // and crashing on the missing verify()/handlePost() call.
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    '404s the reserved prototype-chain key "%s" instead of crashing',
+    async (app) => {
+      const res = await supertest.default(makeApp()).get(`/webhooks/${app}`);
+      expect(res.status).toBe(404);
+      expect(res.body.error).toContain('unknown webhook app');
+    },
+  );
+
+  it('404s "__proto__" on POST too', async () => {
+    const res = await supertest.default(makeApp())
+      .post('/webhooks/__proto__')
+      .set('Content-Type', 'application/json')
+      .send({ hello: 'world' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toContain('unknown webhook app');
+  });
 });
