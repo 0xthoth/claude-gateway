@@ -720,6 +720,14 @@ type AttachmentMeta = {
   name?: string
 }
 
+// Pairing reply shown to an un-allowlisted sender: their one-time code plus
+// the instruction to report it to the admin. Shared by handleInbound (normal
+// message) and the /start command so both hand the code out identically.
+function pairingReplyText(code: string, isResend: boolean): string {
+  const lead = isResend ? 'Still waiting for approval.' : 'This bot is private.'
+  return `${lead}\n\nYour pairing code: ${code}\n\nShare this code with the admin to get access.`
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -741,12 +749,7 @@ async function handleInbound(
     // the web UI. The user does NOT run any command (they may not have Claude
     // Code at all) — they just report the code to the admin, who verifies it
     // matches what's shown in Pending and clicks Approve.
-    const lead = result.isResend
-      ? 'Still waiting for approval.'
-      : 'This bot is private.'
-    await ctx.reply(
-      `${lead}\n\nYour pairing code: ${result.code}\n\nShare this code with the admin to get access.`,
-    )
+    await ctx.reply(pairingReplyText(result.code, result.isResend))
     return
   }
 
@@ -891,18 +894,21 @@ if (!SEND_ONLY) {
 
 bot.command('start', async ctx => {
   if (ctx.chat?.type !== 'private') return
-  const access = loadAccess()
-  if (access.dmPolicy === 'disabled') {
-    await ctx.reply(`This bot isn't accepting new connections.`)
+  // Route /start through the same gate as a first message so a new user gets
+  // their pairing code immediately (LINE-style), instead of an instruction to
+  // send another message. The literal "/start" text is never relayed to Claude.
+  const result = gate(ctx)
+  if (result.action === 'pair') {
+    await ctx.reply(pairingReplyText(result.code, result.isResend))
     return
   }
-  await ctx.reply(
-    `This bot is private.\n\n` +
-    `To get access:\n` +
-    `1. DM me anything — you'll get a 6-char pairing code\n` +
-    `2. Share that code with the admin, who approves you\n\n` +
-    `After that, your DMs here reach the assistant.`
-  )
+  if (result.action === 'deliver') {
+    // Already allowlisted (or an open-policy bot) — nothing to pair.
+    await ctx.reply(`You're paired. Just send me a message and it reaches the assistant.`)
+    return
+  }
+  // drop — dmPolicy disabled, or pure allowlist (pairing off) for an unknown sender.
+  await ctx.reply(`This bot isn't accepting new connections right now.`)
 })
 
 bot.command('help', async ctx => {
