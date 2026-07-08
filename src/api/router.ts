@@ -1412,46 +1412,6 @@ export function createApiRouter(
   });
 
   /**
-   * POST /api/v1/agents/:agentId/telegram/init-pairing
-   * Write sentinel file so the next private message auto-approves sender as owner.
-   */
-  router.post('/v1/agents/:agentId/telegram/init-pairing', auth, (req: Request, res: Response) => {
-    const { agentId } = req.params as { agentId: string };
-    const apiKey = (req as AuthedRequest).apiKey;
-    if (!isAdmin(apiKey)) { res.status(403).json({ error: 'Admin key required' }); return; }
-    if (!agentConfigs.has(agentId)) { res.status(404).json({ error: `Agent '${agentId}' not found` }); return; }
-    const stateDir = getTelegramStateDir(agentId);
-    try {
-      fs.mkdirSync(stateDir, { recursive: true });
-      fs.writeFileSync(path.join(stateDir, 'awaiting-owner'), '');
-    } catch (err) {
-      res.status(500).json({ error: `Failed to write sentinel: ${(err as Error).message}` });
-      return;
-    }
-    res.json({ ok: true });
-  });
-
-  /**
-   * GET /api/v1/agents/:agentId/telegram/pairing-status
-   * Returns whether init-pairing sentinel is still active.
-   */
-  router.get('/v1/agents/:agentId/telegram/pairing-status', auth, (req: Request, res: Response) => {
-    const { agentId } = req.params as { agentId: string };
-    const apiKey = (req as AuthedRequest).apiKey;
-    if (!isAdmin(apiKey)) { res.status(403).json({ error: 'Admin key required' }); return; }
-    if (!agentConfigs.has(agentId)) { res.status(404).json({ error: `Agent '${agentId}' not found` }); return; }
-    const sentinelPath = path.join(getTelegramStateDir(agentId), 'awaiting-owner');
-    let waiting = false;
-    try {
-      const stat = fs.statSync(sentinelPath);
-      waiting = Date.now() - stat.mtimeMs < 10 * 60 * 1000;
-      if (!waiting) fs.rmSync(sentinelPath, { force: true });
-    } catch { /* ENOENT — not waiting */ }
-    const access = readTelegramAccess(agentId);
-    res.json({ waiting, allowFrom: access.allowFrom });
-  });
-
-  /**
    * PATCH /api/v1/agents/:agentId/telegram/policy
    * Update the Telegram DM policy and/or the orthogonal pairing toggle.
    * Body: { dmPolicy?: 'open'|'allowlist'|'disabled', pairing?: boolean }.
