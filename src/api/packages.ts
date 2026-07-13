@@ -4,13 +4,39 @@ import { readdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { ApiKey } from '../types';
 import { createApiAuthMiddleware, isAdmin } from './auth';
+import { compareSemver } from '../config/migrator';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
-// URL param "name" → npm package name
-const PACKAGE_MAP: Record<string, string> = {
-  'claude-gateway': '@0xmaxma/claude-gateway',
-  'claude-code': '@anthropic-ai/claude-code',
+// Per-package resolver strategy.
+//   npm    — npm registry name (used to look up `latest` for every package,
+//            and to detect/update packages installed as an npm global)
+//   detect — how the currently-installed version is resolved:
+//              'npm'    → `npm list -g` (npm global package)
+//              'binary' → shell out to the binary on PATH (native installer)
+//   bin    — binary name for detect: 'binary' / update: 'native'
+//   update — how the Update action installs the latest version:
+//              'npm'    → `npm install -g <pkg>@latest`
+//              'native' → the package's own native updater (`<bin> update`)
+interface PackageConfig {
+  npm: string;
+  detect: 'npm' | 'binary';
+  bin?: string;
+  update: 'npm' | 'native';
+}
+
+// URL param "name" → package config.
+// claude-gateway is a genuine npm global — keep npm detect/update.
+// claude-code ships via the native installer (no longer an npm global), so
+// detect from the `claude` binary and update via its native updater.
+const PACKAGES: Record<string, PackageConfig> = {
+  'claude-gateway': { npm: '@0xmaxma/claude-gateway', detect: 'npm', update: 'npm' },
+  'claude-code': {
+    npm: '@anthropic-ai/claude-code',
+    detect: 'binary',
+    bin: 'claude',
+    update: 'native',
+  },
 };
 
 interface PackageInfo {
@@ -56,6 +82,44 @@ function getNpmListVersion(packageName: string): string | null {
   }
 }
 
+// Resolve the installed version by shelling out to the binary on PATH
+// (e.g. `claude --version` → "2.1.207 (Claude Code)"). Parses the leading
+// semver (with optional prerelease) and returns null on any failure —
+// binary missing, non-zero exit, or unparseable output. `bin` is always a
+// trusted constant from PACKAGES, never request-derived.
+function getBinaryVersion(bin: string): string | null {
+  try {
+    const output = execSync(`${bin} --version`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+    // `claude --version` prints the version first (e.g. "2.1.207 (Claude Code)").
+    // Anchor to the start of the trimmed output so a version-like token later in
+    // the line can never be mistaken for the installed version.
+    const match = output.trim().match(/^(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the currently-installed version per the package's detect strategy.
+function resolveCurrent(config: PackageConfig): string | null {
+  if (config.detect === 'binary' && config.bin) {
+    return getBinaryVersion(config.bin);
+  }
+  return getNpmListVersion(config.npm);
+}
+
+// An update is available only when `latest` is strictly newer than `current`.
+// Using semver ordering (not `current !== latest`) avoids a false "update
+// available" when the installed version is *ahead* of the npm-registry latest
+// — e.g. a native-installer channel that leads the npm dist-tag.
+function updateAvailable(current: string | null, latest: string | null): boolean {
+  return !!(current && latest && compareSemver(latest, current) > 0);
+}
+
 async function getLatestVersion(packageName: string): Promise<string | null> {
   const encodedName = packageName.replace('/', '%2F');
   const res = await fetch(`https://registry.npmjs.org/${encodedName}/latest`);
@@ -65,18 +129,18 @@ async function getLatestVersion(packageName: string): Promise<string | null> {
 }
 
 async function fetchAllPackageVersions(): Promise<PackageInfo[]> {
-  const pkgs = Object.values(PACKAGE_MAP);
-  // Run all synchronous npm list calls before entering async Promise.all
-  const currents = pkgs.map(getNpmListVersion);
+  const configs = Object.values(PACKAGES);
+  // Run all synchronous current-version lookups before entering async Promise.all
+  const currents = configs.map(resolveCurrent);
   return Promise.all(
-    pkgs.map(async (pkg, i) => {
+    configs.map(async (config, i) => {
       const current = currents[i];
-      const latest = await getLatestVersion(pkg);
+      const latest = await getLatestVersion(config.npm);
       return {
-        package: pkg,
+        package: config.npm,
         current,
         latest,
-        hasUpdate: !!(current && latest && current !== latest),
+        hasUpdate: updateAvailable(current, latest),
       };
     }),
   );
@@ -171,13 +235,14 @@ export function createPackagesRouter(apiKeys?: ApiKey[]): Router {
     }
 
     const { name } = req.params as { name: string };
-    const packageName = PACKAGE_MAP[name];
-    if (!packageName) {
+    const config = PACKAGES[name];
+    if (!config) {
       res.status(404).json({ error: `unknown package: ${name}` });
       return;
     }
+    const packageName = config.npm;
 
-    const from = getNpmListVersion(packageName);
+    const from = resolveCurrent(config);
 
     let latest: string | null;
     try {
@@ -192,8 +257,8 @@ export function createPackagesRouter(apiKeys?: ApiKey[]): Router {
       return;
     }
 
-    // Already on latest — no install needed
-    if (from === latest) {
+    // Already on latest (or ahead of it) — no install needed
+    if (from && !updateAvailable(from, latest)) {
       res.json({ package: packageName, from, to: from, updated: false, warning: null });
       return;
     }
@@ -206,6 +271,39 @@ export function createPackagesRouter(apiKeys?: ApiKey[]): Router {
 
     isUpdating = true;
     try {
+      // Native-installer packages (e.g. claude-code) update the binary on PATH
+      // via their own updater. npm install -g would write a separate npm copy
+      // that isn't the running binary, so it must not be used here.
+      if (config.update === 'native' && config.bin) {
+        let updateErr: unknown = null;
+        try {
+          execSync(`${config.bin} update`, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: 300_000,
+          });
+        } catch (err) {
+          updateErr = err;
+        }
+
+        if (updateErr !== null) {
+          const stderr =
+            (updateErr as { stderr?: Buffer }).stderr?.toString() ??
+            (updateErr as { message?: string }).message ??
+            'update failed';
+          res.status(500).json({ error: stderr });
+          return;
+        }
+
+        // Invalidate version cache and re-read the actual binary version.
+        // The native updater may legitimately be a no-op (already newest on its
+        // own channel), so report `updated` from whether the version changed.
+        versionCache = null;
+        const to = resolveCurrent(config);
+        res.json({ package: packageName, from, to, updated: to !== from, warning: null });
+        return;
+      }
+
+      // npm-global packages (e.g. claude-gateway) update via npm install -g.
       // Resolve npm global root for temp dir cleanup
       let npmRoot = '';
       try {
