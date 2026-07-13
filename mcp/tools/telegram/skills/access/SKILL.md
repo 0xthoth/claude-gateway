@@ -95,6 +95,18 @@ single boolean) gates whether the bot answers in an allowlisted group only when
 `chatId` is the group id and `pair`-ing it adds that id to `groupAllowlist`
 (not `allowFrom`). Entries with no `kind` (or `"kind": "dm"`) are DM knocks.
 
+**Group delivery caveat (Telegram Privacy Mode).** Allowlisting a group only
+decides how the gate *responds* — it does nothing if Telegram never delivers the
+message. Bots default to **Privacy Mode ON** (`getMe` →
+`can_read_all_group_messages: false`), so in a group the bot only receives
+`/commands`, @mentions of its username, and replies to its own messages; plain
+messages are filtered out before the gateway sees them. And bot commands are
+DM-only (dropped in groups). So a group can be correctly allowlisted yet stay
+silent, and an unknown group may never mint a pairing code. Tell the user to
+**promote the bot to Admin in the group** (an admin bot receives everything
+regardless of Privacy Mode) or **disable Privacy Mode in BotFather and re-add the
+bot**. This is a Telegram-side setting — `/telegram:access` cannot change it.
+
 `legacyGroupAllowFrom` is a **migration-only artifact**, not a live feature —
 it's how a pre-split file's per-group sender restriction survives migration
 (the old schema could lock a group to specific senders; the current model has

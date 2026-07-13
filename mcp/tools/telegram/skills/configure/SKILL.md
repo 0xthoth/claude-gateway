@@ -114,3 +114,10 @@ Delete the `TELEGRAM_BOT_TOKEN=` line (or the file if that's the only line).
   or `/reload-plugins`. Say so after saving.
 - `access.json` is re-read on every inbound message — policy changes via
   `/telegram:access` take effect immediately, no restart.
+- **Groups need more than allowlisting.** DMs work over long-polling, but in a
+  group Telegram's default **Privacy Mode** stops the bot from receiving plain
+  messages (it only gets `/commands`, @mentions, and replies), and commands are
+  dropped in groups anyway. To use groups, tell the user to promote the bot to
+  **Admin** in the group (or disable Privacy Mode in BotFather and re-add it),
+  then allowlist the group via `/telegram:access` (pairing code or `group allow
+  <groupId>`).
