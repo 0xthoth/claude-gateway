@@ -247,14 +247,13 @@ function gate(ctx: Context): GateResult {
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
 
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-
   const from = ctx.from
   if (!from) return { action: 'drop' }
   const senderId = String(from.id)
   const chatType = ctx.chat?.type
 
   if (chatType === 'private') {
+    if (access.dmPolicy === 'disabled') return { action: 'drop' }
     if (access.dmPolicy === 'open') {
       if (!access.allowFrom.includes(senderId)) {
         access.allowFrom.push(senderId)

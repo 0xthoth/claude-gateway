@@ -222,7 +222,7 @@ export class DiscordModule implements ChannelModule {
 
     const msgHandler = createMessageHandler(agentId, handler, permissiveConfig, permissiveAccessConfig);
 
-    this.client.on('messageCreate', async (msg: any) => {
+    const handleDiscordMessage = async (msg: any): Promise<void> => {
       if (msg.author?.bot) return;
       if (msg.system) return;
 
@@ -292,6 +292,39 @@ export class DiscordModule implements ChannelModule {
       await msgHandler(msg);
       if (autoThread) {
         await maybeCreateThread(msg, autoThread, autoArchive).catch(() => {});
+      }
+    };
+
+    this.client.on('messageCreate', handleDiscordMessage);
+
+    // discord.js's own MESSAGE_CREATE handling resolves msg.channel from its
+    // in-memory cache; DM channels are never included in the initial
+    // GUILD_CREATE/READY payload, so the *first* DM after every process
+    // restart hits an uncached channel. MessageCreateAction's partial-channel
+    // fallback constructs the stub without a `type` field (it only forwards
+    // {id, author, guild_id}), so ChannelManager#_add can't pick a Channel
+    // subclass, logs "Failed to find guild, or unknown type for channel ...
+    // undefined", and silently drops the event — messageCreate never fires,
+    // no error, no pairing code. Every subsequent DM in that channel fails
+    // the same way since the failed resolution never populates the cache.
+    // Work around it: on the raw MESSAGE_CREATE dispatch, if it's a DM whose
+    // channel isn't cached yet, fetch the channel (and the message) via REST
+    // — a real API response includes `type`, so this caches it properly —
+    // then hand the fully-formed Message object to the same handler used by
+    // the normal path. isDuplicate() above ensures no double-processing if
+    // discord.js's own path ever does resolve it first.
+    this.client.on('raw', async (packet: { t?: string; d?: any }) => {
+      if (packet.t !== 'MESSAGE_CREATE') return;
+      const d = packet.d;
+      if (!d || d.guild_id || d.author?.bot) return;
+      if (this.client.channels.cache.has(d.channel_id)) return;
+      try {
+        const channel = await this.client.channels.fetch(d.channel_id);
+        if (!channel) return;
+        const msg = await channel.messages.fetch(d.id);
+        await handleDiscordMessage(msg);
+      } catch (err) {
+        process.stderr.write(`discord: raw DM fallback failed: ${err}\n`);
       }
     });
 
