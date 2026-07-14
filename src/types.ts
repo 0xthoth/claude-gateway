@@ -249,6 +249,20 @@ export type ApiAttachment = {
   relPath: string;
 };
 
+/**
+ * Image-generation options selected in the web composer (per-session, D9/D25).
+ * Passed through the chat send body as `image_params` and surfaced to the agent
+ * so it calls the `generate_image` MCP tool with these values (contract E5).
+ */
+export type ImageParams = {
+  model?: string;
+  quality?: string;
+  size?: string;
+  aspect_ratio?: string;
+  image_ref?: string;
+  n?: number;
+};
+
 export type StreamEvent =
   | { type: 'text_delta'; text: string }
   | { type: 'tool_use'; name: string; id: string; input?: Record<string, unknown> }

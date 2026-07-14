@@ -16,6 +16,8 @@ import { CronScheduler } from '../cron/scheduler';
 import { CronManager } from '../cron/manager';
 import { generateDashboardHtml } from '../ui/web-ui';
 import { createApiRouter } from './router';
+import { MediaStore } from '../history/media-store';
+import { verifyMediaToken } from './media-sign';
 import { createCronRouter } from './cron-router';
 import { createWorkspaceRouter } from './workspace-router';
 import { createSkillsRouter } from './skills-router';
@@ -225,6 +227,38 @@ export class GatewayRouter {
       '/webhooks',
       createWebhooksRouter(this.agents, this.gatewayConfig?.gateway?.logDir ?? '/tmp'),
     );
+
+    // Public signed media route — serves a media file to callers that cannot present
+    // the gateway API key (e.g. LINE's servers fetching an image message). The token
+    // is a short-lived HMAC over { agentId, relPath, exp } minted by the line_image
+    // MCP tool; it self-authenticates, so this route sits outside API-key auth.
+    this.app.get('/media-public/:token', (req: Request, res: Response) => {
+      const secret = process.env.GATEWAY_MEDIA_SIGN_SECRET ?? '';
+      const payload = verifyMediaToken(req.params.token ?? '', secret);
+      if (!payload) {
+        res.status(403).json({ error: 'Invalid or expired media token' });
+        return;
+      }
+      const runner = this.agents.get(payload.a);
+      if (!runner) {
+        res.status(404).json({ error: 'Agent not found' });
+        return;
+      }
+      let absPath: string;
+      try {
+        absPath = MediaStore.resolvePath(runner.getAgentsBaseDir(), payload.a, payload.p);
+      } catch {
+        res.status(400).json({ error: 'Invalid path' });
+        return;
+      }
+      if (!fs.existsSync(absPath)) {
+        res.status(404).json({ error: 'Not found' });
+        return;
+      }
+      res.setHeader('Cache-Control', 'private, max-age=3600, immutable');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.sendFile(absPath);
+    });
 
     this.app.use(express.json());
 

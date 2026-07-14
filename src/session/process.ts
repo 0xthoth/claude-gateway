@@ -360,6 +360,16 @@ export class SessionProcess extends EventEmitter {
             GATEWAY_SESSION_MEDIA_DIR: this.source === 'api'
               ? path.resolve(this.agentConfig.workspace, '..', 'media', `api-${this.sessionId}`)
               : '',
+            // Image-generation tool (generate_image) — getpod-api endpoint + M2M
+            // proxy secret (same secret as the LLM path). Empty ⇒ tool disabled.
+            GETPOD_IMAGE_URL: process.env.GETPOD_IMAGE_URL ?? '',
+            GETPOD_IMAGE_API_KEY: process.env.GETPOD_IMAGE_API_KEY ?? process.env.ANTHROPIC_AUTH_TOKEN ?? '',
+            GETPOD_IMAGE_POLL_TIMEOUT_MS: process.env.GETPOD_IMAGE_POLL_TIMEOUT_MS ?? '',
+            // Signed short-lived public media URLs (LINE image delivery). Empty ⇒
+            // line_image reports "not configured".
+            GATEWAY_PUBLIC_URL: process.env.GATEWAY_PUBLIC_URL ?? '',
+            GATEWAY_MEDIA_SIGN_SECRET: process.env.GATEWAY_MEDIA_SIGN_SECRET ?? '',
+            GATEWAY_MEDIA_URL_TTL_MS: process.env.GATEWAY_MEDIA_URL_TTL_MS ?? '',
           },
         },
       },

@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, ApiKey, ModelConfig, SessionMeta } from '../types';
+import { AgentConfig, ApiKey, ImageParams, ModelConfig, SessionMeta } from '../types';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { MediaStore } from '../history/media-store';
 import { HistoryDB } from '../history/db';
@@ -241,8 +241,9 @@ export function createApiRouter(
       media_files?: unknown;
       model?: unknown;
       store_user_message?: unknown;
+      image_params?: unknown;
     };
-    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message } = body;
+    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message, image_params } = body;
 
     if (message !== undefined && typeof message !== 'string') {
       res.status(400).json({ error: 'message must be a string if provided' });
@@ -287,6 +288,37 @@ export function createApiRouter(
         }
       }
       validatedMediaFiles = media_files as string[];
+    }
+
+    // Validate optional image_params (contract E5) — surfaced to the agent so it
+    // calls generate_image with the composer-selected options.
+    let validatedImageParams: ImageParams | undefined;
+    if (image_params !== undefined) {
+      if (typeof image_params !== 'object' || image_params === null || Array.isArray(image_params)) {
+        res.status(400).json({ error: 'image_params must be an object if provided' });
+        return;
+      }
+      const ip = image_params as Record<string, unknown>;
+      const strFields = ['model', 'quality', 'size', 'aspect_ratio', 'image_ref'] as const;
+      const out: ImageParams = {};
+      for (const f of strFields) {
+        const v = ip[f];
+        if (v !== undefined) {
+          if (typeof v !== 'string') {
+            res.status(400).json({ error: `image_params.${f} must be a string` });
+            return;
+          }
+          if (v.trim()) out[f] = v.trim();
+        }
+      }
+      if (ip.n !== undefined) {
+        if (typeof ip.n !== 'number' || !Number.isFinite(ip.n) || ip.n < 1) {
+          res.status(400).json({ error: 'image_params.n must be a positive number' });
+          return;
+        }
+        out.n = Math.floor(ip.n);
+      }
+      if (Object.keys(out).length) validatedImageParams = out;
     }
 
     // Allow message OR media_files. Image-only sends pass an empty text
@@ -394,7 +426,7 @@ export function createApiRouter(
           chatIdStr,
           trimmedMessage,
           sseCallbacks,
-          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage },
+          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage, imageParams: validatedImageParams },
         );
 
         // Client disconnect — marks SSE writes as no-op; stream continues server-side until result is saved to DB
@@ -433,6 +465,7 @@ export function createApiRouter(
             mediaFiles: validatedMediaFiles,
             model: modelStr,
             skipUserMessage,
+            imageParams: validatedImageParams,
           }));
         }
         const syncResult: Record<string, unknown> = {
@@ -464,6 +497,46 @@ export function createApiRouter(
    */
   router.get('/v1/models', auth, (_req: Request, res: Response) => {
     res.json({ models: (models ?? []).map((m) => ({ id: m.id, name: m.label, alias: m.alias, contextWindow: m.contextWindow, multiplier: m.multiplier ?? 1 })) });
+  });
+
+  /**
+   * GET /api/v1/agents/:agentId/image-models   (contract E4)
+   *
+   * Proxy the getpod-api image-model catalog (E3: GET /v1/models?kind=image) so the
+   * web composer can fetch the list through the gateway (web talks to the gateway,
+   * never the api directly — D16/D9). Auth here is the normal gateway API-key /
+   * session auth; the upstream call adds the M2M Bearer proxy secret.
+   */
+  router.get('/v1/agents/:agentId/image-models', auth, async (req: Request, res: Response) => {
+    const { agentId } = req.params as { agentId: string };
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!canAccessAgent(apiKey, agentId)) {
+      res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+      return;
+    }
+    const baseUrl = (process.env.GETPOD_IMAGE_URL ?? '').replace(/\/+$/, '');
+    const proxySecret = process.env.GETPOD_IMAGE_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || '';
+    if (!baseUrl) {
+      res.status(503).json({ error: 'Image service not configured' });
+      return;
+    }
+    try {
+      const upstream = await fetch(`${baseUrl}/v1/models?kind=image`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(proxySecret ? { Authorization: `Bearer ${proxySecret}` } : {}),
+          'X-Agent-Id': agentId,
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      const text = await upstream.text().catch(() => '');
+      res.status(upstream.status);
+      res.type('application/json');
+      res.send(text || '[]');
+    } catch (err) {
+      res.status(502).json({ error: `Image service unavailable: ${(err as Error).message}` });
+    }
   });
 
   /**

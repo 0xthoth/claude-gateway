@@ -19,6 +19,7 @@ import { CronModule } from './tools/cron/module';
 import { SkillsModule } from './tools/skills/module';
 import { AgentModule } from './tools/agent/module';
 import { BrowserModule } from './tools/browser/module';
+import { ImageModule } from './tools/image/module';
 import { AppsModule } from './tools/apps/module';
 import { ApiModule } from './tools/api/module';
 import type { ChannelModule, ToolModule, McpToolDefinition } from './types';
@@ -39,6 +40,7 @@ const modules: AnyModule[] = [
   new SkillsModule(),
   new AgentModule(),
   new BrowserModule(),
+  new ImageModule(),
   new AppsModule(),
   new ApiModule(),
 ];

@@ -4,7 +4,7 @@ import * as fsPromises from 'fs/promises';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment } from '../types';
+import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment, ImageParams } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess, MAX_HISTORY_MESSAGES, resolveMaxHistoryMessages } from '../session/process';
 import { SessionStore, SessionNotInIndexError } from '../session/store';
@@ -922,6 +922,30 @@ export class AgentRunner extends EventEmitter {
         const code = (err as Error).message.includes('pool full') ? 'POOL_FULL' : 'SPAWN_FAILED';
         this.writeTypingError(chatId, code);
       });
+  }
+
+  /**
+   * Render composer-selected image options (contract E5) as a directive the agent
+   * reads and forwards to the generate_image MCP tool. Returns '' when no usable
+   * options are present.
+   */
+  private static buildImageParamsNote(p: ImageParams): string {
+    const attrs = [
+      p.model ? `model="${AgentRunner.escapeXmlAttr(p.model)}"` : '',
+      p.quality ? `quality="${AgentRunner.escapeXmlAttr(p.quality)}"` : '',
+      p.size ? `size="${AgentRunner.escapeXmlAttr(p.size)}"` : '',
+      p.aspect_ratio ? `aspect_ratio="${AgentRunner.escapeXmlAttr(p.aspect_ratio)}"` : '',
+      typeof p.n === 'number' ? `n="${p.n}"` : '',
+      p.image_ref ? `image_ref="${AgentRunner.escapeXmlAttr(p.image_ref)}"` : '',
+    ].filter(Boolean);
+    if (!attrs.length) return '';
+    return (
+      `<image-params ${attrs.join(' ')} />\n` +
+      `The user selected the image-generation options above in the composer. When the request ` +
+      `involves creating or editing an image, call the generate_image tool (action="generate") ` +
+      `using these values (pass image_ref as the "image" argument for image-to-image), then ` +
+      `deliver the returned image with your reply tool.\n`
+    );
   }
 
   private static buildChannelXml(params: {
@@ -2125,7 +2149,7 @@ export class AgentRunner extends EventEmitter {
     sessionId: string,
     chatId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams },
   ): Promise<{ text: string; attachments: ApiAttachment[] }> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -2200,10 +2224,12 @@ export class AgentRunner extends EventEmitter {
 
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttr = effectiveImagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePaths[0]!)}"` : '';
+    const imageParamsNote = opts.imageParams ? AgentRunner.buildImageParamsNote(opts.imageParams) : '';
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
       `${message}\n\n` +
       `${systemNote}` +
+      `${imageParamsNote}` +
       `</channel>` +
       (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
 
@@ -2329,7 +2355,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string, attachments: ApiAttachment[]) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -2534,10 +2560,12 @@ export class AgentRunner extends EventEmitter {
 
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttrStream = effectiveImagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePathsStream[0]!)}"` : '';
+    const imageParamsNoteStream = opts.imageParams ? AgentRunner.buildImageParamsNote(opts.imageParams) : '';
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
       `${message}\n\n` +
       systemNote +
+      imageParamsNoteStream +
       `</channel>` +
       (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
 
