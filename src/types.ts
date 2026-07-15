@@ -236,6 +236,10 @@ export interface SessionMeta {
   loadedAtSpawn?: number;   // messages loaded into context at last spawn (≤ the resolved max history messages, default MAX_HISTORY_MESSAGES)
   archivedCount?: number;   // messages not loaded into context (older than loaded window)
   messageCountAtSpawn?: number; // total messageCount at spawn time, used to derive in-context count
+  /** Last composer image options sent for this session (D9). Persisted so the web
+   *  can restore the composer selection on reload; the agent's own context is the
+   *  functional source of truth. Updated whenever a send carries image_params. */
+  imageConfig?: ImageParams;
 }
 
 export interface SessionIndex {
