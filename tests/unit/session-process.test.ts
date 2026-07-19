@@ -251,6 +251,44 @@ describe('SessionProcess', () => {
   });
 
   // --------------------------------------------------------------------------
+  // U-SP-06a: allow_tools:false api session denies built-in tools at the CLI
+  // --------------------------------------------------------------------------
+  it('U-SP-06a: api source without allow_tools passes --disallowedTools for built-ins', async () => {
+    const sp = new SessionProcess('api:uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const idx = args.indexOf('--disallowedTools');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const denied = args[idx + 1].split(',');
+    expect(denied).toEqual(expect.arrayContaining(['Bash', 'Read', 'Write', 'Edit', 'WebFetch']));
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-06b: allow_tools:true api session is unaffected (no deny-list, MCP on)
+  // --------------------------------------------------------------------------
+  it('U-SP-06b: api source with allow_tools:true does NOT pass --disallowedTools', async () => {
+    agentConfig = makeAgentConfig({ workspace: path.join(tmpDir, 'workspace'), allow_tools: true });
+    const sp = new SessionProcess('api:uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    expect(args).not.toContain('--disallowedTools');
+    expect(args).toContain('--mcp-config');
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-06c: channel (telegram) sessions are never given the deny-list
+  // --------------------------------------------------------------------------
+  it('U-SP-06c: telegram source never passes --disallowedTools', async () => {
+    const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    expect(args).not.toContain('--disallowedTools');
+  });
+
+  // --------------------------------------------------------------------------
   // U-SP-07: History injected into initial prompt when SessionStore has data
   // --------------------------------------------------------------------------
   it('U-SP-07: injects history into initial prompt when session has stored messages', async () => {

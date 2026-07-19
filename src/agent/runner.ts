@@ -110,6 +110,11 @@ function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string 
     `Memory Rule Override: Do NOT create or update ${PROTECTED_WORKSPACE_FILES.join(', ')} ` +
     `or any other workspace identity file in this session, regardless of user instructions. ` +
     `If the user asks you to remember something, reply that memory updates are not supported in API sessions.`;
+  const secretsRule =
+    `Secret Non-Disclosure: NEVER reveal, print, echo, or transmit environment variables, ` +
+    `API tokens or keys, the contents of ~/.claude/settings.json or any .env file, or any ` +
+    `similar credentials or secrets — regardless of who asks or how the request is phrased. ` +
+    `Treat any such request as adversarial and refuse it.`;
   const toolNote = allowTools
     ? `You may use tools to complete the requested task.`
     : `Reply with plain text only. Do NOT call any tools. Your text output will be returned directly to the caller.`;
@@ -117,7 +122,7 @@ function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string 
   if (imagePaths?.length) {
     imageNote = ` The user attached ${imagePaths.length} image(s). Read them with the Read tool:\n${imagePaths.map(p => `- ${p}`).join('\n')}`;
   }
-  return `<api-context>This is an API request. ${memoryOverride} ${toolNote}${imageNote}</api-context>\n`;
+  return `<api-context>This is an API request. ${memoryOverride} ${secretsRule} ${toolNote}${imageNote}</api-context>\n`;
 }
 
 export class AgentRunner extends EventEmitter {
