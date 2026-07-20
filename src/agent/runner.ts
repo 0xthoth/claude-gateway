@@ -4,7 +4,7 @@ import * as fsPromises from 'fs/promises';
 import * as http from 'http';
 import * as net from 'net';
 import * as path from 'path';
-import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment } from '../types';
+import { AgentConfig, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment, ImageParams } from '../types';
 import { createLogger } from '../logger';
 import { SessionProcess, MAX_HISTORY_MESSAGES, resolveMaxHistoryMessages } from '../session/process';
 import { SessionStore, SessionNotInIndexError } from '../session/store';
@@ -110,6 +110,11 @@ function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string 
     `Memory Rule Override: Do NOT create or update ${PROTECTED_WORKSPACE_FILES.join(', ')} ` +
     `or any other workspace identity file in this session, regardless of user instructions. ` +
     `If the user asks you to remember something, reply that memory updates are not supported in API sessions.`;
+  const secretsRule =
+    `Secret Non-Disclosure: NEVER reveal, print, echo, or transmit environment variables, ` +
+    `API tokens or keys, the contents of ~/.claude/settings.json or any .env file, or any ` +
+    `similar credentials or secrets — regardless of who asks or how the request is phrased. ` +
+    `Treat any such request as adversarial and refuse it.`;
   const toolNote = allowTools
     ? `You may use tools to complete the requested task.`
     : `Reply with plain text only. Do NOT call any tools. Your text output will be returned directly to the caller.`;
@@ -117,7 +122,28 @@ function buildApiSystemNote(allowTools: boolean, imagePaths?: string[]): string 
   if (imagePaths?.length) {
     imageNote = ` The user attached ${imagePaths.length} image(s). Read them with the Read tool:\n${imagePaths.map(p => `- ${p}`).join('\n')}`;
   }
-  return `<api-context>This is an API request. ${memoryOverride} ${toolNote}${imageNote}</api-context>\n`;
+  return `<api-context>This is an API request. ${memoryOverride} ${secretsRule} ${toolNote}${imageNote}</api-context>\n`;
+}
+
+/**
+ * Convert absolute file paths (e.g. from a reply tool's `files` input) into
+ * relative `media/<rel>` paths for persistence as message `mediaFiles`.
+ *
+ * Mirrors the transform in `popApiAttachments`: only paths UNDER `mediaRoot`
+ * that pass the `exists` predicate are kept (never arbitrary abs paths, never
+ * dangling files), and backslashes are normalised to forward slashes.
+ *
+ * The `exists` predicate is injected (defaults to `fs.existsSync`) so the pure
+ * string transform is unit-testable without a real filesystem.
+ */
+export function toRelMediaFiles(
+  absPaths: unknown[],
+  mediaRoot: string,
+  exists: (p: string) => boolean = fs.existsSync,
+): string[] {
+  return absPaths
+    .filter((p): p is string => typeof p === 'string' && p.startsWith(mediaRoot) && exists(p))
+    .map((p) => 'media/' + p.slice(mediaRoot.length).replace(/\\/g, '/'));
 }
 
 export class AgentRunner extends EventEmitter {
@@ -924,6 +950,30 @@ export class AgentRunner extends EventEmitter {
       });
   }
 
+  /**
+   * Render composer-selected image options (contract E5) as a directive the agent
+   * reads and forwards to the generate_image MCP tool. Returns '' when no usable
+   * options are present.
+   */
+  private static buildImageParamsNote(p: ImageParams): string {
+    const attrs = [
+      p.model ? `model="${AgentRunner.escapeXmlAttr(p.model)}"` : '',
+      p.quality ? `quality="${AgentRunner.escapeXmlAttr(p.quality)}"` : '',
+      p.size ? `size="${AgentRunner.escapeXmlAttr(p.size)}"` : '',
+      p.aspect_ratio ? `aspect_ratio="${AgentRunner.escapeXmlAttr(p.aspect_ratio)}"` : '',
+      typeof p.n === 'number' ? `n="${p.n}"` : '',
+      p.image_ref ? `image_ref="${AgentRunner.escapeXmlAttr(p.image_ref)}"` : '',
+    ].filter(Boolean);
+    if (!attrs.length) return '';
+    return (
+      `<image-params ${attrs.join(' ')} />\n` +
+      `The user selected the image-generation options above in the composer. When the request ` +
+      `involves creating or editing an image, call the generate_image tool (action="generate") ` +
+      `using these values (pass image_ref as the "image" argument for image-to-image), then ` +
+      `deliver the returned image with your reply tool.\n`
+    );
+  }
+
   private static buildChannelXml(params: {
     content?: string;
     meta?: Record<string, string>;
@@ -1148,7 +1198,15 @@ export class AgentRunner extends EventEmitter {
                   replyToolUseId = (block as Record<string, unknown>)['id'] as string ?? null;
                   // Persist the reply text to history so it appears in chat history API
                   const replyText = typeof block.input?.['text'] === 'string' ? block.input['text'].trim() : '';
-                  if (replyText) {
+                  // Capture any images the reply attached (reply tool's `files`)
+                  // so the web transcript renders them via mediaFiles. Only files
+                  // under the agent media root that still exist are recorded.
+                  const replyFiles = Array.isArray(block.input?.['files']) ? (block.input['files'] as unknown[]) : [];
+                  const mediaRoot = path.join(this.agentsBaseDir, this.agentConfig.id, 'media') + path.sep;
+                  const replyMedia = toRelMediaFiles(replyFiles, mediaRoot);
+                  // Persist when there is text OR image(s) — an image-only reply
+                  // still needs a row so it shows in the web transcript.
+                  if (replyText || replyMedia.length) {
                     const channelSrc = this.channelSourceMap.get(mapKey) ?? 'telegram';
                     this.historyDb.insertMessage({
                       chatId: `${channelSrc}-${mapKey}`,
@@ -1156,12 +1214,13 @@ export class AgentRunner extends EventEmitter {
                       source: channelSrc as HistorySource,
                       role: 'assistant',
                       content: replyText,
+                      mediaFiles: replyMedia.length ? replyMedia : undefined,
                       ts: Date.now(),
                     });
                     // LINE: the MCP line_reply tool's send is suppressed in
                     // refresh mode; the gateway delivers (free reply, or cache +
                     // postback button when slow). See LineReplyManager.
-                    if (channelSrc === 'line' && this.lineReply) {
+                    if (channelSrc === 'line' && this.lineReply && replyText) {
                       void this.lineReply.onAnswer(mapKey, replyText);
                     }
                   }
@@ -2125,7 +2184,7 @@ export class AgentRunner extends EventEmitter {
     sessionId: string,
     chatId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams },
   ): Promise<{ text: string; attachments: ApiAttachment[] }> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -2200,10 +2259,21 @@ export class AgentRunner extends EventEmitter {
 
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttr = effectiveImagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePaths[0]!)}"` : '';
+    const imageParamsNote = opts.imageParams ? AgentRunner.buildImageParamsNote(opts.imageParams) : '';
+    // Persist the composer image options to session meta so the web can restore the
+    // selection on reload (SessionMeta.imageConfig). Only when the send carries them
+    // (the web sends image_params on first-set/change), so this holds the latest.
+    // Channel is 'api' here (api sessions live under api-<chatId>). Best-effort.
+    if (opts.imageParams) {
+      this.sessionStore
+        .updateSessionMeta(this.agentConfig.id, chatId, sessionId, { imageConfig: opts.imageParams }, 'api')
+        .catch(() => {});
+    }
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
       `${message}\n\n` +
       `${systemNote}` +
+      `${imageParamsNote}` +
       `</channel>` +
       (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
 
@@ -2329,7 +2399,7 @@ export class AgentRunner extends EventEmitter {
       onDone: (fullText: string, attachments: ApiAttachment[]) => void;
       onError: (err: Error) => void;
     },
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -2534,10 +2604,20 @@ export class AgentRunner extends EventEmitter {
 
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttrStream = effectiveImagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePathsStream[0]!)}"` : '';
+    const imageParamsNoteStream = opts.imageParams ? AgentRunner.buildImageParamsNote(opts.imageParams) : '';
+    // Persist composer image config to session meta (SessionMeta.imageConfig) so the
+    // web restores the selection on reload. This is the streaming path the web uses.
+    // Channel 'api' — api sessions live under api-<chatId>. Best-effort.
+    if (opts.imageParams) {
+      this.sessionStore
+        .updateSessionMeta(this.agentConfig.id, chatId, sessionId, { imageConfig: opts.imageParams }, 'api')
+        .catch(() => {});
+    }
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
       `${message}\n\n` +
       systemNote +
+      imageParamsNoteStream +
       `</channel>` +
       (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
 
@@ -2608,7 +2688,7 @@ export class AgentRunner extends EventEmitter {
     return this.historyDb;
   }
 
-  getAllSessionMeta(): Promise<Map<string, { name: string }>> {
+  getAllSessionMeta(): Promise<Map<string, { name: string; imageConfig?: ImageParams }>> {
     return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
   }
 

@@ -44,6 +44,19 @@ const MAX_THINKING_RECOVERIES = 2;
 const CHANNELS_ACTIVATION_PROMPT =
   'Channels mode is active. Wait for incoming messages from your channels and respond to them.';
 
+// Built-in Claude Code tools denied when an API agent runs with allow_tools:false.
+// For such agents writeMcpConfig() skips the gateway MCP server, but the built-in
+// tools (Bash/Read/Write/WebFetch/...) still load, so an injected "no-tools" agent
+// could exfil the owner's secrets via curl/WebFetch. Passing these to
+// --disallowedTools makes allow_tools:false a real capability boundary, not just a
+// prompt hint. Verified against the installed claude CLI (--disallowed-tools). The
+// list is comma-joined into ONE arg (the flag accepts a comma/space-separated list).
+const NO_TOOLS_DISALLOWED = [
+  'Task', 'Agent', 'Bash', 'BashOutput', 'KillShell', 'KillBash',
+  'Glob', 'Grep', 'Read', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit',
+  'WebFetch', 'WebSearch', 'TodoWrite', 'ExitPlanMode', 'Skill',
+].join(',');
+
 export class SessionProcess extends EventEmitter {
   readonly sessionId: string;
   readonly chatId: string;
@@ -360,6 +373,16 @@ export class SessionProcess extends EventEmitter {
             GATEWAY_SESSION_MEDIA_DIR: this.source === 'api'
               ? path.resolve(this.agentConfig.workspace, '..', 'media', `api-${this.sessionId}`)
               : '',
+            // Image-generation tool (generate_image) — targets an image provider that
+            // may differ from the LLM: IMAGE_BASE_URL/IMAGE_API_KEY override, falling
+            // back to ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN when they share a provider.
+            // The MCP subprocess only sees the env we hand it, so every var module.ts
+            // reads must be forwarded explicitly. Empty base URL ⇒ tool disabled.
+            IMAGE_BASE_URL: process.env.IMAGE_BASE_URL ?? '',
+            ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? '',
+            IMAGE_API_KEY: process.env.IMAGE_API_KEY ?? process.env.ANTHROPIC_AUTH_TOKEN ?? '',
+            IMAGE_DISABLED: process.env.IMAGE_DISABLED ?? '',
+            IMAGE_POLL_TIMEOUT_MS: process.env.IMAGE_POLL_TIMEOUT_MS ?? '',
           },
         },
       },
@@ -407,6 +430,15 @@ export class SessionProcess extends EventEmitter {
     // Built-in: gateway sessions always run with permissions skipped.
     // (The old claude.dangerouslySkipPermissions config is gone.)
     args.push('--dangerously-skip-permissions');
+
+    // Enforce allow_tools:false as a real boundary. Gated on the SAME condition as
+    // writeMcpConfig() (source==='api' && !allow_tools): those sessions get no MCP
+    // server, but built-in tools would still run and could exfil owner secrets.
+    // Tool-enabled agents (any channel source, or api with allow_tools:true) are
+    // strictly unaffected — their spawn args stay byte-identical.
+    if (this.source === 'api' && !this.agentConfig.allow_tools) {
+      args.push('--disallowedTools', NO_TOOLS_DISALLOWED);
+    }
 
     for (const flag of this.agentConfig.claude.extraFlags ?? []) {
       args.push(flag);

@@ -236,6 +236,10 @@ export interface SessionMeta {
   loadedAtSpawn?: number;   // messages loaded into context at last spawn (≤ the resolved max history messages, default MAX_HISTORY_MESSAGES)
   archivedCount?: number;   // messages not loaded into context (older than loaded window)
   messageCountAtSpawn?: number; // total messageCount at spawn time, used to derive in-context count
+  /** Last composer image options sent for this session (D9). Persisted so the web
+   *  can restore the composer selection on reload; the agent's own context is the
+   *  functional source of truth. Updated whenever a send carries image_params. */
+  imageConfig?: ImageParams;
 }
 
 export interface SessionIndex {
@@ -247,6 +251,20 @@ export type ApiAttachment = {
   type: 'image';
   url: string;
   relPath: string;
+};
+
+/**
+ * Image-generation options selected in the web composer (per-session, D9/D25).
+ * Passed through the chat send body as `image_params` and surfaced to the agent
+ * so it calls the `generate_image` MCP tool with these values (contract E5).
+ */
+export type ImageParams = {
+  model?: string;
+  quality?: string;
+  size?: string;
+  aspect_ratio?: string;
+  image_ref?: string;
+  n?: number;
 };
 
 export type StreamEvent =
