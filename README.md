@@ -230,6 +230,7 @@ Global default retention policy. Can be overridden per-agent with an `history` k
   "gateway": {
     "history": {
       "retentionDays": 90,
+      "maxHistoryMessages": 30,
       "cleanupHour": 3,
       "cleanupTimezone": "Asia/Bangkok"
     }
@@ -240,6 +241,7 @@ Global default retention policy. Can be overridden per-agent with an `history` k
 | Field | Default | Description |
 |-------|---------|-------------|
 | `retentionDays` | `null` (keep forever) | Delete messages older than N days on each cleanup cycle |
+| `maxHistoryMessages` | `50` | Max history messages re-injected into a session at spawn. Lower it to shrink the context loaded at session start. `0` = inject no history |
 | `cleanupHour` | `3` | Hour of day to run cleanup (24h, in `cleanupTimezone`) |
 | `cleanupTimezone` | `"UTC"` | IANA timezone for the cleanup schedule |
 
@@ -249,7 +251,7 @@ Per-agent override example:
   "agents": [
     {
       "id": "alfred",
-      "history": { "retentionDays": 30 }
+      "history": { "retentionDays": 30, "maxHistoryMessages": 30 }
     }
   ]
 }
@@ -313,6 +315,31 @@ Recovery actions are clamped to a per-stage whitelist and a per-turn budget, and
   }
 }
 ```
+
+### `gateway.bind`
+
+Network interface the HTTP/WebSocket server binds to. Defaults to `127.0.0.1` (localhost-only), so the dashboard and API are **not** exposed to the local network out of the box. Set to `0.0.0.0` to listen on all interfaces (for example when a containerized reverse proxy needs to reach the gateway). The `GATEWAY_BIND` environment variable, when set, takes precedence over this field.
+
+```json
+{
+  "gateway": {
+    "bind": "127.0.0.1"
+  }
+}
+```
+
+> **⚠️ Upgrade note:** the default bind changed from `0.0.0.0` to `127.0.0.1` (configVersion 1.0.13). To avoid silently cutting off external access, the config migrator is **behavior-preserving**: whenever it upgrades a config that never set `gateway.bind`, it pins `bind` to `0.0.0.0` and logs a one-time warning, so a deployment that was reachable from another host stays reachable. This applies to *any* upgraded config with no `bind` key — including one already stamped `1.0.13` that never received a bind (an earlier version gated this on `< 1.0.13` and left such configs stuck on the `127.0.0.1` default). New installs (no prior config, so no migration runs) keep the secure `127.0.0.1` default. If you *want* localhost-only after upgrading, set `gateway.bind` to `127.0.0.1` explicitly (or the `GATEWAY_BIND` env var).
+
+### Terminal Viewer — interactive terminal mode
+
+The dashboard's **Terminal Viewer** opens read-only (a live mirror of the PTY). A toggle in the top-right of the viewer switches it into an **interactive terminal**: keystrokes typed into the panel — printable characters, Enter, arrows, Ctrl-combos, Esc — are streamed into the live PTY, and the panel title changes to reflect the active mode. This is a per-browser client-side choice (Issue #201); there is no server config flag to enable it.
+
+Because interactive mode turns a read-only view into a remote-write surface, access is protected upstream rather than by a feature flag:
+
+- **Authentication** — the WebSocket requires a valid dashboard ticket or API key.
+- **`gateway.bind`** — the gateway binds to `127.0.0.1` (localhost) by default, so the dashboard is not reachable from the network out of the box. Expose a non-loopback bind (`0.0.0.0`) **only** behind a trusted authenticating reverse proxy.
+
+Inbound frames are always bounded (text-only, size-capped) and are dropped for headless sessions (no PTY).
 
 ### `gateway.api.keys`
 
@@ -506,7 +533,7 @@ The gateway proxies `/app/:name/:portName/*` to the app containers. Two env vars
 
 | Env var | Default | Description |
 |---------|---------|-------------|
-| `GATEWAY_BIND` | `0.0.0.0` | Gateway HTTP listen address. Must be `0.0.0.0` (default) when a **containerized** reverse proxy (Caddy, nginx in Docker) needs to reach the gateway. Set to `127.0.0.1` only if using a **host-network** proxy (Traefik on host) — loopback is not reachable across container boundaries. |
+| `GATEWAY_BIND` | `127.0.0.1` | Gateway HTTP listen address. Overrides the `gateway.bind` config field when set. Defaults to localhost-only; set to `0.0.0.0` when a **containerized** reverse proxy (Caddy, nginx in Docker) needs to reach the gateway across container boundaries. A **host-network** proxy (Traefik on host) can keep the localhost default. |
 | `DOCKER_HOST` | _(system default)_ | Docker socket/TCP address. When set to `tcp://host:port` (e.g. DinD), the gateway automatically uses the host extracted from `DOCKER_HOST` to proxy to app containers instead of `127.0.0.1`. |
 
 Example Caddyfile for apps behind Caddy in Docker:

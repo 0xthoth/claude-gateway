@@ -18,6 +18,24 @@ import {
 } from '../utils/tool-labels';
 
 export const MAX_HISTORY_MESSAGES = 50;
+
+/**
+ * Resolve the per-spawn history re-injection cap with precedence
+ * per-agent → global → MAX_HISTORY_MESSAGES. Non-finite or negative values are
+ * ignored (treated as unset) so a malformed config falls back safely instead of
+ * injecting a negative or unbounded window; fractional values are floored.
+ * 0 is a valid value meaning "inject no history".
+ */
+export function resolveMaxHistoryMessages(
+  agentMax?: number,
+  globalMax?: number,
+): number {
+  const valid = (n?: number): n is number =>
+    typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  if (valid(agentMax)) return Math.floor(agentMax);
+  if (valid(globalMax)) return Math.floor(globalMax);
+  return MAX_HISTORY_MESSAGES;
+}
 const AUTO_RESTART_DELAY_MS = 5_000;
 const MAX_RESTARTS = 3;
 // Bound how many times a single session may auto-respawn to recover from a
@@ -25,6 +43,19 @@ const MAX_RESTARTS = 3;
 const MAX_THINKING_RECOVERIES = 2;
 const CHANNELS_ACTIVATION_PROMPT =
   'Channels mode is active. Wait for incoming messages from your channels and respond to them.';
+
+// Built-in Claude Code tools denied when an API agent runs with allow_tools:false.
+// For such agents writeMcpConfig() skips the gateway MCP server, but the built-in
+// tools (Bash/Read/Write/WebFetch/...) still load, so an injected "no-tools" agent
+// could exfil the owner's secrets via curl/WebFetch. Passing these to
+// --disallowedTools makes allow_tools:false a real capability boundary, not just a
+// prompt hint. Verified against the installed claude CLI (--disallowed-tools). The
+// list is comma-joined into ONE arg (the flag accepts a comma/space-separated list).
+const NO_TOOLS_DISALLOWED = [
+  'Task', 'Agent', 'Bash', 'BashOutput', 'KillShell', 'KillBash',
+  'Glob', 'Grep', 'Read', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit',
+  'WebFetch', 'WebSearch', 'TodoWrite', 'ExitPlanMode', 'Skill',
+].join(',');
 
 export class SessionProcess extends EventEmitter {
   readonly sessionId: string;
@@ -342,6 +373,16 @@ export class SessionProcess extends EventEmitter {
             GATEWAY_SESSION_MEDIA_DIR: this.source === 'api'
               ? path.resolve(this.agentConfig.workspace, '..', 'media', `api-${this.sessionId}`)
               : '',
+            // Image-generation tool (generate_image) — targets an image provider that
+            // may differ from the LLM: IMAGE_BASE_URL/IMAGE_API_KEY override, falling
+            // back to ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN when they share a provider.
+            // The MCP subprocess only sees the env we hand it, so every var module.ts
+            // reads must be forwarded explicitly. Empty base URL ⇒ tool disabled.
+            IMAGE_BASE_URL: process.env.IMAGE_BASE_URL ?? '',
+            ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? '',
+            IMAGE_API_KEY: process.env.IMAGE_API_KEY ?? process.env.ANTHROPIC_AUTH_TOKEN ?? '',
+            IMAGE_DISABLED: process.env.IMAGE_DISABLED ?? '',
+            IMAGE_POLL_TIMEOUT_MS: process.env.IMAGE_POLL_TIMEOUT_MS ?? '',
           },
         },
       },
@@ -389,6 +430,15 @@ export class SessionProcess extends EventEmitter {
     // Built-in: gateway sessions always run with permissions skipped.
     // (The old claude.dangerouslySkipPermissions config is gone.)
     args.push('--dangerously-skip-permissions');
+
+    // Enforce allow_tools:false as a real boundary. Gated on the SAME condition as
+    // writeMcpConfig() (source==='api' && !allow_tools): those sessions get no MCP
+    // server, but built-in tools would still run and could exfil owner secrets.
+    // Tool-enabled agents (any channel source, or api with allow_tools:true) are
+    // strictly unaffected — their spawn args stay byte-identical.
+    if (this.source === 'api' && !this.agentConfig.allow_tools) {
+      args.push('--disallowedTools', NO_TOOLS_DISALLOWED);
+    }
 
     for (const flag of this.agentConfig.claude.extraFlags ?? []) {
       args.push(flag);
@@ -918,6 +968,32 @@ export class SessionProcess extends EventEmitter {
     const msg: Record<string, unknown> = { type: 'control', key };
     if (typeof option === 'number') msg['option'] = option;
     this.process.stdin.write(JSON.stringify(msg) + '\n');
+  }
+
+  /**
+   * Send raw interactive-terminal input to the PTY wrapper (Issue #201). Used by
+   * the dashboard's Terminal Viewer input mode to type any key into the
+   * live TUI. Only meaningful on the interactive (pty-shell) backend — the
+   * headless backend has no TUI, so this is a no-op there. The wrapper bounds
+   * the size again before writing to the PTY. Returns true when the bytes were
+   * handed to the subprocess stdin.
+   */
+  sendInput(data: string): boolean {
+    if (this.backend !== 'pty-shell') {
+      this.logger.debug('Ignoring interactive input on headless backend', {
+        sessionId: this.sessionId,
+      });
+      return false;
+    }
+    if (typeof data !== 'string' || data.length === 0) return false;
+    if (!this.process?.stdin?.writable) {
+      this.logger.warn('Cannot send input: subprocess not running', {
+        sessionId: this.sessionId,
+      });
+      return false;
+    }
+    this.process.stdin.write(JSON.stringify({ type: 'input', data }) + '\n');
+    return true;
   }
 
   query(prompt: string, timeoutMs = 60_000): Promise<string> {

@@ -5,6 +5,10 @@ export interface SessionConfig {
 
 export interface HistoryConfig {
   retentionDays?: number; // 0 = keep forever (disabled), default 60
+  // Max history messages re-injected into a session at spawn. Lower values
+  // shrink the context loaded at session start. Default is MAX_HISTORY_MESSAGES
+  // (50). 0 = inject no history. Per-agent overrides global.
+  maxHistoryMessages?: number;
 }
 
 export interface AgentConfig {
@@ -143,6 +147,14 @@ export interface GatewayConfig {
   gateway: {
     logDir: string;
     timezone: string;
+    /**
+     * Network interface the HTTP/WebSocket server binds to. Defaults to
+     * "127.0.0.1" (localhost-only) so the dashboard and API are not exposed to
+     * the local network out of the box. Set to "0.0.0.0" to expose all
+     * interfaces (e.g. behind a trusted reverse proxy). The `GATEWAY_BIND` env
+     * var, when set, takes precedence over this field.
+     */
+    bind?: string;
     models?: ModelConfig[];
     api?: {
       keys: ApiKey[];
@@ -221,9 +233,13 @@ export interface SessionMeta {
   messageCount: number;
   totalTokensUsed: number;
   lastInputTokens?: number;
-  loadedAtSpawn?: number;   // messages loaded into context at last spawn (≤ MAX_HISTORY_MESSAGES)
+  loadedAtSpawn?: number;   // messages loaded into context at last spawn (≤ the resolved max history messages, default MAX_HISTORY_MESSAGES)
   archivedCount?: number;   // messages not loaded into context (older than loaded window)
   messageCountAtSpawn?: number; // total messageCount at spawn time, used to derive in-context count
+  /** Last composer image options sent for this session (D9). Persisted so the web
+   *  can restore the composer selection on reload; the agent's own context is the
+   *  functional source of truth. Updated whenever a send carries image_params. */
+  imageConfig?: ImageParams;
 }
 
 export interface SessionIndex {
@@ -235,6 +251,20 @@ export type ApiAttachment = {
   type: 'image';
   url: string;
   relPath: string;
+};
+
+/**
+ * Image-generation options selected in the web composer (per-session, D9/D25).
+ * Passed through the chat send body as `image_params` and surfaced to the agent
+ * so it calls the `generate_image` MCP tool with these values (contract E5).
+ */
+export type ImageParams = {
+  model?: string;
+  quality?: string;
+  size?: string;
+  aspect_ratio?: string;
+  image_ref?: string;
+  n?: number;
 };
 
 export type StreamEvent =

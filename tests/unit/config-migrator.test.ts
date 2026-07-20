@@ -12,6 +12,7 @@ import {
   pruneAgentPaths,
   repairInjectedAgentFields,
   AGENT_CREDENTIAL_FIELDS,
+  BIND_PRESERVED_WARNING,
 } from '../../src/config/migrator';
 
 describe('config-migrator', () => {
@@ -902,6 +903,96 @@ describe('config-migrator', () => {
       for (const field of expected) {
         expect(AGENT_CREDENTIAL_FIELDS.has(field)).toBe(true);
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // gateway.bind behavior-preserving migration (Issue #204)
+  // ---------------------------------------------------------------------------
+  // Any config that reaches a migration without a `bind` key predates the
+  // localhost-only default and was externally reachable, so migration pins
+  // "0.0.0.0" regardless of its configVersion (there is no version gate — an
+  // earlier `< 1.0.13` gate wrongly skipped configs already stamped 1.0.13).
+  // A fresh install carries bind from the template and never migrates.
+  describe('gateway.bind behavior-preserving migration', () => {
+    // Mirror the real config.template.json, which ships gateway.bind = "127.0.0.1".
+    // The template MUST carry bind here, otherwise the test misses the deepMerge
+    // interaction that leaks the localhost default into old configs (Issue #204).
+    const template = (): string =>
+      writeJson('template.json', {
+        configVersion: '1.0.14',
+        gateway: { timezone: 'UTC', bind: '127.0.0.1' },
+      });
+
+    it('pins gateway.bind to 0.0.0.0 when migrating a config that never set it', () => {
+      const configPath = writeJson('config.json', {
+        configVersion: '1.0.12',
+        gateway: { logDir: '/logs' },
+      });
+      const result = migrateConfig(configPath, template(), '1.0.14');
+
+      expect(result.migrated).toBe(true);
+      expect(result.addedFields).toContain('gateway.bind');
+      expect(result.warnings).toContain(BIND_PRESERVED_WARNING);
+
+      const updated = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      expect(updated.gateway.bind).toBe('0.0.0.0');
+    });
+
+    // Regression for the field report: a config already stamped 1.0.13 with no
+    // bind key was left on the 127.0.0.1 runtime default because the old
+    // `< 1.0.13` gate skipped it. It must now pin 0.0.0.0 like any other
+    // no-bind upgrade.
+    it('pins gateway.bind to 0.0.0.0 for a 1.0.13 config that never set bind', () => {
+      const configPath = writeJson('config.json', {
+        configVersion: '1.0.13',
+        gateway: { logDir: '/logs' },
+      });
+      const result = migrateConfig(configPath, template(), '1.0.14');
+
+      expect(result.migrated).toBe(true); // migration runs (1.0.13 < 1.0.14)
+      expect(result.warnings).toContain(BIND_PRESERVED_WARNING);
+      const updated = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      expect(updated.gateway.bind).toBe('0.0.0.0');
+    });
+
+    it('never overwrites an explicit bind on a pre-1.0.13 config', () => {
+      const configPath = writeJson('config.json', {
+        configVersion: '1.0.12',
+        gateway: { bind: '127.0.0.1', logDir: '/logs' },
+      });
+      const result = migrateConfig(configPath, template(), '1.0.14');
+
+      expect(result.addedFields).not.toContain('gateway.bind');
+      expect(result.warnings).not.toContain(BIND_PRESERVED_WARNING);
+      const updated = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      expect(updated.gateway.bind).toBe('127.0.0.1'); // preserved as-is
+    });
+
+    it('detectMigration dry-run reports gateway.bind without writing to disk', () => {
+      const configPath = writeJson('config.json', {
+        configVersion: '1.0.12',
+        gateway: { logDir: '/logs' },
+      });
+      const result = detectMigration(configPath, template(), '1.0.14');
+
+      expect(result.needed).toBe(true);
+      expect(result.addedFields).toContain('gateway.bind');
+      expect(result.warnings).toContain(BIND_PRESERVED_WARNING);
+
+      // Dry-run must not mutate the file on disk.
+      const onDisk = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      expect(onDisk.configVersion).toBe('1.0.12');
+      expect(onDisk.gateway.bind).toBeUndefined();
+    });
+
+    it('does not pin bind for a fresh install (no prior config)', () => {
+      const missingConfigPath = path.join(tmpDir, 'does-not-exist.json');
+      const result = detectMigration(missingConfigPath, template(), '1.0.14');
+
+      expect(result.needed).toBe(false);
+      expect(result.addedFields).not.toContain('gateway.bind');
+      expect(result.warnings).not.toContain(BIND_PRESERVED_WARNING);
     });
   });
 });

@@ -4,7 +4,9 @@
  * Spins up a real AgentRunner + GatewayRouter with a mock claude subprocess
  * and exercises all 7 Chat History / Media API endpoints via supertest.
  *
- * Test IDs: I-HIST-01 through I-HIST-12
+ * Test IDs: I-HIST-01 through I-HIST-29 (non-contiguous: I-HIST-14 is the `order` param
+ * test from #211/PR #213; active-days coverage is I-HIST-21 through I-HIST-28; I-HIST-29
+ * covers the composite (ts,id) cursor)
  */
 
 import * as fs from 'fs';
@@ -253,6 +255,67 @@ describe('Chat History API integration (planning-50)', () => {
     for (const m of page2.body.messages) {
       expect(ids1.has(m.ts)).toBe(false);
     }
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-14: GET messages honors the `order` param (asc/desc, case-insensitive, 400 on invalid) ─
+  it('I-HIST-14: order=asc reads forward, is case-insensitive, and rejects invalid values with 400', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-14-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-14-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    await waitFor(() => runner.isRunning());
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    const sid = 'hist-14-session';
+    for (let i = 0; i < 3; i++) {
+      await sendMessage(router.getApp(), 'alfred', `message-${i}`, sid);
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const chatId = `api-${sid}`;
+
+    // asc → strictly ascending ts (oldest first)
+    const asc = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/${chatId}/messages?order=asc`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+    expect(asc.status).toBe(200);
+    const ascTs = asc.body.messages.map((m: { ts: number }) => m.ts);
+    expect(ascTs).toEqual([...ascTs].sort((a, b) => a - b));
+
+    // Uppercase ASC is accepted (case-insensitive) and matches lowercase asc
+    const ascUpper = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/${chatId}/messages?order=ASC`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+    expect(ascUpper.status).toBe(200);
+    expect(ascUpper.body.messages.map((m: { ts: number }) => m.ts)).toEqual(ascTs);
+
+    // desc → strictly descending ts (newest first), same as the default
+    const desc = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/${chatId}/messages?order=desc`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+    expect(desc.status).toBe(200);
+    expect(desc.body.messages.map((m: { ts: number }) => m.ts)).toEqual([...ascTs].reverse());
+
+    // An invalid explicit value surfaces as 400 rather than silently defaulting
+    const bad = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/${chatId}/messages?order=sideways`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+    expect(bad.status).toBe(400);
+    expect(bad.body.error).toMatch(/order/i);
+
+    // A repeated param parses as an array, not a string — must 400, never 500
+    const dup = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/${chatId}/messages?order=asc&order=asc`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+    expect(dup.status).toBe(400);
+    expect(dup.body.error).toMatch(/order/i);
 
     await router.stop();
     await runner.stop();
@@ -552,4 +615,287 @@ describe('Chat History API integration (planning-50)', () => {
     await router.stop();
     await runner.stop();
   }, 15000);
+
+  // ─── I-HIST-21: active-days — happy path with tz bucketing + session filter ─
+  it('I-HIST-21: GET /chats/:chatId/messages/active-days returns distinct local days', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-21-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-21-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    await waitFor(() => runner.isRunning());
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    const sid = 'hist-21-session';
+    await sendMessage(router.getApp(), 'alfred', 'first day message', sid);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const chatId = `api-${sid}`;
+    const now = Date.now();
+    const res = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/${chatId}/messages/active-days?from=${now - 86400000}&to=${now + 86400000}&tz_offset=420&session_id=${sid}`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.days)).toBe(true);
+    expect(res.body.days.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.days[0]).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-22: active-days — missing from/to returns 400 ────────────────
+  it('I-HIST-22: GET /messages/active-days with missing from/to returns 400', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-22-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-22-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    const noFrom = await supertest(router.getApp())
+      .get('/api/v1/agents/alfred/chats/api-any/messages/active-days?to=1000')
+      .set('X-Api-Key', API_KEY_ADMIN);
+    const noTo = await supertest(router.getApp())
+      .get('/api/v1/agents/alfred/chats/api-any/messages/active-days?from=0')
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(noFrom.status).toBe(400);
+    expect(noTo.status).toBe(400);
+    expect(noFrom.body.error).toBeDefined();
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-23: active-days — non-numeric from returns 400, not a silent truncation ─
+  it('I-HIST-23: GET /messages/active-days with non-numeric from/to returns 400', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-23-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-23-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    // "100garbage" would silently truncate to 100 under parseInt() — must 400 instead.
+    const res = await supertest(router.getApp())
+      .get('/api/v1/agents/alfred/chats/api-any/messages/active-days?from=100garbage&to=200')
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(res.status).toBe(400);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-24: active-days — non-numeric tz_offset returns 400 ──────────
+  it('I-HIST-24: GET /messages/active-days with non-numeric tz_offset returns 400', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-24-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-24-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    const res = await supertest(router.getApp())
+      .get('/api/v1/agents/alfred/chats/api-any/messages/active-days?from=0&to=1000&tz_offset=banana')
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/tz_offset/i);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-25: active-days — 403 when key has no access to agent ────────
+  it('I-HIST-25: GET /messages/active-days returns 403 when key has no access to agent', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-25-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-25-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    const res = await supertest(router.getApp())
+      .get('/api/v1/agents/alfred/chats/api-any/messages/active-days?from=0&to=1000')
+      .set('X-Api-Key', API_KEY_OTHER);
+
+    expect(res.status).toBe(403);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-26: active-days — 404 when agent not found ───────────────────
+  it('I-HIST-26: GET /messages/active-days returns 404 for unknown agent', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-26-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-26-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    const res = await supertest(router.getApp())
+      .get('/api/v1/agents/nonexistent/chats/api-any/messages/active-days?from=0&to=1000')
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(res.status).toBe(404);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-27: active-days — window larger than 366 days returns 400 ─────
+  it('I-HIST-27: GET /messages/active-days with an over-long window returns 400', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-27-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-27-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    // 400 days apart — beyond the 366-day cap that guards against a full-history scan.
+    const from = 0;
+    const to = 400 * 24 * 60 * 60 * 1000;
+    const res = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/api-any/messages/active-days?from=${from}&to=${to}`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/window too large/i);
+
+    // A window exactly at the boundary (366 days) is still accepted (200).
+    const okTo = 366 * 24 * 60 * 60 * 1000;
+    const ok = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/api-any/messages/active-days?from=${from}&to=${okTo}`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(ok.status).toBe(200);
+    expect(Array.isArray(ok.body.days)).toBe(true);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-28: active-days — repeated session_id param returns 400, not 500 ─────
+  it('I-HIST-28: GET /messages/active-days with a repeated session_id returns 400', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-28-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-28-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    // Express parses ?session_id=a&session_id=b as an array; without the guard it would
+    // reach the sqlite bind and throw a 500. Expect a clean 400 instead.
+    const from = 0;
+    const to = 24 * 60 * 60 * 1000;
+    const res = await supertest(router.getApp())
+      .get(`/api/v1/agents/alfred/chats/api-any/messages/active-days?from=${from}&to=${to}&session_id=a&session_id=b`)
+      .set('X-Api-Key', API_KEY_ADMIN);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/session_id/i);
+
+    await router.stop();
+    await runner.stop();
+  });
+
+  // ─── I-HIST-29: composite (ts,id) cursor pages an equal-ts burst without skipping ─────
+  it('I-HIST-29: GET /messages before_id/after_id cursor covers an equal-ts burst end-to-end', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-29-'));
+    const ws = createStructuredWorkspace(base, 'alfred');
+    const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hist-29-log-'));
+    const cfg = makeAgentConfig('alfred', ws);
+    const gwCfg = makeGatewayConfig(logDir);
+
+    const runner = new AgentRunner(cfg, gwCfg);
+    await runner.start();
+    const router = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gwCfg);
+    await router.start(0);
+
+    // Seed a burst where three messages share ts=200, flanked by a lower and a higher ts,
+    // directly through the history DB so the tie is deterministic (sendMessage stamps wall-clock ts).
+    const chatId = 'telegram-tie-burst';
+    const db = runner.getHistoryDb();
+    const seed: ReadonlyArray<readonly [string, number]> = [
+      ['a', 100], ['b', 200], ['c', 200], ['d', 200], ['e', 300],
+    ];
+    for (const [content, ts] of seed) {
+      db.insertMessage({
+        chatId, sessionId: 'sess-tie', source: 'telegram', role: 'user',
+        content, senderName: 'tester', ts,
+      });
+    }
+
+    // Page desc, 2 at a time, feeding BOTH nextCursor and nextCursorId back each round.
+    const collected: string[] = [];
+    let before: number | undefined;
+    let beforeId: number | undefined;
+    for (let guard = 0; guard < 10; guard++) {
+      const qs = new URLSearchParams({ limit: '2' });
+      if (before !== undefined) qs.set('before', String(before));
+      if (beforeId !== undefined) qs.set('before_id', String(beforeId));
+      const res = await supertest(router.getApp())
+        .get(`/api/v1/agents/alfred/chats/${chatId}/messages?${qs.toString()}`)
+        .set('X-Api-Key', API_KEY_ADMIN);
+      expect(res.status).toBe(200);
+      collected.push(...res.body.messages.map((m: { content: string }) => m.content));
+      if (!res.body.hasMore) break;
+      before = res.body.nextCursor as number;
+      beforeId = res.body.nextCursorId as number;
+    }
+
+    // Every message exactly once, full desc order — the tied 'b'/'c' are NOT skipped,
+    // which a ts-only cursor (before without before_id) would drop at the ts=200 boundary.
+    expect(collected).toEqual(['e', 'd', 'c', 'b', 'a']);
+    expect(new Set(collected).size).toBe(5);
+
+    // A present-but-non-numeric cursor component is a malformed request → 400 (not a
+    // silent empty page). Covers before/after and both id companions uniformly.
+    for (const badParam of ['before=abc', 'after=xyz', 'before_id=nope', 'after_id=nan']) {
+      const bad = await supertest(router.getApp())
+        .get(`/api/v1/agents/alfred/chats/${chatId}/messages?${badParam}`)
+        .set('X-Api-Key', API_KEY_ADMIN);
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toMatch(/must be a number/i);
+    }
+
+    await router.stop();
+    await runner.stop();
+  });
 });

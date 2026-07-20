@@ -6,7 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, ApiKey, ModelConfig, SessionMeta } from '../types';
+import { AgentConfig, ApiKey, ImageParams, ModelConfig, SessionMeta } from '../types';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { MediaStore } from '../history/media-store';
 import { HistoryDB } from '../history/db';
@@ -241,8 +241,9 @@ export function createApiRouter(
       media_files?: unknown;
       model?: unknown;
       store_user_message?: unknown;
+      image_params?: unknown;
     };
-    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message } = body;
+    const { message, chat_id, session_id, stream, timeout_ms, media_files, model: requestModel, store_user_message, image_params } = body;
 
     if (message !== undefined && typeof message !== 'string') {
       res.status(400).json({ error: 'message must be a string if provided' });
@@ -287,6 +288,37 @@ export function createApiRouter(
         }
       }
       validatedMediaFiles = media_files as string[];
+    }
+
+    // Validate optional image_params (contract E5) — surfaced to the agent so it
+    // calls generate_image with the composer-selected options.
+    let validatedImageParams: ImageParams | undefined;
+    if (image_params !== undefined) {
+      if (typeof image_params !== 'object' || image_params === null || Array.isArray(image_params)) {
+        res.status(400).json({ error: 'image_params must be an object if provided' });
+        return;
+      }
+      const ip = image_params as Record<string, unknown>;
+      const strFields = ['model', 'quality', 'size', 'aspect_ratio', 'image_ref'] as const;
+      const out: ImageParams = {};
+      for (const f of strFields) {
+        const v = ip[f];
+        if (v !== undefined) {
+          if (typeof v !== 'string') {
+            res.status(400).json({ error: `image_params.${f} must be a string` });
+            return;
+          }
+          if (v.trim()) out[f] = v.trim();
+        }
+      }
+      if (ip.n !== undefined) {
+        if (typeof ip.n !== 'number' || !Number.isFinite(ip.n) || ip.n < 1) {
+          res.status(400).json({ error: 'image_params.n must be a positive number' });
+          return;
+        }
+        out.n = Math.floor(ip.n);
+      }
+      if (Object.keys(out).length) validatedImageParams = out;
     }
 
     // Allow message OR media_files. Image-only sends pass an empty text
@@ -394,7 +426,7 @@ export function createApiRouter(
           chatIdStr,
           trimmedMessage,
           sseCallbacks,
-          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage },
+          { timeoutMs, allowTools, mediaFiles: validatedMediaFiles, model: modelStr, skipUserMessage, imageParams: validatedImageParams },
         );
 
         // Client disconnect — marks SSE writes as no-op; stream continues server-side until result is saved to DB
@@ -433,6 +465,7 @@ export function createApiRouter(
             mediaFiles: validatedMediaFiles,
             model: modelStr,
             skipUserMessage,
+            imageParams: validatedImageParams,
           }));
         }
         const syncResult: Record<string, unknown> = {
@@ -545,7 +578,7 @@ export function createApiRouter(
           description: cfg?.description ?? '',
           sessions: sessions.map((s) => {
             const meta = metaMap.get(s.sessionId);
-            return { ...s, sessionName: meta?.name ?? null };
+            return { ...s, sessionName: meta?.name ?? null, imageConfig: meta?.imageConfig ?? null };
           }),
         };
       }),
@@ -2034,7 +2067,7 @@ export function createApiRouter(
   /**
    * GET /api/v1/agents/:agentId/chats/:chatId/messages
    * Paginated message history (cursor-based).
-   * Query: limit, before (ts ms), after (ts ms), session_id
+   * Query: limit, before (ts ms), after (ts ms), session_id, order (asc|desc, default desc)
    */
   router.get('/v1/agents/:agentId/chats/:chatId/messages', auth, (req: Request, res: Response) => {
     const { agentId, chatId } = req.params as { agentId: string; chatId: string };
@@ -2050,11 +2083,53 @@ export function createApiRouter(
     }
     const query = req.query as Record<string, string>;
     const limit = query['limit'] ? Math.min(parseInt(query['limit'], 10) || 50, 200) : 50;
-    const before = query['before'] ? parseInt(query['before'], 10) : undefined;
-    const after = query['after'] ? parseInt(query['after'], 10) : undefined;
+    // Numeric cursor params. before/after are ms timestamps; before_id/after_id are the id
+    // component of the composite (ts, id) cursor, echoed from a prior page's nextCursorId —
+    // paired with before/after they stop paging from skipping messages that share a ts
+    // (ignored unless the matching before/after is present). A present-but-non-numeric value
+    // (?before=abc, or a duplicate/structured param) is a malformed request: reject with 400
+    // so client bugs surface, mirroring the `order` guard below, rather than coercing to NaN
+    // and silently returning an empty page.
+    const cursorInts: Record<string, number | undefined> = {};
+    for (const name of ['before', 'after', 'before_id', 'after_id']) {
+      const raw = query[name] as unknown;
+      if (raw === undefined) continue;
+      const n = typeof raw === 'string' ? parseInt(raw, 10) : NaN;
+      if (!Number.isFinite(n)) {
+        res.status(400).json({ error: `${name} must be a number` });
+        return;
+      }
+      cursorInts[name] = n;
+    }
+    const before = cursorInts['before'];
+    const after = cursorInts['after'];
+    const beforeId = cursorInts['before_id'];
+    const afterId = cursorInts['after_id'];
     const sessionId = query['session_id'] ?? undefined;
 
-    const page = runner.getHistoryDb().getMessages(chatId, { limit, before, after, sessionId });
+    // order: case-insensitive; 'asc' seeks forward, 'desc' (or omitted) is the db default.
+    // Reject any other explicit value with 400 so client typos surface instead of silently defaulting.
+    let order: 'asc' | undefined;
+    const rawOrder = query['order'] as unknown;
+    if (rawOrder !== undefined) {
+      // Express parses a repeated/structured param (?order=asc&order=asc) as an
+      // array/object, not a string — guard so .toLowerCase() can't throw a 500.
+      if (typeof rawOrder !== 'string') {
+        res.status(400).json({ error: "order must be 'asc' or 'desc'" });
+        return;
+      }
+      const normalized = rawOrder.toLowerCase();
+      if (normalized === 'asc') {
+        order = 'asc';
+      } else if (normalized === 'desc') {
+        order = undefined; // explicit desc == db default
+      } else {
+        res.status(400).json({ error: "order must be 'asc' or 'desc'" });
+        return;
+      }
+    }
+
+    const page = runner.getHistoryDb().getMessages(chatId, { limit, before, after, beforeId, afterId, sessionId, order });
     res.json(page);
   });
 
@@ -2086,6 +2161,64 @@ export function createApiRouter(
 
     const page = runner.getHistoryDb().searchMessages(chatId, q, { limit, offset });
     res.json(page);
+  });
+
+  /**
+   * GET /api/v1/agents/:agentId/chats/:chatId/messages/active-days
+   * Distinct local calendar days (YYYY-MM-DD) with >= 1 message in a [from, to) window.
+   * Powers the jump-to-date calendar's per-day "has history" dot in one bounded index scan.
+   * Query: from (ts ms, inclusive), to (ts ms, exclusive), tz_offset (min east of UTC, Bangkok=+420), session_id
+   */
+  router.get('/v1/agents/:agentId/chats/:chatId/messages/active-days', auth, (req: Request, res: Response) => {
+    const { agentId, chatId } = req.params as { agentId: string; chatId: string };
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!canAccessAgent(apiKey, agentId)) {
+      res.status(403).json({ error: `API key has no access to agent '${agentId}'` });
+      return;
+    }
+    const runner = agentRunners.get(agentId);
+    if (!runner) {
+      res.status(404).json({ error: `Agent '${agentId}' not found` });
+      return;
+    }
+    const query = req.query as Record<string, string>;
+    // Number(), not parseInt() — parseInt("100garbage") silently returns 100, masking a malformed
+    // client value the same way a case-sensitive/silently-defaulting enum param would (see order).
+    const from = query['from'] ? Number(query['from']) : NaN;
+    const to = query['to'] ? Number(query['to']) : NaN;
+    if (!Number.isFinite(from) || !Number.isFinite(to)) {
+      res.status(400).json({ error: 'from and to (ts ms) are required' });
+      return;
+    }
+    // Bound the window so a malformed client can't turn this into a near-full-history scan.
+    // 366 days is far wider than the one-month view the calendar sends, so it never bites
+    // legitimate navigation while still capping a pathological range (E5 in the design notes).
+    const MAX_ACTIVE_DAYS_SPAN_MS = 366 * 24 * 60 * 60 * 1000;
+    if (to - from > MAX_ACTIVE_DAYS_SPAN_MS) {
+      res.status(400).json({ error: 'window too large (max 366 days between from and to)' });
+      return;
+    }
+    let tzOffset = 0;
+    if (query['tz_offset'] !== undefined) {
+      const parsed = Number(query['tz_offset']);
+      if (!Number.isFinite(parsed)) {
+        res.status(400).json({ error: 'tz_offset must be a number (minutes east of UTC)' });
+        return;
+      }
+      tzOffset = parsed;
+    }
+    // session_id, like order, can arrive as an array when the param is repeated
+    // (?session_id=a&session_id=b). Guard so it can't reach the sqlite bind as an
+    // array and throw a 500 — surface a 400 instead. (Mirrors the order guard above.)
+    const rawSessionId = query['session_id'] as unknown;
+    if (rawSessionId !== undefined && typeof rawSessionId !== 'string') {
+      res.status(400).json({ error: 'session_id must be a single value' });
+      return;
+    }
+    const sessionId = rawSessionId ?? undefined;
+
+    const days = runner.getHistoryDb().getActiveDays(chatId, { from, to, tzOffset, sessionId });
+    res.json({ days });
   });
 
   /**

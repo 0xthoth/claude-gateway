@@ -140,6 +140,7 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | `GET` | `/api/v1/agents/:agentId/chats/:chatId/sessions` | Key | List sessions for a specific chat |
 | `GET` | `/api/v1/agents/:agentId/chats/:chatId/messages` | Key | Paginated message history (cursor-based) |
 | `GET` | `/api/v1/agents/:agentId/chats/:chatId/messages/search` | Key | Full-text search across messages (SQLite FTS5) |
+| `GET` | `/api/v1/agents/:agentId/chats/:chatId/messages/active-days` | Key | Distinct local calendar days with >= 1 message in a window (jump-to-date dots) |
 | `POST` | `/api/v1/agents/:agentId/chats/:chatId/sessions/:sessionId/messages` | Key | Inject a message into an existing channel session (SSE stream) |
 
 ### Media API
@@ -224,6 +225,8 @@ ws://localhost:10850/api/v1/agents/<agentId>/pty-stream?session=<sessionId>
 > does not need `?session=` because the ticket is already bound to one session.
 
 Closes with code `4404` if the session is not running in PTY mode.
+
+**Direction:** the stream is server → client (live PTY output) by default, and the socket is bidirectional: inbound **text** frames carry raw keystroke bytes that are written into the live PTY (interactive terminal mode), bounded per frame and dropped for headless sessions. A dashboard viewer only sends these frames while its mode toggle is in input mode (a client-side choice); binary and oversized/empty frames are always dropped. Access is protected by the socket's auth (ticket/API key) and the localhost-default [`gateway.bind`](README.md#gatewaybind) — see the [Terminal Viewer](README.md#terminal-viewer--interactive-terminal-mode) docs.
 
 **Auth levels:** `Key` = any valid API key, `Write` = key with write access to the agent, `Admin` = key with `agents: "*"`.
 
@@ -1123,6 +1126,7 @@ Send a message to an agent. Returns a JSON response or SSE stream.
 | `timeout_ms` | No | Override the default response timeout in milliseconds (default 60000) |
 | `media_files` | No | Array of `mediaPath` strings returned by the Media Upload endpoint |
 | `store_user_message` | No | Set to `false` to skip persisting the user message in session history — only the assistant response is stored. Requires a write or admin key. Useful for proactive/trigger prompts where the user trigger should be invisible. |
+| `image_params` | No | Composer-selected image-generation options, surfaced to the agent so it calls the built-in `generate_image` tool with them. An object with optional string fields `model`, `quality`, `size`, `aspect_ratio`, `image_ref` and optional positive number `n`. Empty/whitespace strings are ignored; a non-object (or `n < 1`) returns `400`. The latest sent value is persisted to session meta as `imageConfig` (see the sessions list endpoint) so a web client can restore the selection on reload. |
 
 #### Slash command dispatch
 
@@ -2289,7 +2293,8 @@ curl -H "X-Api-Key: admin-key-456" \
           "createdAt": 1775737709000,
           "lastActivity": 1775823600000,
           "lastMessage": "Sure, I can help with that!",
-          "sessionName": "Project Planning"
+          "sessionName": "Project Planning",
+          "imageConfig": { "model": "openai/gpt-image-1", "quality": "medium" }
         }
       ]
     }
@@ -2309,6 +2314,7 @@ curl -H "X-Api-Key: admin-key-456" \
 | `lastActivity` | number | Last message timestamp (ms) |
 | `lastMessage` | string\|null | Preview of the last message content |
 | `sessionName` | string\|null | Human-readable session name (set via `/rename` or `POST /sessions`) |
+| `imageConfig` | object\|null | Last `image_params` sent for this session (composer image-generation options); `null` when none set. Lets a web client restore the composer selection on reload. |
 
 **Error responses:**
 
@@ -2365,7 +2371,7 @@ curl -H "X-Api-Key: my-secret-key-123" \
 
 ### GET /api/v1/agents/:agentId/chats/:chatId/messages
 
-Paginated message history (cursor-based). Returns messages in reverse chronological order.
+Paginated message history (cursor-based). Returns messages in reverse chronological order by default; pass `order=asc` to read forward.
 
 **Query parameters:**
 
@@ -2374,7 +2380,12 @@ Paginated message history (cursor-based). Returns messages in reverse chronologi
 | `limit` | Max messages to return (default 50, max 200) |
 | `before` | Return messages before this timestamp (ms) |
 | `after` | Return messages after this timestamp (ms) |
+| `before_id` | Id component of the cursor, paired with `before`. Echo back `nextCursorId` here to page correctly across messages that share a `ts` (see below). Ignored without `before`. |
+| `after_id` | Id component of the cursor, paired with `after` (the `order=asc` counterpart of `before_id`). Ignored without `after`. |
 | `session_id` | Filter to a specific session |
+| `order` | `asc` reads forward (oldest→newest) from `after`; `desc` (default) reads newest→oldest. Case-insensitive; any other value returns `400`. |
+
+`before`, `after`, `before_id`, and `after_id` must be numeric; a present-but-non-numeric value returns `400`.
 
 ```bash
 curl -H "X-Api-Key: my-secret-key-123" \
@@ -2384,12 +2395,27 @@ curl -H "X-Api-Key: my-secret-key-123" \
 ```json
 {
   "messages": [
-    { "role": "user", "content": "Hello!", "ts": 1775737709000, "sessionId": "abc-123" },
-    { "role": "assistant", "content": "Hi there!", "ts": 1775737712000, "sessionId": "abc-123" }
+    { "role": "assistant", "content": "Hi there!", "ts": 1775737712000, "sessionId": "abc-123" },
+    { "role": "user", "content": "Hello!", "ts": 1775737709000, "sessionId": "abc-123" }
   ],
-  "hasMore": false
+  "hasMore": true,
+  "nextCursor": 1775737709000,
+  "nextCursorId": 8412
 }
 ```
+
+When `hasMore` is `true`, the response carries a **composite cursor**: `nextCursor` (the boundary message's `ts`) and `nextCursorId` (its row id). `nextCursorId` is `null` whenever `nextCursor` is.
+
+**Seek-forward example** (jump to a date and read that day's first messages in one round-trip):
+
+```bash
+curl -H "X-Api-Key: my-secret-key-123" \
+  "http://localhost:10850/api/v1/agents/alfred/chats/telegram-<CHAT_ID>/messages?order=asc&after=<startOfDay-1>&limit=20" | jq
+```
+
+`nextCursor` continues forward via `after` when `order=asc` (vs. `before` for the default `desc`).
+
+**Paging across equal-`ts` messages.** `ts` is millisecond-granular and not unique — an image burst coalesced into one turn, or rapid messages, can share a `ts`. To page a run of tied rows without skipping the remainder at the boundary, echo **both** cursor components back: `before=<nextCursor>&before_id=<nextCursorId>` for the default `desc`, or `after=<nextCursor>&after_id=<nextCursorId>` for `order=asc`. The query then matches the boundary as a composite `(ts, id)` tuple. Passing only `before`/`after` (the `ts`) remains valid and byte-for-byte backward compatible; it just retains the legacy behavior of dropping not-yet-shown rows that share the exact boundary `ts`.
 
 ---
 
@@ -2424,6 +2450,55 @@ curl -H "X-Api-Key: my-secret-key-123" \
 | Status | When |
 |--------|------|
 | 400 | `q` is missing or empty |
+
+---
+
+### GET /api/v1/agents/:agentId/chats/:chatId/messages/active-days
+
+Returns the distinct **local calendar days** that have at least one message inside a `[from, to)`
+window. Intended for a jump-to-date calendar: the client requests the visible month once and
+draws a "has history" dot under each returned day, without paging the whole thread into memory.
+The query rides the `(chat_id, ts)` index as a bounded range scan, so a one-month window returns
+at most ~31 days.
+
+**Query parameters:**
+
+| Param | Required | Description |
+|-------|----------|-------------|
+| `from` | Yes | Window start, UTC epoch ms, **inclusive** (`ts >= from`) |
+| `to` | Yes | Window end, UTC epoch ms, **exclusive** (`ts < to`) |
+| `tz_offset` | No | Viewer's timezone offset in **minutes east of UTC** (`local = UTC + offset`). Bangkok (UTC+7) is `+420`, India (UTC+5:30) is `+330`, New York (UTC-4 DST) is `-240`. Default `0` (UTC bucketing). Clients computing this from JavaScript should send `-new Date().getTimezoneOffset()` (that API returns the opposite sign). |
+| `session_id` | No | Restrict to a single session (parity with the messages endpoint) |
+
+Days are returned as `YYYY-MM-DD` strings, **distinct and sorted ascending**. An empty or
+inverted window (`to <= from`) and a window with no messages both return `{ "days": [] }` with
+status `200`. The window may span at most **366 days** (`to - from`); a larger range returns 400,
+since the calendar only ever requests one visible month at a time.
+
+> **Window is filtered in UTC, days are bucketed in local time.** `from`/`to` are matched against
+> the raw stored `ts` (UTC ms), while the returned day labels use `tz_offset`. For a viewer east of
+> UTC, the first local day of a month begins *before* its UTC midnight (e.g. Bangkok's `2026-07-01`
+> starts at `2026-06-30T17:00Z`). Send `from`/`to` covering the visible month **in the viewer's
+> local time** — i.e. widen the UTC window by `tz_offset` — so edge days aren't under-counted.
+
+```bash
+curl -H "X-Api-Key: my-secret-key-123" \
+  "http://localhost:10850/api/v1/agents/alfred/chats/telegram-<CHAT_ID>/messages/active-days?from=1751328000000&to=1754006400000&tz_offset=420" | jq
+```
+
+```json
+{
+  "days": ["2026-07-02", "2026-07-03", "2026-07-05", "2026-07-09"]
+}
+```
+
+**Error responses:**
+
+| Status | When |
+|--------|------|
+| 400 | `from` or `to` is missing or non-numeric |
+| 400 | `tz_offset` is present but non-numeric |
+| 400 | window is larger than 366 days (`to - from`) |
 
 ---
 

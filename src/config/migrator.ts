@@ -5,6 +5,7 @@ export interface MigrationResult {
   migrated: boolean;
   addedFields: string[];
   removedFields: string[];
+  warnings: string[];
 }
 
 export interface DetectMigrationResult {
@@ -13,6 +14,7 @@ export interface DetectMigrationResult {
   toVersion: string;
   addedFields: string[];
   removedFields: string[];
+  warnings: string[];
   config: Record<string, unknown>;
   template: Record<string, unknown>;
 }
@@ -224,6 +226,44 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
+/** Warning surfaced when a migration pins `gateway.bind` to preserve external access (Issue #204). */
+export const BIND_PRESERVED_WARNING =
+  'gateway.bind was pinned to "0.0.0.0" to preserve external API/dashboard access across this upgrade. ' +
+  'Set gateway.bind to "127.0.0.1" in config.json if you do not need access from outside this host.';
+
+/**
+ * Behavior-preserving migration for `gateway.bind` (Issue #204).
+ *
+ * The localhost-only `gateway.bind` default (Issue #201 / PR #202) makes the
+ * server bind 127.0.0.1 when `gateway.bind` is unset, which silently cuts off
+ * external API/dashboard access for any pre-existing deployment that used to be
+ * reachable on all interfaces.
+ *
+ * This runs ONLY inside a migration, which fires only when the config's
+ * `configVersion` is OLDER than the template's — i.e. only for configs that are
+ * being upgraded, never for fresh installs (a fresh install copies the template
+ * verbatim, so it already carries `bind: "127.0.0.1"` and no migration runs).
+ * Therefore any config that reaches this point WITHOUT a `bind` key predates the
+ * localhost default and was externally reachable, so we pin "0.0.0.0" to
+ * preserve that. We do NOT gate on a specific configVersion: an earlier gate of
+ * `< 1.0.13` wrongly skipped configs already stamped 1.0.13 that never got a
+ * bind, leaving them on the 127.0.0.1 runtime default with no way to recover.
+ *
+ * Mutates `config` in place when it pins the value. Returns the added field
+ * path (`gateway.bind`) if pinned, otherwise null.
+ */
+function preserveBindDefault(config: Record<string, unknown>): string | null {
+  const gateway = config.gateway;
+  if (!gateway || typeof gateway !== 'object' || Array.isArray(gateway)) return null;
+
+  const g = gateway as Record<string, unknown>;
+  // Respect any explicit bind the user already set — never overwrite.
+  if ('bind' in g) return null;
+
+  g.bind = '0.0.0.0';
+  return 'gateway.bind';
+}
+
 /**
  * Load a template file, extract the _migration metadata, strip it,
  * and return the clean template along with the ignorePaths set.
@@ -308,6 +348,7 @@ export function detectMigration(
     toVersion: templateVersion,
     addedFields: [],
     removedFields: [],
+    warnings: [],
     config,
     template,
   });
@@ -344,6 +385,16 @@ export function detectMigration(
   // Dry-run merge on a clone to detect what would be added/removed
   const configClone = structuredClone(config);
   const added: string[] = [];
+  const warnings: string[] = [];
+
+  // Preserve external bind for an upgrading config (Issue #204) BEFORE the
+  // template merge — mirrors applyMigration so the dry-run reports the same
+  // gateway.bind = "0.0.0.0" instead of the template's localhost default.
+  const bindField = preserveBindDefault(configClone);
+  if (bindField) {
+    added.push(bindField);
+    warnings.push(BIND_PRESERVED_WARNING);
+  }
 
   // Deep-merge top-level keys (except agents which need special handling)
   const templateWithoutAgents = { ...template };
@@ -395,6 +446,7 @@ export function detectMigration(
     toVersion: templateVersion,
     addedFields: added,
     removedFields: removed,
+    warnings,
     config,
     template,
   };
@@ -413,6 +465,18 @@ export function applyMigration(
   removePaths?: string[],
 ): MigrationResult {
   const added: string[] = [];
+  const warnings: string[] = [];
+
+  // Preserve external bind for an upgrading config (Issue #204) BEFORE the
+  // template merge: config.template.json ships gateway.bind = "127.0.0.1", and
+  // deepMerge would inject that localhost default into a config that never set
+  // bind. Pinning here first means deepMerge (which only adds missing keys)
+  // leaves our 0.0.0.0 untouched, so old deployments keep external access.
+  const bindField = preserveBindDefault(config);
+  if (bindField) {
+    added.push(bindField);
+    warnings.push(BIND_PRESERVED_WARNING);
+  }
 
   // Deep-merge top-level keys (except agents)
   const templateWithoutAgents = { ...template };
@@ -468,7 +532,7 @@ export function applyMigration(
   fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
   fs.renameSync(tmpPath, configPath);
 
-  return { migrated: true, addedFields: added, removedFields: removed };
+  return { migrated: true, addedFields: added, removedFields: removed, warnings };
 }
 
 /**
@@ -485,7 +549,7 @@ export function migrateConfig(
   const detection = detectMigration(configPath, templatePath, templateVersion);
 
   if (!detection.needed) {
-    return { migrated: false, addedFields: [], removedFields: [] };
+    return { migrated: false, addedFields: [], removedFields: [], warnings: [] };
   }
 
   // Load ignorePaths and removePaths again for the actual merge

@@ -84,7 +84,7 @@ jest.mock('child_process', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 
-import { SessionProcess } from '../../src/session/process';
+import { SessionProcess, resolveMaxHistoryMessages, MAX_HISTORY_MESSAGES } from '../../src/session/process';
 import { SessionStore } from '../../src/session/store';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 
@@ -251,6 +251,44 @@ describe('SessionProcess', () => {
   });
 
   // --------------------------------------------------------------------------
+  // U-SP-06a: allow_tools:false api session denies built-in tools at the CLI
+  // --------------------------------------------------------------------------
+  it('U-SP-06a: api source without allow_tools passes --disallowedTools for built-ins', async () => {
+    const sp = new SessionProcess('api:uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const idx = args.indexOf('--disallowedTools');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const denied = args[idx + 1].split(',');
+    expect(denied).toEqual(expect.arrayContaining(['Bash', 'Read', 'Write', 'Edit', 'WebFetch']));
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-06b: allow_tools:true api session is unaffected (no deny-list, MCP on)
+  // --------------------------------------------------------------------------
+  it('U-SP-06b: api source with allow_tools:true does NOT pass --disallowedTools', async () => {
+    agentConfig = makeAgentConfig({ workspace: path.join(tmpDir, 'workspace'), allow_tools: true });
+    const sp = new SessionProcess('api:uuid', 'api', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    expect(args).not.toContain('--disallowedTools');
+    expect(args).toContain('--mcp-config');
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-06c: channel (telegram) sessions are never given the deny-list
+  // --------------------------------------------------------------------------
+  it('U-SP-06c: telegram source never passes --disallowedTools', async () => {
+    const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    await sp.start();
+
+    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    expect(args).not.toContain('--disallowedTools');
+  });
+
+  // --------------------------------------------------------------------------
   // U-SP-07: History injected into initial prompt when SessionStore has data
   // --------------------------------------------------------------------------
   it('U-SP-07: injects history into initial prompt when session has stored messages', async () => {
@@ -318,6 +356,33 @@ describe('SessionProcess', () => {
     // Should contain Message 59 (last) but NOT Message 0 (first — truncated)
     expect(text).toContain('Message 59');
     expect(text).not.toContain('Message 0');
+  });
+
+  // --------------------------------------------------------------------------
+  // U-SP-09b: a lowered historyLimit (configurable cap) truncates further
+  // --------------------------------------------------------------------------
+  it('U-SP-09b: history is truncated to a lowered historyLimit (30)', async () => {
+    // Insert 40 messages so the 30-message cap must drop the oldest 10
+    for (let i = 0; i < 40; i++) {
+      await sessionStore.appendTelegramMessage('alfred', 'chat:111', 'chat:111', {
+        role: 'user',
+        content: `Message ${i}`,
+        ts: Date.now() + i,
+      });
+    }
+
+    const sp = new SessionProcess('chat:111', 'telegram', agentConfig, gatewayConfig, sessionStore);
+    // Mirror what the runner sets from a resolved maxHistoryMessages config
+    sp.historyLimit = 30;
+    await sp.start();
+
+    sp.sendMessage('probe');
+    const text: string = JSON.parse(lastProcess!.stdin!.write.mock.calls[0][0] as string).message.content[0].text;
+
+    // Last 30 (Message 39 .. Message 10) loaded; Message 9 and older truncated.
+    expect(text).toContain('Message 39');
+    expect(text).toContain('Message 10');
+    expect(text).not.toContain('Message 9');
   });
 
   // --------------------------------------------------------------------------
@@ -2065,5 +2130,36 @@ describe('SessionProcess — corrupted thinking-block recovery', () => {
     expect(priv.lastStderrLine).toBe('fatal: claude crashed mid-line');
 
     await sp.stop();
+  });
+});
+
+// ── resolveMaxHistoryMessages ────────────────────────────────────────────────
+
+describe('resolveMaxHistoryMessages', () => {
+  it('returns the per-agent value when set (overrides global)', () => {
+    expect(resolveMaxHistoryMessages(30, 50)).toBe(30);
+  });
+
+  it('falls back to the global value when the agent value is undefined', () => {
+    expect(resolveMaxHistoryMessages(undefined, 40)).toBe(40);
+  });
+
+  it('returns the default (MAX_HISTORY_MESSAGES) when both are undefined', () => {
+    expect(resolveMaxHistoryMessages(undefined, undefined)).toBe(MAX_HISTORY_MESSAGES);
+  });
+
+  it('treats 0 as a valid value meaning "inject no history"', () => {
+    expect(resolveMaxHistoryMessages(0, 50)).toBe(0);
+  });
+
+  it('ignores negative / non-finite values and falls through to the next level', () => {
+    expect(resolveMaxHistoryMessages(-5, 40)).toBe(40);
+    expect(resolveMaxHistoryMessages(NaN, 40)).toBe(40);
+    expect(resolveMaxHistoryMessages(Infinity, 40)).toBe(40);
+    expect(resolveMaxHistoryMessages(-1, undefined)).toBe(MAX_HISTORY_MESSAGES);
+  });
+
+  it('floors fractional values', () => {
+    expect(resolveMaxHistoryMessages(30.9, 50)).toBe(30);
   });
 });

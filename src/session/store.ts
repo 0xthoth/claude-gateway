@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import PQueue from 'p-queue';
-import { Message, SessionIndex, SessionMeta } from '../types';
+import { ImageParams, Message, SessionIndex, SessionMeta } from '../types';
 
 export class SessionNotInIndexError extends Error {
   constructor(message: string) {
@@ -439,7 +439,7 @@ export class SessionStore {
     agentId: string,
     chatId: string,
     sessionId: string,
-    meta: Partial<Pick<SessionMeta, 'name' | 'totalTokensUsed' | 'messageCount' | 'lastInputTokens' | 'loadedAtSpawn' | 'archivedCount' | 'messageCountAtSpawn'>>,
+    meta: Partial<Pick<SessionMeta, 'name' | 'totalTokensUsed' | 'messageCount' | 'lastInputTokens' | 'loadedAtSpawn' | 'archivedCount' | 'messageCountAtSpawn' | 'imageConfig'>>,
     channel: 'telegram' | 'discord' | 'api' | 'line' = 'telegram',
   ): Promise<void> {
     const queue = this.getTelegramQueue(agentId, chatId);
@@ -588,8 +588,8 @@ export class SessionStore {
   }
 
   /** Get all session metadata (name) for an agent, keyed by sessionId. */
-  async getAllSessionMeta(agentId: string): Promise<Map<string, { name: string }>> {
-    const metaMap = new Map<string, { name: string }>();
+  async getAllSessionMeta(agentId: string): Promise<Map<string, { name: string; imageConfig?: ImageParams }>> {
+    const metaMap = new Map<string, { name: string; imageConfig?: ImageParams }>();
     const sessionsDir = path.join(this.agentsBaseDir, agentId, 'sessions');
     let entries: fs.Dirent[];
     try {
@@ -604,7 +604,7 @@ export class SessionStore {
         const chatId = e.name.slice(channel.length + 1);
         const index = await this.loadIndex(agentId, chatId, channel);
         if (index) {
-          for (const s of index.sessions) metaMap.set(s.id, { name: s.name });
+          for (const s of index.sessions) metaMap.set(s.id, { name: s.name, imageConfig: s.imageConfig });
         }
       });
     await Promise.all(reads);

@@ -9,6 +9,7 @@ import {
   MessageRole,
   PaginationOpts,
   SearchOpts,
+  ActiveDaysOpts,
   SearchPage,
   SearchResult,
   SessionSummary,
@@ -175,23 +176,45 @@ export class HistoryDB {
       conditions.push('session_id = ?');
       params.push(opts.sessionId);
     }
+    // Composite (ts, id) cursor: when the caller pairs before/after with its id component,
+    // match the boundary as a tuple so a page edge landing between equal-ts rows doesn't
+    // skip the tied remainder. Without the id it falls back to the legacy ts-only filter,
+    // keeping existing clients byte-for-byte compatible. before pages toward older rows
+    // (uses <), after pages toward newer rows (uses >) — the id comparison follows the
+    // same direction as its ts.
     if (opts.before !== undefined) {
-      conditions.push('ts < ?');
-      params.push(opts.before);
+      if (opts.beforeId !== undefined) {
+        conditions.push('(ts < ? OR (ts = ? AND id < ?))');
+        params.push(opts.before, opts.before, opts.beforeId);
+      } else {
+        conditions.push('ts < ?');
+        params.push(opts.before);
+      }
     }
     if (opts.after !== undefined) {
-      conditions.push('ts > ?');
-      params.push(opts.after);
+      if (opts.afterId !== undefined) {
+        conditions.push('(ts > ? OR (ts = ? AND id > ?))');
+        params.push(opts.after, opts.after, opts.afterId);
+      } else {
+        conditions.push('ts > ?');
+        params.push(opts.after);
+      }
     }
 
     // Fetch limit+1 to determine hasMore
     params.push(limit + 1);
+    const order = opts.order === 'asc' ? 'ASC' : 'DESC'; // whitelist; never interpolate raw input
+    // Tiebreak on id (AUTOINCREMENT, monotonic with insertion) so rows sharing a
+    // ts have a deterministic, chronology-consistent order instead of relying on
+    // SQLite's unspecified default. Paired with the composite (ts, id) cursor above,
+    // a page boundary between equal-ts rows is expressible exactly, so no tied row is
+    // skipped or repeated when the caller passes the cursor's id component back.
     const sql = `
       SELECT id, chat_id, session_id, source, role, content, sender_name, sender_id,
              platform_message_id, media_files, ts
       FROM messages
       WHERE ${conditions.join(' AND ')}
-      ORDER BY ts DESC
+      ORDER BY ts ${order}, id ${order}
       LIMIT ?
     `;
 
@@ -200,11 +223,11 @@ export class HistoryDB {
     const slice = hasMore ? rows.slice(0, limit) : rows;
 
     const messages = slice.map((r) => this._rowToMessage(r));
-    const nextCursor = hasMore && slice.length > 0
-      ? (slice[slice.length - 1]!['ts'] as number)
-      : null;
+    const boundary = hasMore && slice.length > 0 ? slice[slice.length - 1]! : null;
+    const nextCursor = boundary ? (boundary['ts'] as number) : null;
+    const nextCursorId = boundary ? (boundary['id'] as number) : null;
 
-    return { messages, hasMore, nextCursor };
+    return { messages, hasMore, nextCursor, nextCursorId };
   }
 
   searchMessages(chatId: string, query: string, opts: SearchOpts = {}): SearchPage {
@@ -253,6 +276,44 @@ export class HistoryDB {
     } catch {
       return { results: [], total: 0, hasMore: false };
     }
+  }
+
+  /**
+   * Distinct local calendar days (YYYY-MM-DD) that have >= 1 message in [from, to).
+   *
+   * Rides the idx_messages_chat_ts index as a bounded range scan (chat_id + ts window),
+   * so a one-month window emits at most ~31 rows without a full-history scan.
+   *
+   * Timezone: tzOffset is minutes EAST of UTC (local = UTC + offset), matching the issue's
+   * SQL contract. Bangkok (UTC+7) => +420. The SQL adds (tzOffset * 60000) ms to ts before
+   * bucketing, so days match the viewer's local calendar. Omitted tzOffset defaults to 0 (UTC).
+   * (Clients computing this from JS should send -Date.prototype.getTimezoneOffset().)
+   */
+  getActiveDays(chatId: string, opts: ActiveDaysOpts): string[] {
+    // Short-circuit empty/inverted windows before touching SQLite.
+    if (!(opts.to > opts.from)) {
+      return [];
+    }
+
+    const conditions: string[] = ['chat_id = ?', 'ts >= ?', 'ts < ?'];
+    const params: (string | number)[] = [chatId, opts.from, opts.to];
+    if (opts.sessionId) {
+      conditions.push('session_id = ?');
+      params.push(opts.sessionId);
+    }
+
+    // offsetMs is bound FIRST because it appears first in the SQL text; keep ? order and bind
+    // order in lockstep. tzOffset is minutes east of UTC => local = UTC + offset => add offsetMs.
+    const offsetMs = (opts.tzOffset ?? 0) * 60000;
+    const sql = `
+      SELECT DISTINCT date((ts + ?) / 1000, 'unixepoch') AS day
+      FROM messages
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY day ASC
+    `;
+
+    const rows = this.db.prepare(sql).all(offsetMs, ...params) as Array<{ day: string }>;
+    return rows.map((r) => r.day);
   }
 
   listSessions(chatId?: string): SessionSummary[] {
