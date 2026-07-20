@@ -54,6 +54,10 @@ export class DiscordModule implements ChannelModule {
   private running = false;
   private lastMessageAt?: number;
   private lastError?: string;
+  // Files already delivered this session. Small models sometimes retry
+  // discord_reply after a transient send hiccup even though the upload
+  // succeeded, which spams duplicate images. We never re-send the same file.
+  private readonly sentFiles = new Set<string>();
 
   constructor() {
     this.stateDir = process.env.DISCORD_STATE_DIR
@@ -567,8 +571,19 @@ export class DiscordModule implements ChannelModule {
     const channel = await this.client.channels.fetch(args.channel_id as string);
     const text = args.text as string;
     const replyTo = args.reply_to as string | undefined;
-    const files = (args.files as string[] | undefined) ?? [];
+    const requested = (args.files as string[] | undefined) ?? [];
     const useEmbed = Boolean(args.embed);
+
+    // Never re-send a file already delivered this session (retry-dedup): mark
+    // BEFORE sending so a resend after an apparent failure can't duplicate it.
+    const files = requested.filter((f) => typeof f === 'string' && !this.sentFiles.has(f));
+    for (const f of files) this.sentFiles.add(f);
+
+    // Nothing new to say or send — the whole reply is a duplicate. No-op success
+    // so the agent treats it as delivered and stops retrying.
+    if (!text && files.length === 0 && requested.length > 0) {
+      return { content: [{ type: 'text', text: 'already sent (duplicate suppressed)' }] };
+    }
 
     for (const f of files) {
       const st = fs.statSync(f);
