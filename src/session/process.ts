@@ -98,6 +98,8 @@ export class SessionProcess extends EventEmitter {
   // recent turn. Surfaced read-only for the status dashboard. Best-effort —
   // reset to 0 until the first tokenUsage event fires.
   private lastTotalTokens = 0;
+  // Real model from Claude stream, updated per turn. Persisted to SessionMeta.
+  _lastModel = '';
   private thinkingRecoveryCount = 0;
   // Binary path last spawned and the last non-empty stderr line, retained so a
   // fatal `Session max restarts reached` names what actually failed (e.g. an
@@ -166,6 +168,11 @@ export class SessionProcess extends EventEmitter {
   /** Latest context-window token usage for this session (for status/UI). */
   get totalTokens(): number {
     return this.lastTotalTokens;
+  }
+
+  /** Real model from the last Claude stream, updated per turn. */
+  get lastModel(): string {
+    return this._lastModel;
   }
 
   private readFreshModel(): string {
@@ -318,7 +325,14 @@ export class SessionProcess extends EventEmitter {
     if (this.source === 'api' && !this.agentConfig.allow_tools) return null;
 
     const stateDir = path.join(this.agentConfig.workspace, '.telegram-state');
-    const sessionDir = path.join(this.agentConfig.workspace, '.sessions', this.sessionId);
+    const sessionsRoot = path.join(this.agentConfig.workspace, '.sessions');
+    const sessionDir = path.join(sessionsRoot, this.sessionId);
+    // Defense-in-depth: a sessionId containing '../' would escape the .sessions
+    // directory. Reject anything that resolves outside it.
+    const sessionDirRel = path.relative(sessionsRoot, sessionDir);
+    if (sessionDirRel.startsWith('..') || path.isAbsolute(sessionDirRel)) {
+      throw new Error('invalid session id');
+    }
     fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
 
     const mcpServerPath = path.resolve(__dirname, '..', '..', 'mcp', 'server.ts');
@@ -383,6 +397,15 @@ export class SessionProcess extends EventEmitter {
             IMAGE_API_KEY: process.env.IMAGE_API_KEY ?? process.env.ANTHROPIC_AUTH_TOKEN ?? '',
             IMAGE_DISABLED: process.env.IMAGE_DISABLED ?? '',
             IMAGE_POLL_TIMEOUT_MS: process.env.IMAGE_POLL_TIMEOUT_MS ?? '',
+            IMAGE_SHARE_MAX_REFS: process.env.IMAGE_SHARE_MAX_REFS ?? '',
+            // Short-lived public media URLs (LINE image delivery). line_image
+            // mints a share token via the gateway share bridge (using
+            // GATEWAY_API_KEY, injected above) and builds a `/shared/<token>` URL —
+            // no HMAC / separate public-token secret. The public base URL is derived
+            // by the gateway from the inbound LINE webhook and written to
+            // `<workspace>/../.public-base`, which line_image reads at call-time
+            // (no public-base-URL env var).
+            GATEWAY_MEDIA_URL_TTL_MS: process.env.GATEWAY_MEDIA_URL_TTL_MS ?? '',
           },
         },
       },
@@ -680,6 +703,10 @@ export class SessionProcess extends EventEmitter {
           const obj = JSON.parse(line);
           // stream-json assistant message (partial or final)
           if (obj.type === 'assistant' && Array.isArray(obj.message?.content)) {
+            // Capture the real model from the stream
+            if (typeof obj.message?.model === 'string') {
+              this._lastModel = obj.message.model;
+            }
             // Extract full text from all text blocks in this message
             let fullText = '';
             for (const block of obj.message.content) {

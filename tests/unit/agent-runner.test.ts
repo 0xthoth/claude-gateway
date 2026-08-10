@@ -326,6 +326,213 @@ describe('AgentRunner (session pool)', () => {
   }, 15000);
 });
 
+// ── tokenUsage → session model persistence (#273) ────────────────────────────
+
+describe('AgentRunner — tokenUsage persists model to session meta', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-model-'));
+    agentConfig = makeAgentConfig(path.join(tmpDir, 'workspace'));
+    fs.mkdirSync(agentConfig.workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) {
+      await runner.stop();
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  // Drive the raw child-process stdout (not SessionProcess's 'output' passthrough)
+  // so the real stream-json parser in src/session/process.ts runs and populates
+  // proc.lastModel + fires 'tokenUsage', exactly as it would against the live CLI.
+  function emitTurn(rawProc: MockChildProcess, opts: { model?: string; inputTokens: number; outputTokens: number }): void {
+    if (opts.model !== undefined) {
+      const assistantLine = JSON.stringify({
+        type: 'assistant',
+        message: { model: opts.model, content: [{ type: 'text', text: 'hi' }] },
+      });
+      rawProc.stdout!.emit('data', Buffer.from(assistantLine + '\n'));
+    }
+    const messageStart = JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { usage: { input_tokens: opts.inputTokens } } },
+    });
+    rawProc.stdout!.emit('data', Buffer.from(messageStart + '\n'));
+    const resultLine = JSON.stringify({
+      type: 'result', is_error: false, result: 'ok',
+      usage: { output_tokens: opts.outputTokens },
+    });
+    rawProc.stdout!.emit('data', Buffer.from(resultLine + '\n'));
+  }
+
+  it('T-AR-MODEL-1: tokenUsage persists both model and totalTokensUsed to session meta', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:model1', 'hi');
+    await waitForSession(runner, 'chat:model1');
+    await new Promise(r => setTimeout(r, 100));
+    const sessionUuid = getSessions(runner).get('chat:model1')!.sessionId;
+
+    const rawProc = allProcesses[allProcesses.length - 1];
+    emitTurn(rawProc, { model: 'claude-opus-4-8', inputTokens: 100, outputTokens: 50 });
+
+    await new Promise(r => setTimeout(r, 150));
+
+    const metaMap = await runner.getAllSessionMeta();
+    const meta = metaMap.get(sessionUuid);
+    expect(meta).toBeDefined();
+    expect(meta!.model).toBe('claude-opus-4-8');
+  }, 15000);
+
+  it('T-AR-MODEL-2: a later turn on a different model overwrites the persisted model (latest wins)', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:model2', 'hi');
+    await waitForSession(runner, 'chat:model2');
+    await new Promise(r => setTimeout(r, 100));
+    const sessionUuid = getSessions(runner).get('chat:model2')!.sessionId;
+
+    const rawProc = allProcesses[allProcesses.length - 1];
+    emitTurn(rawProc, { model: 'claude-sonnet-4-6', inputTokens: 60, outputTokens: 40 });
+    await new Promise(r => setTimeout(r, 150));
+
+    let metaMap = await runner.getAllSessionMeta();
+    expect(metaMap.get(sessionUuid)?.model).toBe('claude-sonnet-4-6');
+
+    emitTurn(rawProc, { model: 'claude-opus-4-8', inputTokens: 60, outputTokens: 40 });
+    await new Promise(r => setTimeout(r, 150));
+
+    metaMap = await runner.getAllSessionMeta();
+    expect(metaMap.get(sessionUuid)?.model).toBe('claude-opus-4-8');
+  }, 15000);
+
+  it('T-AR-MODEL-3: proc.lastModel is sticky — a later turn with no fresh assistant/model event keeps the previously captured model', async () => {
+    // proc.lastModel lives on the SessionProcess instance and is only overwritten by a new
+    // `type: assistant` event carrying `message.model`; it is NOT reset per turn. So a turn
+    // whose stream is only message_start + result (no assistant event) still reports the
+    // model captured on an earlier turn of the same process.
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:model3', 'hi');
+    await waitForSession(runner, 'chat:model3');
+    await new Promise(r => setTimeout(r, 100));
+    const sessionUuid = getSessions(runner).get('chat:model3')!.sessionId;
+
+    const rawProc = allProcesses[allProcesses.length - 1];
+    emitTurn(rawProc, { model: 'claude-opus-4-8', inputTokens: 60, outputTokens: 40 });
+    await new Promise(r => setTimeout(r, 150));
+    expect((await runner.getAllSessionMeta()).get(sessionUuid)?.model).toBe('claude-opus-4-8');
+
+    // Second turn: no assistant/model event at all, only message_start + result.
+    emitTurn(rawProc, { inputTokens: 60, outputTokens: 40 });
+    await new Promise(r => setTimeout(r, 150));
+
+    const metaMap = await runner.getAllSessionMeta();
+    expect(metaMap.get(sessionUuid)).toBeDefined();
+    expect(metaMap.get(sessionUuid)!.model).toBe('claude-opus-4-8');
+  }, 15000);
+
+  it('T-AR-MODEL-3b: the very first tokenUsage event on a session that never saw an assistant/model event leaves model unset', async () => {
+    // `...(proc.lastModel && { model: proc.lastModel })` in runner.ts: when proc.lastModel is
+    // still '' (its initial value — no assistant event has arrived yet), the `model` key is
+    // omitted from the meta patch entirely, so a session with no prior model stays unset.
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:model3b', 'hi');
+    await waitForSession(runner, 'chat:model3b');
+    await new Promise(r => setTimeout(r, 100));
+    const sessionUuid = getSessions(runner).get('chat:model3b')!.sessionId;
+
+    const rawProc = allProcesses[allProcesses.length - 1];
+    // No assistant/model event at all — only message_start + result.
+    emitTurn(rawProc, { inputTokens: 60, outputTokens: 40 });
+    await new Promise(r => setTimeout(r, 150));
+
+    const metaMap = await runner.getAllSessionMeta();
+    expect(metaMap.get(sessionUuid)).toBeDefined();
+    expect(metaMap.get(sessionUuid)!.model).toBeUndefined();
+  }, 15000);
+
+  it('T-AR-MODEL-3c: a tokenUsage event with no captured model does NOT wipe a model persisted by an earlier process instance (fix for #273 regression)', async () => {
+    // Regression coverage for the d44c9da fix. Simulates a respawned SessionProcess (fresh
+    // instance, proc.lastModel reset to '') whose store already has a model persisted from a
+    // prior instance's turn. Before the fix, `model: proc.lastModel || undefined` would have
+    // explicitly overwritten the stored model with undefined via Object.assign; the spread-based
+    // fix must omit the key instead and leave the previously persisted model untouched.
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:model3c', 'hi');
+    await waitForSession(runner, 'chat:model3c');
+    await new Promise(r => setTimeout(r, 100));
+    const sp = getSessions(runner).get('chat:model3c')!;
+    const sessionUuid = sp.sessionId;
+
+    // Seed a persisted model directly in the store, as if an earlier process instance had
+    // already captured one (this session's own fresh proc.lastModel is still '').
+    const sessionStore = (runner as unknown as { sessionStore: import('../../src/session/store').SessionStore }).sessionStore;
+    await sessionStore.updateSessionMeta(agentConfig.id, 'chat:model3c', sessionUuid, { model: 'claude-opus-4-8' });
+    expect((await runner.getAllSessionMeta()).get(sessionUuid)?.model).toBe('claude-opus-4-8');
+
+    const rawProc = allProcesses[allProcesses.length - 1];
+    // This turn's stream never carries an assistant/model event — proc.lastModel stays ''.
+    emitTurn(rawProc, { inputTokens: 60, outputTokens: 40 });
+    await new Promise(r => setTimeout(r, 150));
+
+    const metaMap = await runner.getAllSessionMeta();
+    expect(metaMap.get(sessionUuid)?.model).toBe('claude-opus-4-8');
+  }, 15000);
+
+  it('T-AR-MODEL-4 (bad case): a result event without usage data does not touch session meta at all', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+    const port = getCallbackPort(runner);
+
+    await sendChannelPost(port, 'chat:model4', 'hi');
+    await waitForSession(runner, 'chat:model4');
+    await new Promise(r => setTimeout(r, 100));
+    const sessionUuid = getSessions(runner).get('chat:model4')!.sessionId;
+
+    const before = await runner.getAllSessionMeta();
+    const beforeModel = before.get(sessionUuid)?.model;
+
+    const rawProc = allProcesses[allProcesses.length - 1];
+    // Assistant message carries a model, but the turn never reaches message_start,
+    // so lastMessageStartContext stays 0 and tokenUsage must not fire.
+    const assistantLine = JSON.stringify({
+      type: 'assistant',
+      message: { model: 'claude-opus-4-8', content: [{ type: 'text', text: 'hi' }] },
+    });
+    rawProc.stdout!.emit('data', Buffer.from(assistantLine + '\n'));
+    const resultLine = JSON.stringify({ type: 'result', is_error: false, result: 'ok' });
+    rawProc.stdout!.emit('data', Buffer.from(resultLine + '\n'));
+
+    await new Promise(r => setTimeout(r, 150));
+
+    const after = await runner.getAllSessionMeta();
+    // totalTokensUsed/model were never persisted via tokenUsage — meta.model unchanged.
+    expect(after.get(sessionUuid)?.model).toBe(beforeModel);
+  }, 15000);
+});
+
 // ── restartOrDefer (skills hot-reload support) ────────────────────────────────
 
 describe('AgentRunner — restartOrDefer', () => {
@@ -1763,6 +1970,125 @@ describe('AgentRunner — sendApiMessageStream', () => {
 });
 
 // ── sendApiMessage (sync) tests ───────────────────────────────────────────────
+
+describe('AgentRunner — timeout keeps listening (#75)', () => {
+  let tmpDir: string;
+  let agentConfig: AgentConfig;
+  let gatewayConfig: GatewayConfig;
+  let runner: AgentRunner;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ar-t75-test-'));
+    const workspace = path.join(tmpDir, 'agents', 'alfred', 'workspace');
+    agentConfig = makeAgentConfig(workspace);
+    fs.mkdirSync(workspace, { recursive: true });
+    gatewayConfig = makeGatewayConfig();
+    allProcesses.length = 0;
+    (require('child_process').spawn as jest.Mock).mockClear();
+  });
+
+  afterEach(async () => {
+    if (runner) await runner.stop();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    jest.clearAllMocks();
+  });
+
+  it('stream: a result arriving AFTER the soft timeout still persists to history with its attachments', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const errorPromise = new Promise<Error>((resolve) => {
+      runner.sendApiMessageStream(
+        'late-1',
+        'late-chat',
+        'slow turn',
+        { onChunk: () => {}, onDone: () => {}, onError: (err) => resolve(err) },
+        { timeoutMs: 200 },
+      );
+    });
+    await waitForSession(runner, 'late-1');
+
+    // Soft timeout fires and the client is told…
+    const err = await errorPromise;
+    expect((err as Error & { code: string }).code).toBe('TIMEOUT');
+
+    // …but the turn is still listening: register an attachment and finish late.
+    const mediaDir = path.join(runner.getAgentsBaseDir(), 'alfred', 'media', 'api-late-1');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const absFile = path.join(mediaDir, 'late.png');
+    fs.writeFileSync(absFile, 'png-bytes');
+    runner.addApiAttachments('late-1', [absFile]);
+
+    const session = getSessions(runner).get('late-1')!;
+    session.emit('output', JSON.stringify({ type: 'result', result: 'finished late' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    // Newest-first: [assistant "finished late", user "slow turn"]
+    const page = runner.getHistoryDb().getMessages('api-late-chat');
+    expect(page.messages).toHaveLength(2);
+    expect(page.messages[0]!.role).toBe('assistant');
+    expect(page.messages[0]!.content).toBe('finished late');
+    expect(page.messages[0]!.mediaFiles).toEqual(['media/api-late-1/late.png']);
+    // Session slot freed only after the late result, and the buffer is drained.
+    expect(runner.hasActiveApiSession('late-1')).toBe(false);
+    expect(runner.popApiAttachments('late-1')).toEqual([]);
+  }, 15000);
+
+  it('sync: a result arriving AFTER the soft timeout still persists to history', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    const rejected = runner
+      .sendApiMessage('late-sync', 'late-sync-chat', 'slow turn', { timeoutMs: 200 })
+      .then(() => null, (err: Error) => err);
+    await waitForSession(runner, 'late-sync');
+    const err = await rejected;
+    expect(err).not.toBeNull();
+    expect((err as Error & { code: string }).code).toBe('TIMEOUT');
+
+    const session = getSessions(runner).get('late-sync')!;
+    session.emit('output', JSON.stringify({ type: 'result', result: 'sync late' }));
+    await new Promise(r => setTimeout(r, 100));
+
+    // Newest-first: [assistant "sync late", user "slow turn"]
+    const page = runner.getHistoryDb().getMessages('api-late-sync-chat');
+    expect(page.messages).toHaveLength(2);
+    expect(page.messages[0]!.role).toBe('assistant');
+    expect(page.messages[0]!.content).toBe('sync late');
+  }, 15000);
+
+  it('a new turn clears attachments a dead turn left behind (no cross-turn leak)', async () => {
+    runner = new AgentRunner(agentConfig, gatewayConfig);
+    await runner.start();
+
+    // Simulate a dead turn's leftovers sitting in the buffer.
+    const mediaDir = path.join(runner.getAgentsBaseDir(), 'alfred', 'media', 'api-leak-1');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const stale = path.join(mediaDir, 'stale.png');
+    fs.writeFileSync(stale, 'stale-bytes');
+    runner.addApiAttachments('leak-1', [stale]);
+
+    const donePromise = new Promise<string>((resolve) => {
+      runner.sendApiMessageStream(
+        'leak-1',
+        'leak-chat',
+        'fresh turn',
+        { onChunk: () => {}, onDone: (text) => resolve(text), onError: () => {} },
+        { timeoutMs: 5000 },
+      );
+    });
+    await waitForSession(runner, 'leak-1');
+    const session = getSessions(runner).get('leak-1')!;
+    session.emit('output', JSON.stringify({ type: 'result', result: 'clean reply' }));
+    await donePromise;
+    await new Promise(r => setTimeout(r, 50));
+
+    const page = runner.getHistoryDb().getMessages('api-leak-chat');
+    const assistantRow = page.messages.find((m) => m.role === 'assistant')!;
+    // The stale attachment from the dead turn must NOT ride on this reply.
+    expect(assistantRow.mediaFiles).toBeUndefined();
+  }, 15000);
+});
 
 describe('AgentRunner — sendApiMessage (sync)', () => {
   let tmpDir: string;

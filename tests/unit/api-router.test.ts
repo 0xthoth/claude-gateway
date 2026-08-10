@@ -2,7 +2,7 @@ import express from 'express';
 import { EventEmitter } from 'events';
 import * as supertest from 'supertest';
 import * as http from 'http';
-import { createApiRouter } from '../../src/api/router';
+import { createApiRouter, isValidSessionId } from '../../src/api/router';
 import { AgentConfig, ApiKey, StreamEvent } from '../../src/types';
 
 // ── Minimal mock AgentRunner ─────────────────────────────────────────────────
@@ -84,6 +84,20 @@ class MockAgentRunner extends EventEmitter {
   // Required by media_files path validation in the router
   getAgentsBaseDir(): string {
     return '/tmp';
+  }
+
+  // Backing data for GET /v1/agents/sessions — override per-test via the impl fields.
+  getHistoryDbImpl: () => { listSessions: (chatId?: string) => Array<Record<string, unknown>> } =
+    () => ({ listSessions: () => [] });
+  getAllSessionMetaImpl: () => Promise<Map<string, { name: string; imageConfig?: unknown; model?: string }>> =
+    () => Promise.resolve(new Map());
+
+  getHistoryDb(): { listSessions: (chatId?: string) => Array<Record<string, unknown>> } {
+    return this.getHistoryDbImpl();
+  }
+
+  getAllSessionMeta(): Promise<Map<string, { name: string; imageConfig?: unknown; model?: string }>> {
+    return this.getAllSessionMetaImpl();
   }
 }
 
@@ -241,6 +255,16 @@ describe('POST /api/v1/agents/:agentId/messages', () => {
       .set(AUTH)
       .send({ message: 'hi', chat_id: 'test-chat', session_id: 123 });
     expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when session_id contains path-traversal characters', async () => {
+    const app = buildApp(async () => ({ text: 'ok', attachments: [] }));
+    const res = await supertest.default(app)
+      .post(POST_URL)
+      .set(AUTH)
+      .send({ message: 'hi', chat_id: 'test-chat', session_id: '../evil' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/session_id must be/);
   });
 
   it('returns 401 when no auth header', async () => {
@@ -965,5 +989,167 @@ describe('POST /api/v1/agents/:agentId/messages — builtin commands (#157)', ()
     expect(res.status).toBe(200);
     expect(res.body.response).toBe('claude answer');
     expect(runner.lastCommandCall).toBeUndefined();
+  });
+});
+
+// ── GET /v1/agents/sessions — model field exposure (#273) ────────────────────
+
+describe('GET /api/v1/agents/sessions', () => {
+  const SESSIONS_URL = '/api/v1/agents/sessions';
+  const ADMIN_AUTH = { Authorization: 'Bearer sk-test-admin' };
+
+  function makeHistorySession(sessionId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      chatId: 'chat:1',
+      sessionId,
+      source: 'telegram',
+      messageCount: 2,
+      createdAt: 1000,
+      lastActivity: 2000,
+      lastMessage: 'hi',
+      lastMessageRole: 'assistant',
+      sessionName: null,
+      ...overrides,
+    };
+  }
+
+  function buildSessionsApp(agents: Record<string, { sessions: Array<Record<string, unknown>>; metaMap: Map<string, { name: string; imageConfig?: unknown; model?: string }> }>) {
+    const runners = new Map<string, import('../../src/agent/runner').AgentRunner>();
+    const configs = new Map<string, AgentConfig>();
+    for (const [id, data] of Object.entries(agents)) {
+      const runner = new MockAgentRunner(async () => ({ text: 'ok', attachments: [] }));
+      runner.getHistoryDbImpl = () => ({ listSessions: () => data.sessions });
+      runner.getAllSessionMetaImpl = () => Promise.resolve(data.metaMap);
+      runners.set(id, runner as unknown as import('../../src/agent/runner').AgentRunner);
+      configs.set(id, { ...agentConfig, id, description: `desc-${id}` });
+    }
+    const app = express();
+    app.use(express.json());
+    app.use('/api', createApiRouter(runners, configs, apiKeys));
+    return app;
+  }
+
+  it('S1: exposes model from getAllSessionMeta on each session', async () => {
+    const app = buildSessionsApp({
+      [AGENT_ID]: {
+        sessions: [makeHistorySession('sess-1')],
+        metaMap: new Map([['sess-1', { name: 'My Session', model: 'claude-opus-4-8' }]]),
+      },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL).set(ADMIN_AUTH);
+
+    expect(res.status).toBe(200);
+    const session = res.body.agents[0].sessions[0];
+    expect(session.model).toBe('claude-opus-4-8');
+    expect(session.sessionName).toBe('My Session');
+  });
+
+  it('S2 (bad case): a session with no meta entry at all reports model: null, not undefined/missing', async () => {
+    const app = buildSessionsApp({
+      [AGENT_ID]: {
+        sessions: [makeHistorySession('sess-orphan')],
+        metaMap: new Map(), // no meta registered for this session
+      },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL).set(ADMIN_AUTH);
+
+    expect(res.status).toBe(200);
+    const session = res.body.agents[0].sessions[0];
+    expect(session).toHaveProperty('model');
+    expect(session.model).toBeNull();
+  });
+
+  it('S3 (bad case): a meta entry that predates the model field reports model: null', async () => {
+    const app = buildSessionsApp({
+      [AGENT_ID]: {
+        sessions: [makeHistorySession('sess-old')],
+        metaMap: new Map([['sess-old', { name: 'Old Session' }]]), // no `model` key
+      },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL).set(ADMIN_AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.agents[0].sessions[0].model).toBeNull();
+  });
+
+  it('S4: models stay correctly scoped per-agent across multiple agents', async () => {
+    const app = buildSessionsApp({
+      alfred: {
+        sessions: [makeHistorySession('sess-a')],
+        metaMap: new Map([['sess-a', { name: 'A', model: 'claude-sonnet-4-6' }]]),
+      },
+      baerbel: {
+        sessions: [makeHistorySession('sess-b')],
+        metaMap: new Map([['sess-b', { name: 'B', model: 'claude-opus-4-8' }]]),
+      },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL).set(ADMIN_AUTH);
+
+    expect(res.status).toBe(200);
+    const byAgent = Object.fromEntries(
+      (res.body.agents as Array<{ agentId: string; sessions: Array<Record<string, unknown>> }>)
+        .map(a => [a.agentId, a.sessions[0].model]),
+    );
+    expect(byAgent.alfred).toBe('claude-sonnet-4-6');
+    expect(byAgent.baerbel).toBe('claude-opus-4-8');
+  });
+
+  it('S5 (bad case): non-admin key is rejected with 403 and no session data leaks', async () => {
+    const app = buildSessionsApp({
+      [AGENT_ID]: {
+        sessions: [makeHistorySession('sess-1')],
+        metaMap: new Map([['sess-1', { name: 'Secret', model: 'claude-opus-4-8' }]]),
+      },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL).set(AUTH); // sk-test-app, not admin
+
+    expect(res.status).toBe(403);
+    expect(res.body.agents).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain('claude-opus-4-8');
+  });
+
+  it('S6 (bad case): unauthenticated request is rejected with 401', async () => {
+    const app = buildSessionsApp({
+      [AGENT_ID]: { sessions: [makeHistorySession('sess-1')], metaMap: new Map() },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL);
+
+    expect(res.status).toBe(401);
+  });
+
+  it('S7: an agent with zero sessions returns an empty sessions array (not an error)', async () => {
+    const app = buildSessionsApp({
+      [AGENT_ID]: { sessions: [], metaMap: new Map() },
+    });
+
+    const res = await supertest.default(app).get(SESSIONS_URL).set(ADMIN_AUTH);
+
+    expect(res.status).toBe(200);
+    expect(res.body.agents[0].sessions).toEqual([]);
+  });
+});
+
+describe('isValidSessionId', () => {
+  it('accepts a normal id and a UUID', () => {
+    expect(isValidSessionId('my-session-001')).toBe(true);
+    expect(isValidSessionId('550e8400-e29b-41d4-a716-446655440000')).toBe(true);
+    expect(isValidSessionId('a'.repeat(64))).toBe(true);
+  });
+
+  it('rejects path-traversal, separators, dots, empty, and over-length strings', () => {
+    expect(isValidSessionId('../x')).toBe(false);
+    expect(isValidSessionId('a/b')).toBe(false);
+    expect(isValidSessionId('.')).toBe(false);
+    expect(isValidSessionId('a.jsonl')).toBe(false);
+    expect(isValidSessionId('')).toBe(false);
+    expect(isValidSessionId('a'.repeat(65))).toBe(false);
+    expect(isValidSessionId(123)).toBe(false);
+    expect(isValidSessionId(undefined)).toBe(false);
   });
 });

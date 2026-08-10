@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { AppInstaller, InstallerCallbacks, JobState } from '../../../src/apps/installer';
+import { AppInstaller, InstallerCallbacks, JobState, parseComposePs, mapContainerStatesToAppStatus } from '../../../src/apps/installer';
 import { AppsRegistry } from '../../../src/apps/registry';
 import { RegistryClient } from '../../../src/apps/registry-client';
 import { ComposePort, ComposeSocket } from '../../../src/apps/compose-generator';
@@ -880,6 +880,43 @@ services:
       expect(readEnvFile(entry!.installPath)['APP_SECRET']).toBe('keep-me');
     });
 
+    it('updates an app whose on-disk dir name ≠ app.yaml name (legacy install, issue #275)', async () => {
+      // Legacy installs named the on-disk dir after the source repo basename,
+      // so installPath basename can differ from the app name. The dir-swap must
+      // key off entry.installPath (like the down/rollback steps), not the app
+      // name — otherwise it throws ENOENT renaming a non-existent apps/<name>.
+      const githubUrl = 'https://github.com/test/cc-monitor-appstore';
+      const { state, spawn } = makeGitState('cc-monitor', 5403);
+      const installer = makeInstaller(spawn);
+
+      state.head = 'a'.repeat(40);
+      state.version = '1.0.0';
+      await waitForJob(installer, installer.install({ githubUrl, envVars: { APP_SECRET: 'keep-me' } }), 5000);
+
+      // Simulate the legacy on-disk layout: rename the installed dir to the repo
+      // basename and repoint the registry's installPath at it (dir name ≠ name).
+      const entry = await registry.get('cc-monitor');
+      const legacyDir = path.join(appsDir, 'cc-monitor-appstore');
+      fs.renameSync(entry!.installPath, legacyDir);
+      await registry.upsert({ ...entry!, installPath: legacyDir });
+      expect(fs.existsSync(path.join(appsDir, 'cc-monitor'))).toBe(false);
+
+      // Update must complete end-to-end (previously threw ENOENT at the swap).
+      state.head = 'b'.repeat(40);
+      state.version = '2.0.0';
+      const job = await waitForJob(installer, installer.update('cc-monitor'), 5000);
+      expect(job.status).toBe('completed');
+
+      const after = await registry.get('cc-monitor');
+      expect(after?.commit).toBe('b'.repeat(40));
+      expect(after?.version).toBe('2.0.0');
+      // Registry installPath stays at the real (legacy) directory, still on disk.
+      expect(after?.installPath).toBe(legacyDir);
+      expect(fs.existsSync(legacyDir)).toBe(true);
+      // Secret (and therefore volumes) preserved via the .env copy-forward.
+      expect(readEnvFile(after!.installPath)['APP_SECRET']).toBe('keep-me');
+    });
+
     it('is a no-op when the custom app is already at HEAD', async () => {
       const githubUrl = 'https://github.com/test/steady-app';
       const { state, spawn } = makeGitState('steady-app', 5401);
@@ -1533,6 +1570,172 @@ services:
         /already being installed or updated/,
       );
       await waitForJob(installer, first, 5000);
+    });
+  });
+
+  // ─── reconcileStatus() — sync stored status with the live Docker runtime ────
+
+  describe('reconcileStatus()', () => {
+    /**
+     * An ASYNC spawn mock (reconcile uses the non-blocking spawn seam) that
+     * answers `docker compose ps` with a caller-supplied payload and succeeds
+     * (empty) for everything else. `psStatus` simulates the daemon being
+     * unreachable (non-zero exit).
+     */
+    function psSpawn(psStdout: string, psStatus = 0) {
+      return jest.fn(async (_cmd: string, args: string[], _opts?: object) => {
+        if (args.includes('ps')) {
+          return { stdout: psStdout, stderr: psStatus === 0 ? '' : 'boom', status: psStatus };
+        }
+        return { stdout: '', stderr: '', status: 0 };
+      });
+    }
+
+    const runningPs = JSON.stringify({ State: 'running', ExitCode: 0 });
+    const crashedPs = JSON.stringify({ State: 'exited', ExitCode: 137 });
+
+    it('flips a stale running → stopped when no containers exist (the reported bug)', async () => {
+      await registry.upsert({ ...makeEntryFor('ghost-app', 6001), status: 'running' });
+      const installer = makeInstaller(successSpawn, psSpawn('') /* empty ps = no containers */);
+
+      const reconciled = await installer.reconcileStatus((await registry.get('ghost-app'))!);
+
+      expect(reconciled.status).toBe('stopped');
+      // Persisted, so the next read (and boot restore) see the truth.
+      expect((await registry.get('ghost-app'))?.status).toBe('stopped');
+    });
+
+    it('reports error when a container crashed (exited non-zero)', async () => {
+      await registry.upsert({ ...makeEntryFor('crash-app', 6002), status: 'running' });
+      const installer = makeInstaller(successSpawn, psSpawn(crashedPs));
+
+      const reconciled = await installer.reconcileStatus((await registry.get('crash-app'))!);
+      expect(reconciled.status).toBe('error');
+    });
+
+    it('keeps running when the container is genuinely running', async () => {
+      await registry.upsert({ ...makeEntryFor('live-app', 6003), status: 'running' });
+      const installer = makeInstaller(successSpawn, psSpawn(runningPs));
+
+      const reconciled = await installer.reconcileStatus((await registry.get('live-app'))!);
+      expect(reconciled.status).toBe('running');
+    });
+
+    it('keeps the stored status when Docker cannot be queried (non-zero exit)', async () => {
+      await registry.upsert({ ...makeEntryFor('daemon-down', 6004), status: 'running' });
+      const installer = makeInstaller(successSpawn, psSpawn('', 1) /* daemon unreachable */);
+
+      const reconciled = await installer.reconcileStatus((await registry.get('daemon-down'))!);
+      expect(reconciled.status).toBe('running'); // no false "stopped"
+    });
+
+    it('keeps the stored status when the ps query rejects (timeout)', async () => {
+      await registry.upsert({ ...makeEntryFor('hung-app', 6008), status: 'running' });
+      const rejectingSpawn = jest.fn(async (_cmd: string, args: string[]) => {
+        if (args.includes('ps')) throw new Error('spawn timed out');
+        return { stdout: '', stderr: '', status: 0 };
+      });
+      const installer = makeInstaller(successSpawn, rejectingSpawn);
+
+      const reconciled = await installer.reconcileStatus((await registry.get('hung-app'))!);
+      expect(reconciled.status).toBe('running'); // rejection swallowed, no false flip
+    });
+
+    it('still returns the corrected status when the persist write fails', async () => {
+      await registry.upsert({ ...makeEntryFor('persist-fail', 6009), status: 'running' });
+      const installer = makeInstaller(successSpawn, psSpawn('') /* no containers */);
+      // Simulate a registry lock/write failure on persist.
+      jest.spyOn(registry, 'updateStatus').mockRejectedValueOnce(new Error('lock timeout'));
+
+      const reconciled = await installer.reconcileStatus((await registry.get('persist-fail'))!);
+      // Read is still corrected in-memory even though the write failed —
+      // reconcileStatus must never reject and 500 the whole list.
+      expect(reconciled.status).toBe('stopped');
+    });
+
+    it('does not reconcile an app in the building state (in-flight install)', async () => {
+      await registry.upsert({ ...makeEntryFor('installing-app', 6005), status: 'building' });
+      const spawn = psSpawn('');
+      const installer = makeInstaller(successSpawn, spawn);
+
+      const reconciled = await installer.reconcileStatus((await registry.get('installing-app'))!);
+      expect(reconciled.status).toBe('building');
+      // ps must not even be queried while building.
+      const psCalls = spawn.mock.calls.filter((c) => (c[1] as string[]).includes('ps'));
+      expect(psCalls).toHaveLength(0);
+    });
+
+    it('reconcileStatuses() maps a mixed list in one pass', async () => {
+      await registry.upsert({ ...makeEntryFor('mixed-live', 6006), status: 'running' });
+      await registry.upsert({ ...makeEntryFor('mixed-dead', 6007), status: 'running' });
+      // Route ps by cwd (installPath differs per app: /tmp/<name>).
+      const spawn = jest.fn(async (_cmd: string, args: string[], opts?: { cwd?: string }) => {
+        if (args.includes('ps')) {
+          const stdout = opts?.cwd?.endsWith('mixed-live') ? runningPs : '';
+          return { stdout, stderr: '', status: 0 };
+        }
+        return { stdout: '', stderr: '', status: 0 };
+      });
+      const installer = makeInstaller(successSpawn, spawn as unknown as typeof successAsyncSpawn);
+
+      const list = await registry.list();
+      const reconciled = await installer.reconcileStatuses(list);
+      const byName = Object.fromEntries(reconciled.map((e) => [e.name, e.status]));
+      expect(byName['mixed-live']).toBe('running');
+      expect(byName['mixed-dead']).toBe('stopped');
+    });
+  });
+
+  // ─── parseComposePs() / mapContainerStatesToAppStatus() — pure helpers ──────
+
+  describe('compose ps parsing + status mapping', () => {
+    it('parses newline-delimited JSON objects (current compose)', () => {
+      const ndjson = [
+        JSON.stringify({ State: 'running', ExitCode: 0 }),
+        JSON.stringify({ State: 'exited', ExitCode: 0 }),
+      ].join('\n');
+      const parsed = parseComposePs(ndjson);
+      expect(parsed).toEqual([
+        { state: 'running', exitCode: 0 },
+        { state: 'exited', exitCode: 0 },
+      ]);
+    });
+
+    it('parses a single JSON array (older compose)', () => {
+      const arr = JSON.stringify([
+        { State: 'Running', ExitCode: 0 },
+        { State: 'Dead', ExitCode: 0 },
+      ]);
+      const parsed = parseComposePs(arr);
+      expect(parsed).toEqual([
+        { state: 'running', exitCode: 0 },
+        { state: 'dead', exitCode: 0 },
+      ]);
+    });
+
+    it('returns [] for empty output and skips malformed lines', () => {
+      expect(parseComposePs('')).toEqual([]);
+      expect(parseComposePs('   \n  ')).toEqual([]);
+      expect(parseComposePs('{not json}\n' + JSON.stringify({ State: 'running' }))).toEqual([
+        { state: 'running', exitCode: 0 },
+      ]);
+    });
+
+    it('maps aggregate states to the right app status', () => {
+      expect(mapContainerStatesToAppStatus([])).toBe('stopped');
+      expect(mapContainerStatesToAppStatus([{ state: 'running', exitCode: 0 }])).toBe('running');
+      expect(mapContainerStatesToAppStatus([{ state: 'restarting', exitCode: 0 }])).toBe('running');
+      // running wins even when a sibling has exited.
+      expect(
+        mapContainerStatesToAppStatus([
+          { state: 'exited', exitCode: 0 },
+          { state: 'running', exitCode: 0 },
+        ]),
+      ).toBe('running');
+      expect(mapContainerStatesToAppStatus([{ state: 'exited', exitCode: 137 }])).toBe('error');
+      expect(mapContainerStatesToAppStatus([{ state: 'dead', exitCode: 0 }])).toBe('error');
+      expect(mapContainerStatesToAppStatus([{ state: 'exited', exitCode: 0 }])).toBe('stopped');
+      expect(mapContainerStatesToAppStatus([{ state: 'created', exitCode: 0 }])).toBe('stopped');
     });
   });
 });

@@ -194,6 +194,24 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | `POST` | `/api/v1/agents/:agentId/media` | Key | Upload a media file (image/* or PDF) — returns `mediaPath` |
 | `GET` | `/api/v1/agents/:agentId/media/*` | Key | Serve a media file by path |
 
+### Image Share Bridge API
+
+Short-lived public image shares + private image artifacts (enabled only when
+`gateway.publicUrl` is set). A token IS the capability — only its SHA-256 hash is
+stored, and shares are unenumerable (there is no list endpoint by design).
+**Phase-1 supports raster images only (PNG / JPEG / WebP);** any other type is
+rejected with `415 unsupported_image_type` at both mint and fetch time. `agent_id`
+and `session_id` must be valid identifiers (same charset as elsewhere) or the
+request is `400` before any path resolution.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/api/v1/shares` | Key (agent-scoped) | Mint one or more shares for artifact refs / media paths → `{ items: [{ share_id, token, url?, expires_at }] }` (order preserved; TTL 10s–24h, default 30 min; idempotent within a 60s window). `token` is a host-agnostic capability and is always present; `url` is a convenience built from `gateway.publicUrl` and is omitted when that is unset — callers with their own public base (e.g. LINE) build `<base>/shared/<token>` themselves |
+| `DELETE` | `/api/v1/shares/:shareId` | Key (owner/admin) | Revoke a share (uniform `404` when the key can't access the owner) |
+| `POST` | `/api/v1/image-artifacts` | Key (agent-scoped) | Register generated images as private artifacts (registration never makes a file public) |
+| `GET` | `/api/v1/image-catalog?agent_id=&session_id=` | Key (agent-scoped) | Deterministic per-session image list (oldest first); mints nothing, returns no token |
+| `GET`/`HEAD` | `/shared/:token` | None (token IS the capability) | Stream a shared image inline; uniform `404` for unknown/expired/revoked/traversal; per-IP rate limited. This is the single public share primitive — the gateway, MCP subprocesses, and LINE image delivery all mint through `/api/v1/shares` and serve here |
+
 ### PTY Shell API
 
 Available only for agents running in wrap-shell (PTY) mode (`gateway.headless: false`).
@@ -1262,6 +1280,7 @@ curl -X POST \
 > - `session_id` is optional — omit for a stateless one-shot call
 > - Sessions idle-timeout after `idleTimeoutMinutes` (default 30 min); history is restored automatically on next message
 > - Error 409 = session is currently processing a request — wait and retry
+> - After a soft timeout (504), the same `session_id` keeps returning `409` until the hard cap (a further 10 min) — the subprocess is still finishing that turn, so a retry would interleave. Use a new `session_id` to start immediately.
 
 ---
 
@@ -2375,7 +2394,8 @@ curl -H "X-Api-Key: admin-key-456" \
           "lastActivity": 1775823600000,
           "lastMessage": "Sure, I can help with that!",
           "sessionName": "Project Planning",
-          "imageConfig": { "model": "openai/gpt-image-1", "quality": "medium" }
+          "imageConfig": { "model": "openai/gpt-image-1", "quality": "medium" },
+          "model": "claude-opus-4-8"
         }
       ]
     }
@@ -2396,6 +2416,7 @@ curl -H "X-Api-Key: admin-key-456" \
 | `lastMessage` | string\|null | Preview of the last message content |
 | `sessionName` | string\|null | Human-readable session name (set via `/rename` or `POST /sessions`) |
 | `imageConfig` | object\|null | Last `image_params` sent for this session (composer image-generation options); `null` when none set. Lets a web client restore the composer selection on reload. |
+| `model` | string\|null | Real Claude model that produced the session's latest turn, captured from the stream and updated every turn (so a mid-session `/model` switch is reflected). `null` for legacy sessions recorded before this was tracked, or when no turn has run yet. |
 
 **Error responses:**
 
@@ -2784,6 +2805,8 @@ curl -H "X-Api-Key: my-key" http://localhost:10850/api/v1/apps | jq
 ```
 
 **`status` values:** `running` | `stopped` | `error` | `building`
+
+> **Live status:** `GET /api/v1/apps` and `GET /api/v1/apps/:name` reconcile the stored status against the live Docker runtime (`docker compose ps`) on read, so a container that crashed, was OOM-killed, or was stopped from outside the gateway reports `stopped`/`error` rather than a stale `running`. `running`/`restarting` containers → `running`; a non-zero exit or `dead` container → `error`; no containers or a clean exit → `stopped`. If Docker cannot be queried (daemon down, compose file missing) the last stored status is returned unchanged, and an app mid-install (`building`) is not reconciled.
 
 **`source` values:** `registry` | `custom` | `local`
 
