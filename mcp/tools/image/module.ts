@@ -878,6 +878,14 @@ const imageToolDefs: McpToolDefinition[] = [
       'attach it with your reply tool and answer in one or two short sentences. Every extra step risks pushing ' +
       'the request past its timeout. ' +
       'action="status" polls a previously returned task_id. ' +
+      'PATIENCE: image generation can legitimately take several minutes — a "running" status (including the ' +
+      '"still generating, call again with action=status" note you get back when the local poll budget runs out) ' +
+      'is normal, not stuck. Keep calling action="status" with the SAME task_id until it resolves to done/failed. ' +
+      'Do NOT submit a new action="generate" call (on the same or a different model) for the same request while ' +
+      'an earlier task_id for it is still running — the earlier job may finish moments later, and you will have ' +
+      'generated and charged for the image twice while delivering only one. If you are genuinely considering ' +
+      'giving up after a long wait, say so to the user first in a normal reply and let them decide, instead of ' +
+      'silently abandoning the task_id and starting over. ' +
       'action="list" returns every available image model with its supported_qualities, supported_sizes, cost, and ' +
       'the capability flags supports_image_ref (image-to-image / edit) and supports_style_ref. Call it FIRST when ' +
       'choosing a model or when you need to know what a provider can do — you are NOT limited to the composer ' +
