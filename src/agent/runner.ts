@@ -71,6 +71,11 @@ const MAX_API_IMAGES = 5;
  *  CLI turn is still producing a result that must reach history, exactly like
  *  the client-disconnect path. This cap bounds a genuinely hung turn. */
 const API_TIMEOUT_HARD_CAP_EXTRA_MS = 600_000;
+// Bound on getOrSpawnSession's wait for a crash-triggered auto-restart to land
+// (session/process.ts's AUTO_RESTART_DELAY_MS is 5s, plus real CLI spawn time
+// observed up to a few seconds more) — generous, but must not be the long
+// API_TIMEOUT_HARD_CAP_EXTRA_MS chain: this is a pre-turn gap, not a turn.
+const SESSION_RESTART_WAIT_TIMEOUT_MS = 20_000;
 // Hard timeout for the one-shot local `claude -p` triage during recovery
 // (Epic #195, Phase 3b). A slow/hung triage collapses to a safe notify-only.
 const RECOVERY_TRIAGE_TIMEOUT_MS = 15_000;
@@ -1246,6 +1251,37 @@ export class AgentRunner extends EventEmitter {
     );
   }
 
+  /**
+   * Await a SessionProcess's in-flight crash-triggered auto-restart
+   * (scheduleRestart's setTimeout → spawnProcess) instead of handing back a
+   * process whose sendMessage() will silently no-op. Resolves once the new
+   * child is attached ('restarted'); rejects on a definitive restart failure
+   * ('restartFailed', or 'failed' once MAX_RESTARTS is exhausted) or, as a
+   * last resort, on SESSION_RESTART_WAIT_TIMEOUT_MS so a caller is never left
+   * hanging past that bound.
+   */
+  private waitForSessionRestart(proc: SessionProcess): Promise<void> {
+    if (proc.isRunning()) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('Session restart did not complete in time'));
+      }, SESSION_RESTART_WAIT_TIMEOUT_MS);
+      const onRestarted = () => { cleanup(); resolve(); };
+      const onRestartFailed = (err: Error) => { cleanup(); reject(err); };
+      const onFailed = () => { cleanup(); reject(new Error('Session failed permanently (max restarts exceeded)')); };
+      const cleanup = () => {
+        clearTimeout(timer);
+        proc.off('restarted', onRestarted);
+        proc.off('restartFailed', onRestartFailed);
+        proc.off('failed', onFailed);
+      };
+      proc.once('restarted', onRestarted);
+      proc.once('restartFailed', onRestartFailed);
+      proc.once('failed', onFailed);
+    });
+  }
+
   private async getOrSpawnSession(
     mapKey: string,              // Map lookup key (chatId for telegram/discord, sessionId for API)
     source: 'telegram' | 'discord' | 'line' | 'api',
@@ -1265,6 +1301,19 @@ export class AgentRunner extends EventEmitter {
 
     const existing = this.sessions.get(mapKey);
     if (existing) {
+      // The mapped SessionProcess can be mid auto-restart (its child crashed —
+      // see the 'exit'/scheduleRestart cycle in session/process.ts — and the
+      // AUTO_RESTART_DELAY_MS timer hasn't fired the replacement child yet).
+      // existing.sendMessage() silently no-ops while .process is null (only a
+      // warning log, no error, no event), which previously left the caller's
+      // pendingApiSessions entry stuck until the long timeout chain (the same
+      // failure mode this whole area was already patched for — see the
+      // session.on('exit', onExit) fix in sendApiMessage/sendApiMessageStream —
+      // but THIS gap is hit before a turn even starts, so that fix can't see
+      // it). Wait for the pending respawn to actually land before handing the
+      // session back.
+      if (!existing.isRunning()) await this.waitForSessionRestart(existing);
+
       // Restart if model changed (including switching back to the agent default)
       if (existing.modelOverride !== effectiveOverride) {
         this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: effectiveOverride ?? agentDefaultModel });
@@ -2654,8 +2703,13 @@ export class AgentRunner extends EventEmitter {
       let quietTimer: ReturnType<typeof setTimeout> | undefined;
       // Track partial message text for delta computation (--include-partial-messages)
       let lastPartialText = '';
+      // Guards done/fail against a double-fire — e.g. onExit racing a 'result'
+      // line that already settled this turn (see onExit below).
+      let settled = false;
 
       const done = (result: string) => {
+        if (settled) return;
+        settled = true;
         cleanup();
         const attachments = this.popApiAttachments(sessionId);
         // Persist assistant reply. Image-only replies (empty text but attachments
@@ -2683,6 +2737,8 @@ export class AgentRunner extends EventEmitter {
       };
 
       const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
         // Terminal close for a turn that produced no result (#75): record it so
         // history does not end on a dangling user message, and drain the
         // attachment buffer so nothing leaks into the next turn.
@@ -2691,11 +2747,23 @@ export class AgentRunner extends EventEmitter {
         reject(err); // no-op when the soft timeout already rejected
       };
 
+      // The subprocess died without ever emitting a final `result` line (crash,
+      // an unexpected signal — distinct from a graceful /stop, whose SIGINT
+      // handler still emits a terminal result before exiting, so `done()` wins
+      // that race and this is a no-op). Without this, a mid-turn crash left
+      // pendingApiSessions — and the caller's pending-response spinner — stuck
+      // until the up-to-15-minute opts.timeoutMs + API_TIMEOUT_HARD_CAP_EXTRA_MS
+      // safety net finally fired.
+      const onExit = () => {
+        fail(Object.assign(new Error('Session process exited unexpectedly before responding.'), { code: 'PROCESS_EXITED' }));
+      };
+
       const cleanup = () => {
         clearTimeout(globalTimer);
         if (hardCapTimer) clearTimeout(hardCapTimer);
         if (quietTimer) clearTimeout(quietTimer);
         session.off('output', onOutput);
+        session.off('exit', onExit);
         this.pendingApiSessions.delete(sessionId);
       };
 
@@ -2761,6 +2829,7 @@ export class AgentRunner extends EventEmitter {
       }, opts.timeoutMs);
 
       session.on('output', onOutput);
+      session.on('exit', onExit);
       session.setProcessing(true);
       session.sendMessage(channelXml);
       // Do NOT call resetQuiet() here — the quiet timer should only start
@@ -2904,10 +2973,22 @@ export class AgentRunner extends EventEmitter {
       notifyError(err);
     };
 
+    // The subprocess died without ever emitting a final `result` line (crash,
+    // an unexpected signal — distinct from a graceful /stop, whose SIGINT
+    // handler still emits a terminal result before exiting, so `done()` wins
+    // that race and this is a no-op via the `settled` guard in fail()).
+    // Without this, a mid-turn crash left pendingApiSessions — and the web's
+    // pending-response spinner — stuck until the up-to-15-minute
+    // opts.timeoutMs + API_TIMEOUT_HARD_CAP_EXTRA_MS safety net finally fired.
+    const onExit = () => {
+      fail(Object.assign(new Error('Session process exited unexpectedly before responding.'), { code: 'PROCESS_EXITED' }));
+    };
+
     const cleanup = () => {
       clearTimeout(globalTimer);
       if (hardCapTimer) clearTimeout(hardCapTimer);
       session.off('output', onOutput);
+      session.off('exit', onExit);
       this.pendingApiSessions.delete(sessionId);
     };
 
@@ -3010,6 +3091,7 @@ export class AgentRunner extends EventEmitter {
     }, opts.timeoutMs);
 
     session.on('output', onOutput);
+    session.on('exit', onExit);
 
     // Image paths only work when allowTools:true — Claude needs the Read tool to access them
     const allowToolsStream = opts.allowTools ?? false;
