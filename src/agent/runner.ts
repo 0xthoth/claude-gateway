@@ -12,6 +12,7 @@ import { SessionCompactor } from '../session/compactor';
 import { TelegramReceiver } from '../telegram/receiver';
 import { DiscordReceiver } from '../discord/receiver';
 import { LineReplyManager } from './line-reply-manager';
+import { SlackClient } from '../api/slack-client';
 import { hasMarkdown, toTelegramHtml } from '../telegram/markdown';
 import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
 import { isBuiltinCommand } from './builtin-commands';
@@ -180,6 +181,11 @@ export class AgentRunner extends EventEmitter {
   private discordReceiver: DiscordReceiver | null = null;
   // LINE slow-LLM postback button manager (null when LINE disabled or threshold=0).
   private lineReply: LineReplyManager | null = null;
+  // Slack has no reply-token TTL to work around (see the plan's "no reply-manager
+  // needed" note), so unlike LINE this is a plain client, not a stateful manager —
+  // it exists only so writeAutoForward's fallback/command-reply path (below) has
+  // somewhere to actually deliver Slack messages instead of silently dropping them.
+  private slackOutbound: SlackClient | null = null;
   private readonly sessionStore: SessionStore;
   private readonly idleTimeoutMs: number;
   private readonly maxConcurrent: number;
@@ -1219,7 +1225,10 @@ export class AgentRunner extends EventEmitter {
       'attachment_name',
       'user_id',     // LINE: the userId the session passes back to line_reply
       'reply_token', // LINE: single-use reply token (push is preferred; surfaced for completeness)
-      'message_id',  // Slack: the inbound message ts, passed back to slack_reply so it can clear the ack-reaction it left
+      'thread_ts',   // Slack: set when the inbound message is inside a thread — pass back as thread_id to slack_reply to reply in-thread
+      // NOTE: message_id is NOT listed here — the base <channel> template below
+      // already unconditionally emits it; adding it here would duplicate the
+      // attribute in the XML whenever meta.message_id is set (any channel).
     ]
       .filter(k => meta[k])
       .map(k => ` ${k}="${meta[k]!.replace(/"/g, '&quot;')}"`)
@@ -1675,7 +1684,14 @@ export class AgentRunner extends EventEmitter {
               // button when slow) instead of writeAutoForward.
               if (channelSrcForResult === 'line' && this.lineReply) {
                 void this.lineReply.onAnswer(mapKey, text);
-              } else if (channelSrcForResult !== 'discord' && hasMarkdown(text)) {
+              } else if (
+                channelSrcForResult !== 'discord' &&
+                channelSrcForResult !== 'slack' &&
+                hasMarkdown(text)
+              ) {
+                // Telegram HTML entities — Slack has its own mrkdwn format and
+                // would display these tags literally, so Slack skips this and
+                // falls through to the plain-text branch below.
                 this.writeAutoForward(mapKey, toTelegramHtml(text), 'html');
               } else {
                 this.writeAutoForward(mapKey, text);
@@ -2292,6 +2308,22 @@ export class AgentRunner extends EventEmitter {
       if (this.lineReply) void this.lineReply.onAnswer(chatId, text);
       return;
     }
+    // Slack likewise has no .forward consumer (only Telegram/Discord receivers
+    // poll that directory) — post directly via the outbound client instead.
+    // Without this branch every command reply (/stop, /rename, /sessions,
+    // /compact), the Anthropic-socket-drop notice, and the plain-text
+    // assistant-fallback path (no tool call) silently vanished for Slack.
+    if (this.channelFor(chatId) === 'slack') {
+      if (this.slackOutbound) {
+        void this.slackOutbound.postMessage(chatId, text).catch((err: unknown) => {
+          this.logger.warn('Slack auto-forward failed', {
+            chatId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+      return;
+    }
     const typingDir = this.getTypingDir(chatId);
     try {
       fs.mkdirSync(typingDir, { recursive: true });
@@ -2358,6 +2390,7 @@ export class AgentRunner extends EventEmitter {
     // Enabled for any LINE agent unless its threshold is 0 (then the MCP
     // line_reply tool keeps the plain reply-first → push-fallback path).
     this.startLineReply();
+    this.startSlackOutbound();
     this.startIdleCleaner();
     this._startCleanupScheduler();
     this.logger.info('AgentRunner started', { agentId: this.agentConfig.id });
@@ -2369,6 +2402,23 @@ export class AgentRunner extends EventEmitter {
     // picks up a new access token, threshold, or labels without a full restart.
     this.stopLineReply();
     this.startLineReply();
+    // Slack token/secret may have changed (or been cleared) — rebuild to pick
+    // it up, same reasoning as LineReplyManager above.
+    this.stopSlackOutbound();
+    this.startSlackOutbound();
+  }
+
+  startSlackOutbound(): void {
+    if (!this.agentConfig.slack?.botToken || !this.agentConfig.slack?.signingSecret) return;
+    if (this.slackOutbound) return; // already running
+    this.slackOutbound = new SlackClient({
+      botToken: this.agentConfig.slack.botToken,
+      logDir: this.gatewayConfig.gateway.logDir,
+    });
+  }
+
+  stopSlackOutbound(): void {
+    this.slackOutbound = null;
   }
 
   startLineReply(): void {
@@ -3197,8 +3247,9 @@ export class AgentRunner extends EventEmitter {
     //
     // skipPersist (wire param store_user_message=false) suppresses BOTH the user command and
     // the assistant reply: programmatic REST callers leave no trace in chat history at all.
-    const persist = (role: 'user' | 'assistant', content: string) => {
-      if (skipPersist || !content) return;
+    // `force` overrides that for notes that must stay visible regardless (see /stop below).
+    const persist = (role: 'user' | 'assistant', content: string, force = false) => {
+      if ((skipPersist && !force) || !content) return;
       this.historyDb.insertMessage({ chatId: dbChatId, sessionId, source: 'api', role, content, ts: Date.now() });
     };
 
@@ -3210,6 +3261,7 @@ export class AgentRunner extends EventEmitter {
 
     let result: Record<string, unknown>;
     let responseText: string;
+    let forcePersist = false;
     try {
       if (cmd === '/model') {
         const model = this.agentConfig.claude.model;
@@ -3222,7 +3274,14 @@ export class AgentRunner extends EventEmitter {
         const session = this.sessions.get(sessionId);
         const stopped = session ? session.interrupt() : false;
         result = { stopped };
-        responseText = stopped ? 'Session interrupted.' : 'No active session to stop.';
+        responseText = stopped
+          ? 'Session was interrupted before I could respond.'
+          : 'No active session to stop.';
+        // A turn was actually cut off — always leave a visible note in history so the
+        // web Stop button (skipPersist:true, to suppress the "/stop" command echo) and
+        // a typed /stop command show the same outcome instead of the button leaving a
+        // silently-dangling user turn.
+        forcePersist = stopped;
       } else if (cmd === '/restart') {
         this.restartProcess(sessionId).catch(() => {});
         result = { restarting: true };
@@ -3325,7 +3384,8 @@ export class AgentRunner extends EventEmitter {
 
     // Persist the human-readable response as an assistant turn so the conversation ends with
     // an assistant message (the web's computeIsPendingResponse needs last.role !== 'user').
-    persist('assistant', responseText);
+    // forcePersist writes it even under skipPersist (set only when /stop cut a turn off).
+    persist('assistant', responseText, forcePersist);
 
     return { result, responseText };
   }
