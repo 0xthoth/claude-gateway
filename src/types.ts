@@ -128,6 +128,32 @@ export interface AgentConfig {
      */
     pairing?: boolean;
   };
+  sms?: {
+    /** Twilio Account SID ("AC"+32hex) — identifies the Twilio account. */
+    accountSid: string;
+    /** Twilio Auth Token — used for X-Twilio-Signature verification and REST Basic Auth. */
+    authToken: string;
+    /** Sending number, E.164 (e.g. "+15551234567"). */
+    fromNumber: string;
+    /**
+     * DM access policy (mirrors `slack.dmPolicy`/`line.dmPolicy` exactly —
+     * same 3 states, same closed-by-default posture). SMS has no group/room
+     * concept, so unlike line/slack there is no groupPolicy counterpart —
+     * every inbound message is a 1:1 conversation gated by this alone.
+     */
+    dmPolicy?: 'open' | 'allowlist' | 'disabled';
+    /** Allowed sender numbers, E.164. */
+    dmAllowlist?: string[];
+    /**
+     * Pairing aid for the allowlist (mirrors `slack.pairing`/`line.pairing`
+     * exactly). When on, an un-allowlisted sender gets a one-time visual-match
+     * pairing code texted back to them, and the same code shows in the UI
+     * "pending" row so an admin can visually match it before clicking "+ Add".
+     * Default true (absent ⇒ on). Only has an effect under `allowlist`
+     * (closed-default).
+     */
+    pairing?: boolean;
+  };
   claude: {
     model: string;
     /** @deprecated --dangerously-skip-permissions is always passed now; this field is ignored. */

@@ -85,6 +85,7 @@ const STATE_SUBDIR: Record<ChatChannel, string> = {
   discord: '.discord-state',
   line: '.line-state',
   slack: '.slack-state',
+  sms: '.sms-state',
 };
 
 export class SessionProcess extends EventEmitter {
@@ -427,6 +428,11 @@ export class SessionProcess extends EventEmitter {
             // to work around), so no refresh-mode env is needed — the subprocess
             // always sends directly.
             SLACK_BOT_TOKEN: this.agentConfig.slack?.botToken ?? '',
+            // SMS outbound: sms_reply sends via Twilio's REST Messages API, same
+            // "no reply-token TTL, subprocess always sends directly" posture as Slack.
+            SMS_ACCOUNT_SID: this.agentConfig.sms?.accountSid ?? '',
+            SMS_AUTH_TOKEN: this.agentConfig.sms?.authToken ?? '',
+            SMS_FROM_NUMBER: this.agentConfig.sms?.fromNumber ?? '',
             GATEWAY_AGENT_ID: this.agentConfig.id,
             // Must be the base URL without /api suffix (e.g. http://127.0.0.1:10850).
             // MCP tools append /api/v1/... themselves — a trailing /api here causes double-prefix 404s.

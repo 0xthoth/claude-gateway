@@ -13,6 +13,7 @@ import { TelegramReceiver } from '../telegram/receiver';
 import { DiscordReceiver } from '../discord/receiver';
 import { LineReplyManager } from './line-reply-manager';
 import { SlackClient } from '../api/slack-client';
+import { SmsClient } from '../api/sms-client';
 import { hasMarkdown, normalizeTelegramLineBreaks, toTelegramHtml, containsTelegramHtml } from '../telegram/markdown';
 import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
 import { isBuiltinCommand } from './builtin-commands';
@@ -204,6 +205,9 @@ export class AgentRunner extends EventEmitter {
   // it exists only so writeAutoForward's fallback/command-reply path (below) has
   // somewhere to actually deliver Slack messages instead of silently dropping them.
   private slackOutbound: SlackClient | null = null;
+  // Same reasoning as slackOutbound above — SMS (Twilio) has no reply-token
+  // TTL either, so a plain client is enough for writeAutoForward's fallback path.
+  private smsOutbound: SmsClient | null = null;
   private readonly sessionStore: SessionStore;
   private readonly idleTimeoutMs: number;
   private readonly maxConcurrent: number;
@@ -429,7 +433,9 @@ export class AgentRunner extends EventEmitter {
               ? 'line'
               : meta['source'] === 'slack'
                 ? 'slack'
-                : 'telegram') as ChatChannel;
+                : meta['source'] === 'sms'
+                  ? 'sms'
+                  : 'telegram') as ChatChannel;
           this.channelSourceMap.set(chatId, channelSource);
 
           // Slack: remember the current message's thread context so the
@@ -1539,7 +1545,9 @@ export class AgentRunner extends EventEmitter {
             ? 'mcp__gateway__line_reply'
             : source === 'slack'
               ? 'mcp__gateway__slack_reply'
-              : 'mcp__gateway__telegram_reply';
+              : source === 'sms'
+                ? 'mcp__gateway__sms_reply'
+                : 'mcp__gateway__telegram_reply';
 
       proc.on('output', (line: string) => {
         try {
@@ -1810,11 +1818,13 @@ export class AgentRunner extends EventEmitter {
               } else if (
                 channelSrcForResult !== 'discord' &&
                 channelSrcForResult !== 'slack' &&
+                channelSrcForResult !== 'sms' &&
                 (hasMarkdown(channelText) || containsTelegramHtml(channelText))
               ) {
                 // Telegram HTML entities — Slack has its own mrkdwn format and
                 // would display these tags literally, so Slack skips this and
-                // falls through to the plain-text branch below.
+                // falls through to the plain-text branch below. SMS is plain
+                // text only (no markup at all), same reasoning.
                 this.writeAutoForward(mapKey, toTelegramHtml(channelText), 'html');
               } else {
                 this.writeAutoForward(mapKey, channelText);
@@ -2487,6 +2497,19 @@ export class AgentRunner extends EventEmitter {
       }
       return;
     }
+    // SMS likewise has no .forward consumer and no reply-token TTL — same
+    // posture as Slack above, minus threading (SMS has no threads).
+    if (this.channelFor(chatId) === 'sms') {
+      if (this.smsOutbound) {
+        void this.smsOutbound.sendMessage(chatId, text).catch((err: unknown) => {
+          this.logger.warn('SMS auto-forward failed', {
+            chatId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+      return;
+    }
     const typingDir = this.getTypingDir(chatId);
     try {
       fs.mkdirSync(typingDir, { recursive: true });
@@ -2554,6 +2577,7 @@ export class AgentRunner extends EventEmitter {
     // line_reply tool keeps the plain reply-first → push-fallback path).
     this.startLineReply();
     this.startSlackOutbound();
+    this.startSmsOutbound();
     this.startIdleCleaner();
     this._startCleanupScheduler();
     this.logger.info('AgentRunner started', { agentId: this.agentConfig.id });
@@ -2569,6 +2593,10 @@ export class AgentRunner extends EventEmitter {
     // it up, same reasoning as LineReplyManager above.
     this.stopSlackOutbound();
     this.startSlackOutbound();
+    // SMS credentials may have changed (or been cleared) — rebuild to pick it
+    // up, same reasoning as Slack above.
+    this.stopSmsOutbound();
+    this.startSmsOutbound();
   }
 
   startSlackOutbound(): void {
@@ -2582,6 +2610,22 @@ export class AgentRunner extends EventEmitter {
 
   stopSlackOutbound(): void {
     this.slackOutbound = null;
+  }
+
+  startSmsOutbound(): void {
+    const sms = this.agentConfig.sms;
+    if (!sms?.accountSid || !sms?.authToken || !sms?.fromNumber) return;
+    if (this.smsOutbound) return; // already running
+    this.smsOutbound = new SmsClient({
+      accountSid: sms.accountSid,
+      authToken: sms.authToken,
+      fromNumber: sms.fromNumber,
+      logDir: this.gatewayConfig.gateway.logDir,
+    });
+  }
+
+  stopSmsOutbound(): void {
+    this.smsOutbound = null;
   }
 
   startLineReply(): void {
