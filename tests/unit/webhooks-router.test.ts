@@ -63,6 +63,22 @@ describe('webhooks dispatcher', () => {
     expect(res.body.error).toContain('no Slack-enabled agent');
   });
 
+  it('routes GET /webhooks/sms to the SMS verify handler (200 ok)', async () => {
+    const res = await supertest.default(makeApp()).get('/webhooks/sms');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  it('dispatches POST /webhooks/sms to the SMS handler (404 when no SMS agent)', async () => {
+    const res = await supertest.default(makeApp())
+      .post('/webhooks/sms')
+      .set('Content-Type', 'application/x-www-form-urlencoded')
+      .send('From=%2B15551234567&Body=hi&MessageSid=SM123');
+    // Reaches the SMS handler, which resolves no SMS-enabled agent.
+    expect(res.status).toBe(404);
+    expect(res.body.error).toContain('no SMS-enabled agent');
+  });
+
   // `app` is attacker-controlled (`:app` path segment, no auth on this zone). A
   // plain-object lookup with no own-property guard would resolve these to a
   // truthy prototype-chain value instead of undefined, bypassing the 404 below

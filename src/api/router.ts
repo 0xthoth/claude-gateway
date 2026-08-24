@@ -622,6 +622,17 @@ export function createApiRouter(
         slack_group_allowlist: cfg.slack?.signingSecret ? (cfg.slack?.groupAllowlist ?? []) : null,
         slack_require_mention: cfg.slack?.signingSecret ? (cfg.slack?.requireMention ?? null) : null,
         slack_pairing: cfg.slack?.signingSecret ? (cfg.slack?.pairing ?? true) : null,
+        // SMS (Twilio) — same dmPolicy/pairing shape as LINE/Slack above, gated
+        // on authToken presence. No group tier: a phone number has no "group".
+        sms_connected: !!cfg.sms?.authToken,
+        sms_token_preview: cfg.sms?.accountSid ? maskToken(cfg.sms.accountSid) : null,
+        // Not a secret (a Twilio number is meant to be publicly dialable/textable) —
+        // shown as-is, not masked, so the UI can display which number is connected.
+        sms_from_number: cfg.sms?.authToken ? (cfg.sms?.fromNumber ?? null) : null,
+        sms_webhook_path: cfg.sms?.authToken ? `/webhooks/sms/${id}` : null,
+        sms_dm_policy: cfg.sms?.authToken ? (cfg.sms?.dmPolicy ?? null) : null,
+        sms_dm_allowlist: cfg.sms?.authToken ? (cfg.sms?.dmAllowlist ?? []) : null,
+        sms_pairing: cfg.sms?.authToken ? (cfg.sms?.pairing ?? true) : null,
       }));
     res.json({ agents });
   });
@@ -1337,8 +1348,8 @@ export function createApiRouter(
       return;
     }
 
-    const body = req.body as { name?: unknown; description?: unknown; model?: unknown; allow_tools?: unknown; telegram_bot_token?: unknown; discord_bot_token?: unknown; line_channel_access_token?: unknown; line_channel_secret?: unknown; line_dm_policy?: unknown; line_dm_allowlist?: unknown; line_group_policy?: unknown; line_group_allowlist?: unknown; line_require_mention?: unknown; line_pairing?: unknown; slack_bot_token?: unknown; slack_signing_secret?: unknown; slack_dm_policy?: unknown; slack_dm_allowlist?: unknown; slack_group_policy?: unknown; slack_group_allowlist?: unknown; slack_require_mention?: unknown; slack_pairing?: unknown };
-    const { name, description, model, allow_tools, telegram_bot_token, discord_bot_token, line_channel_access_token, line_channel_secret, line_dm_policy, line_dm_allowlist, line_group_policy, line_group_allowlist, line_require_mention, line_pairing, slack_bot_token, slack_signing_secret, slack_dm_policy, slack_dm_allowlist, slack_group_policy, slack_group_allowlist, slack_require_mention, slack_pairing } = body;
+    const body = req.body as { name?: unknown; description?: unknown; model?: unknown; allow_tools?: unknown; telegram_bot_token?: unknown; discord_bot_token?: unknown; line_channel_access_token?: unknown; line_channel_secret?: unknown; line_dm_policy?: unknown; line_dm_allowlist?: unknown; line_group_policy?: unknown; line_group_allowlist?: unknown; line_require_mention?: unknown; line_pairing?: unknown; slack_bot_token?: unknown; slack_signing_secret?: unknown; slack_dm_policy?: unknown; slack_dm_allowlist?: unknown; slack_group_policy?: unknown; slack_group_allowlist?: unknown; slack_require_mention?: unknown; slack_pairing?: unknown; sms_account_sid?: unknown; sms_auth_token?: unknown; sms_from_number?: unknown; sms_dm_policy?: unknown; sms_dm_allowlist?: unknown; sms_pairing?: unknown };
+    const { name, description, model, allow_tools, telegram_bot_token, discord_bot_token, line_channel_access_token, line_channel_secret, line_dm_policy, line_dm_allowlist, line_group_policy, line_group_allowlist, line_require_mention, line_pairing, slack_bot_token, slack_signing_secret, slack_dm_policy, slack_dm_allowlist, slack_group_policy, slack_group_allowlist, slack_require_mention, slack_pairing, sms_account_sid, sms_auth_token, sms_from_number, sms_dm_policy, sms_dm_allowlist, sms_pairing } = body;
     if (name !== undefined && name !== null && typeof name !== 'string') {
       res.status(400).json({ error: 'name must be a string or null' });
       return;
@@ -1492,6 +1503,56 @@ export function createApiRouter(
       slack_group_policy !== undefined || slack_group_allowlist !== undefined || slack_require_mention !== undefined ||
       slack_pairing !== undefined;
 
+    // SMS (Twilio) — same validation shape as LINE/Slack, except THREE
+    // credentials (accountSid/authToken/fromNumber) must be provided together
+    // or all cleared, not two. No live Save-time verification (unlike Slack's
+    // auth.test): Twilio has no cheap "verify these creds" call without
+    // actually sending or fetching account info — a bad credential surfaces on
+    // the first real send instead, same as Telegram/Discord's posture.
+    if (sms_account_sid !== undefined && sms_account_sid !== null && typeof sms_account_sid !== 'string') {
+      res.status(400).json({ error: 'sms_account_sid must be a string or null' });
+      return;
+    }
+    if (sms_auth_token !== undefined && sms_auth_token !== null && typeof sms_auth_token !== 'string') {
+      res.status(400).json({ error: 'sms_auth_token must be a string or null' });
+      return;
+    }
+    if (sms_from_number !== undefined && sms_from_number !== null && typeof sms_from_number !== 'string') {
+      res.status(400).json({ error: 'sms_from_number must be a string or null' });
+      return;
+    }
+    const smsTouched = sms_account_sid !== undefined || sms_auth_token !== undefined || sms_from_number !== undefined;
+    if (smsTouched) {
+      const sid = typeof sms_account_sid === 'string' ? sms_account_sid.trim() : '';
+      const tok = typeof sms_auth_token === 'string' ? sms_auth_token.trim() : '';
+      const num = typeof sms_from_number === 'string' ? sms_from_number.trim() : '';
+      const allSet = sid !== '' && tok !== '' && num !== '';
+      const allClear = sid === '' && tok === '' && num === '';
+      if (!allSet && !allClear) {
+        res.status(400).json({
+          error: 'sms_account_sid, sms_auth_token, and sms_from_number must be provided together',
+        });
+        return;
+      }
+    }
+    if (sms_dm_policy !== undefined && sms_dm_policy !== null &&
+        !(typeof sms_dm_policy === 'string' && ['open', 'allowlist', 'disabled'].includes(sms_dm_policy))) {
+      res.status(400).json({ error: "sms_dm_policy must be 'open', 'allowlist', 'disabled', or null" });
+      return;
+    }
+    if (sms_dm_allowlist !== undefined && sms_dm_allowlist !== null &&
+        !(Array.isArray(sms_dm_allowlist) && sms_dm_allowlist.every((u) => typeof u === 'string'))) {
+      res.status(400).json({ error: 'sms_dm_allowlist must be an array of strings or null' });
+      return;
+    }
+    if (sms_pairing !== undefined && sms_pairing !== null &&
+        typeof sms_pairing !== 'boolean') {
+      res.status(400).json({ error: 'sms_pairing must be a boolean or null' });
+      return;
+    }
+    const smsAccessTouched = sms_dm_policy !== undefined || sms_dm_allowlist !== undefined ||
+      sms_pairing !== undefined;
+
     try {
       await writeAgentsToConfig(configPath, (agents) => {
         const agent = (agents as Record<string, unknown>[]).find((a) => a.id === agentId);
@@ -1604,6 +1665,38 @@ export function createApiRouter(
             if (slack_pairing !== undefined) {
               if (slack_pairing === null) delete existing.pairing;
               else existing.pairing = slack_pairing;
+            }
+          }
+        }
+        if (smsTouched) {
+          const sid = typeof sms_account_sid === 'string' ? sms_account_sid.trim() : '';
+          const tok = typeof sms_auth_token === 'string' ? sms_auth_token.trim() : '';
+          const num = typeof sms_from_number === 'string' ? sms_from_number.trim() : '';
+          if (sid === '' && tok === '' && num === '') {
+            delete (agent as Record<string, unknown>).sms;
+          } else {
+            const existing = agent.sms as Record<string, unknown> | undefined;
+            agent.sms = { ...(existing ?? {}), accountSid: sid, authToken: tok, fromNumber: num };
+          }
+        }
+        // Access fields — merge into the existing sms block (re-read after the
+        // credential block above, which may have just created or deleted it).
+        // Skip silently when no sms channel exists; policy without credentials
+        // is meaningless. No group fields — SMS has no group tier.
+        if (smsAccessTouched) {
+          const existing = agent.sms as Record<string, unknown> | undefined;
+          if (existing) {
+            if (sms_dm_policy !== undefined) {
+              if (sms_dm_policy === null) delete existing.dmPolicy;
+              else existing.dmPolicy = sms_dm_policy;
+            }
+            if (sms_dm_allowlist !== undefined) {
+              if (sms_dm_allowlist === null) delete existing.dmAllowlist;
+              else existing.dmAllowlist = sms_dm_allowlist;
+            }
+            if (sms_pairing !== undefined) {
+              if (sms_pairing === null) delete existing.pairing;
+              else existing.pairing = sms_pairing;
             }
           }
         }
@@ -1763,6 +1856,40 @@ export function createApiRouter(
         for (const id of slack_group_allowlist) clearPendingSender('slack', agentId, id);
       }
     }
+    if (smsTouched) {
+      const sid = typeof sms_account_sid === 'string' ? sms_account_sid.trim() : '';
+      const tok = typeof sms_auth_token === 'string' ? sms_auth_token.trim() : '';
+      const num = typeof sms_from_number === 'string' ? sms_from_number.trim() : '';
+      if (sid && tok && num) {
+        cfg.sms = { ...(cfg.sms ?? {}), accountSid: sid, authToken: tok, fromNumber: num };
+      } else {
+        delete cfg.sms;
+      }
+      // SMS is webhook-based — no receiver to start/stop. The webhook router
+      // reads config live via runner.getAgentConfig(); updateAgentConfig also
+      // rebuilds the outbound client (see AgentRunner.startSmsOutbound).
+      agentRunners.get(agentId)?.updateAgentConfig(cfg);
+    }
+    if (smsAccessTouched && cfg.sms) {
+      if (sms_dm_policy !== undefined) {
+        if (sms_dm_policy === null) delete cfg.sms.dmPolicy;
+        else cfg.sms.dmPolicy = sms_dm_policy as 'open' | 'allowlist' | 'disabled';
+      }
+      if (sms_dm_allowlist !== undefined) {
+        if (sms_dm_allowlist === null) delete cfg.sms.dmAllowlist;
+        else cfg.sms.dmAllowlist = sms_dm_allowlist as string[];
+      }
+      if (sms_pairing !== undefined) {
+        if (sms_pairing === null) delete cfg.sms.pairing;
+        else cfg.sms.pairing = sms_pairing as boolean;
+      }
+      agentRunners.get(agentId)?.updateAgentConfig(cfg);
+      // Anyone just added to the allowlist is now allowed — drop them from the
+      // in-memory knock list so the discovery UI stops surfacing them.
+      if (Array.isArray(sms_dm_allowlist)) {
+        for (const num of sms_dm_allowlist) clearPendingSender('sms', agentId, num);
+      }
+    }
 
     res.json({
       agent: {
@@ -1806,6 +1933,14 @@ export function createApiRouter(
         slack_group_allowlist: cfg.slack?.signingSecret ? (cfg.slack?.groupAllowlist ?? []) : null,
         slack_require_mention: cfg.slack?.signingSecret ? (cfg.slack?.requireMention ?? null) : null,
         slack_pairing: cfg.slack?.signingSecret ? (cfg.slack?.pairing ?? true) : null,
+        // SMS — same shape/semantics as LINE/Slack above, no group tier.
+        sms_connected: !!cfg.sms?.authToken,
+        sms_token_preview: cfg.sms?.accountSid ? maskToken(cfg.sms.accountSid) : null,
+        sms_from_number: cfg.sms?.authToken ? (cfg.sms?.fromNumber ?? null) : null,
+        sms_webhook_path: cfg.sms?.authToken ? `/webhooks/sms/${agentId}` : null,
+        sms_dm_policy: cfg.sms?.authToken ? (cfg.sms?.dmPolicy ?? null) : null,
+        sms_dm_allowlist: cfg.sms?.authToken ? (cfg.sms?.dmAllowlist ?? []) : null,
+        sms_pairing: cfg.sms?.authToken ? (cfg.sms?.pairing ?? true) : null,
       },
     });
   });
@@ -2005,6 +2140,34 @@ export function createApiRouter(
     const { agentId, senderId } = req.params as { agentId: string; senderId: string };
     if (!agentConfigs.has(agentId)) { res.status(404).json({ error: `Agent '${agentId}' not found` }); return; }
     clearPendingSender('slack', agentId, senderId);
+    res.json({ ok: true });
+  });
+
+  /**
+   * GET /api/v1/agents/:agentId/sms/pending
+   * Recently denied SMS senders (Tier 1 allowlist discovery aid). Admin only.
+   * Mirrors GET .../slack/pending exactly, keyed under the 'sms' channel
+   * namespace in the shared pending-senders store.
+   */
+  router.get('/v1/agents/:agentId/sms/pending', auth, (req: Request, res: Response) => {
+    const { agentId } = req.params as { agentId: string };
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!isAdmin(apiKey)) { res.status(403).json({ error: 'Admin key required' }); return; }
+    if (!agentConfigs.has(agentId)) { res.status(404).json({ error: `Agent '${agentId}' not found` }); return; }
+    res.json({ senders: getPendingSenders('sms', agentId) });
+  });
+
+  /**
+   * DELETE /api/v1/agents/:agentId/sms/pending/:senderId
+   * Dismiss one knock from the in-memory pending list (admin only). Mirrors
+   * DELETE .../slack/pending/:senderId exactly. The id is an E.164 phone number.
+   */
+  router.delete('/v1/agents/:agentId/sms/pending/:senderId', auth, (req: Request, res: Response) => {
+    const apiKey = (req as AuthedRequest).apiKey;
+    if (!isAdmin(apiKey)) { res.status(403).json({ error: 'Admin key required' }); return; }
+    const { agentId, senderId } = req.params as { agentId: string; senderId: string };
+    if (!agentConfigs.has(agentId)) { res.status(404).json({ error: `Agent '${agentId}' not found` }); return; }
+    clearPendingSender('sms', agentId, senderId);
     res.json({ ok: true });
   });
 
@@ -2347,7 +2510,7 @@ export function createApiRouter(
     }
     const { source, rawChatId } = parseHistoryChatId(chatId);
     if (!isChatChannel(source)) {
-      res.status(400).json({ error: 'Sessions endpoint only supports telegram/discord/line/slack chats' });
+      res.status(400).json({ error: 'Sessions endpoint only supports telegram/discord/line/slack/sms chats' });
       return;
     }
     try {
@@ -2537,7 +2700,7 @@ export function createApiRouter(
     }
     const { source, rawChatId } = parseHistoryChatId(chatId);
     if (!isChatChannel(source)) {
-      res.status(400).json({ error: 'Cross-channel messaging only supported for telegram/discord/line/slack chats' });
+      res.status(400).json({ error: 'Cross-channel messaging only supported for telegram/discord/line/slack/sms chats' });
       return;
     }
 
@@ -3319,5 +3482,6 @@ function parseHistoryChatId(fullChatId: string): { source: string; rawChatId: st
   if (fullChatId.startsWith('discord-')) return { source: 'discord', rawChatId: fullChatId.slice(8) };
   if (fullChatId.startsWith('line-')) return { source: 'line', rawChatId: fullChatId.slice(5) };
   if (fullChatId.startsWith('slack-')) return { source: 'slack', rawChatId: fullChatId.slice(6) };
+  if (fullChatId.startsWith('sms-')) return { source: 'sms', rawChatId: fullChatId.slice(4) };
   return { source: 'api', rawChatId: fullChatId };
 }
