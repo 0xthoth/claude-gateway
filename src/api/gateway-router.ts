@@ -612,10 +612,23 @@ export class GatewayRouter {
     // express.json() — each app handler needs the raw request bytes for its own
     // signature validation. This whole /webhooks zone bypasses API-key auth;
     // every app authenticates itself (see webhooks-router.ts).
-    this.app.use(
-      '/webhooks',
-      createWebhooksRouter(this.agents, this.gatewayConfig?.gateway?.logDir ?? '/tmp'),
+    //
+    // Mounted at BOTH '/webhooks' and '/gateway/webhooks': in production,
+    // Traefik strips the '/gateway' prefix before forwarding, so only
+    // '/webhooks' is ever actually hit there — the second mount is inert. In
+    // local dev topologies with no such stripping proxy in front (e.g. an
+    // ngrok tunnel straight to this container), gateway.publicUrl is still
+    // forced to end in '/gateway' (see config/loader.ts), so a
+    // URL-inclusive signature scheme (Twilio's — unlike LINE/Slack's, which
+    // sign only the body) would otherwise never be satisfiable locally: the
+    // signed URL and the reachable route could never agree. Serving the same
+    // router at both prefixes makes them agree in both topologies.
+    const webhooksRouter = createWebhooksRouter(
+      this.agents,
+      this.gatewayConfig?.gateway?.logDir ?? '/tmp',
     );
+    this.app.use('/webhooks', webhooksRouter);
+    this.app.use('/gateway/webhooks', webhooksRouter);
 
     this.app.use(express.json());
 
