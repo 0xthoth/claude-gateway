@@ -126,6 +126,12 @@ non-interactive run is refused rather than left hanging). Always stop the gatewa
 `service uninstall` or `systemctl --user stop claude-gateway.service` — a bare `kill <pid>` bypasses
 systemd's own stop tracking, so `Restart=always` brings it right back regardless of exit code.
 
+`install`'s exit code distinguishes three outcomes: `0` fully healthy, `1` install/enable itself
+failed or a validation/confirmation gate refused (nothing was written), `2` install/enable
+succeeded but `/health` never answered within the poll window. A script that only checks the exit
+code — not the JSON result on stdout — can still tell "didn't happen" apart from "happened, health
+unconfirmed" this way.
+
 `install` also refuses (rather than just warning) if a `claude-gateway.service` unit already
 exists and is enabled or active at *system* scope (e.g. one written by provisioning outside this
 CLI) — installing a second, independent unit alongside it would race for the port on the next
@@ -134,8 +140,50 @@ pass `--force` to install anyway.
 
 The systemd path writes `~/.config/systemd/user/claude-gateway.service`. Run
 `loginctl enable-linger $USER` once if it must keep running while you're logged out.
+The unit sets `OOMPolicy=continue` so that an OOM-killed child process (e.g. a dev server an
+agent spawned on its own) doesn't take the whole gateway down with it — only `Restart=always`
+restarting the *gateway's own* process is intended. Re-running `claude-gateway service install`
+against an already-active unit whose rendered content changed (a newer CLI version, or different
+flags) automatically restarts it via `systemctl ... restart`, so the update takes effect
+immediately; re-running with unchanged content leaves the running unit alone.
 Prefer [PM2](https://pm2.keymetrics.io)? `claude-gateway service install --manager pm2` registers
 and saves the process instead (run `pm2 startup` separately for boot-time start).
+
+**System-scope installs (for automated/infra provisioning)**
+
+Pass `--scope system` to install a root-owned unit at `/etc/systemd/system/claude-gateway.service`
+instead — for provisioning that needs the gateway to run under a fixed system account rather than
+whoever happens to run the install interactively. It requires:
+
+```bash
+sudo claude-gateway service install --scope system --run-as gwuser --yes
+```
+
+- The caller must already be root — `--scope system` never escalates via `sudo` on its own, and
+  refuses immediately if it isn't.
+- `--run-as <user>` is required and becomes the unit's `User=`; `WantedBy=` is
+  `multi-user.target` instead of `default.target`, so it starts at boot regardless of any login
+  session (the `loginctl enable-linger` hint is skipped — it's meaningless here).
+- `WorkingDirectory=`/`HOME=`/the config path all resolve to `--run-as`'s own home directory
+  (looked up via `getent passwd`, not the installing root process's home) — the unit runs as that
+  user, so its paths must be theirs. A `~/...` in `--config`/`--env-file` expands against that same
+  home. `$GATEWAY_CONFIG` from the installing (root) process's own environment is **not** consulted
+  for a system-scope install — only an explicit `--config` is — since it belongs to root's
+  environment, not `--run-as`'s. If the user's `~/.claude-gateway` doesn't exist yet, the install
+  creates it and `chown`s it to them; if it already exists but is owned by someone else (e.g. a
+  prior install used a different `--run-as`), ownership is reassigned to match. An
+  already-correctly-owned directory is left untouched. Refuses if `--run-as` doesn't resolve to a
+  real user on this host.
+- A system-scope install never refuses itself over the system-scope conflict check described
+  above — that check exists to protect a *user*-scope install from colliding with an externally
+  provisioned system-scope unit, and a system-scope install *is* that unit.
+- `--after <target1,target2>`, `--env-file <path>`, and `--env KEY=VALUE[,KEY=VALUE...]` further
+  customize the generated unit (both scopes): extra `After=` ordering targets, an
+  `EnvironmentFile=-<path>` for feeding secrets in without ever writing them into the unit text,
+  and additional non-secret `Environment=` lines. `--env` refuses to override `HOME`, `PATH`, or
+  `GATEWAY_CONFIG` (the installer's own reserved names) — use `--env-file` for anything sensitive.
+- `service status --scope system` and `service uninstall --scope system` work the same way against
+  the system-scope unit (uninstall also requires root).
 
 Once installed, drive it through the CLI — it detects whichever manager owns the process:
 
@@ -292,6 +340,91 @@ returns the `token` (the share endpoint stays enabled) and callers with their ow
 public base — e.g. LINE, which derives its host from the inbound webhook — build
 `<base>/shared/<token>` themselves. HTTP is accepted only for local development
 hosts such as `http://host.docker.internal:10850/gateway`.
+
+### `gateway.oauthReturnUrl` (optional)
+
+Where to send the browser after a connector OAuth sign-in finishes. The gateway is
+product-agnostic and never hardcodes a downstream app's domain, so this is opt-in.
+
+```json
+{
+  "gateway": {
+    "oauthReturnUrl": "https://app.example.com/settings/connectors"
+  }
+}
+```
+
+Set, the callback issues a real `302` to it on **every** terminal outcome — success, and
+also a denied, expired or failed sign-in, which carries `?connector_oauth_error=<code>`.
+Unset, the callback renders a plain "Connected — you can close this tab" page instead.
+The value is validated once at startup: anything that isn't a well-formed `http(s)` URL
+is logged and ignored rather than injecting a broken redirect into every future callback.
+The scheme is part of that check — this value becomes the `Location` of a redirect sent
+to the end user's own browser from a public route, so a `javascript:` or `data:` URL
+here would be script running on every sign-in, and is refused like any other malformed
+value.
+
+### `gateway.customConnectors` (optional)
+
+User-pasted MCP connectors, keyed by a slugified id. Normally written through the API
+(`POST /api/v1/connectors/custom`) rather than by hand.
+
+```json
+{
+  "gateway": {
+    "customConnectors": {
+      "firecrawl": {
+        "label": "Firecrawl",
+        "config": {
+          "type": "streamable-http",
+          "url": "https://mcp.firecrawl.dev/v2/mcp-oauth",
+          "headers": { "Authorization": "Bearer {access_token}" }
+        },
+        "secretNames": ["access_token"],
+        "credentialOwner": "gateway"
+      }
+    }
+  }
+}
+```
+
+Each entry is raw `mcpServers`-entry JSON with `{placeholder}` tokens standing in for
+secrets. `credentialOwner` records who holds the credential and keeps it valid — `none`,
+`static` (a pasted value), `gateway` (this gateway ran the OAuth flow and refreshes the
+token itself) or `external` (a control plane pushes tokens in). It is written by the
+route that creates the entry; see [API.md](./API.md#connectors-api). **Only the placeholder names are stored here** — the values live in
+`~/.claude-gateway/mcp-token.env` (mode `0600`), namespaced
+`CUSTOM__<connectorId>__<placeholderName>`, and are substituted in when a session spawns.
+Override that file's path with `GATEWAY_MCP_TOKEN_ENV_PATH`.
+
+Custom connectors are **admin-trusted but not code-reviewed** — the config is whatever
+the admin pasted, and it becomes an MCP server in every agent's session. Per-agent
+enablement is opt-out and lives on the agent instead (`PATCH /api/v1/agents/:id` with
+`connectors`); connecting a connector at all is the security gate. See
+[API.md](./API.md#connectors-api) for the full model, the OAuth flow, and the refresh
+behaviour.
+
+### `gateway.connectorsDefaultEnabled` (optional)
+
+Whether a connected connector is available to an agent that has no explicit entry in its
+own `connectors` map. Defaults to `true` — opt-out: connecting a connector makes it
+available everywhere, and an agent only misses it if explicitly disabled.
+
+```json
+{
+  "gateway": {
+    "connectorsDefaultEnabled": false
+  }
+}
+```
+
+Set it to `false` on a gateway that hosts agents for **more than one person**. The default
+suits the common single-operator install, but with several owners it hands a credential
+connected by one of them to every agent on the box — including agents whose chat users are
+not that person. With `false`, each agent has to be opted in explicitly (`PATCH
+/api/v1/agents/:id` with `{"connectors": {"<id>": {"enabled": true}}}`).
+
+Changing this affects the next session spawn, like any other connector change.
 
 ### `gateway.logs` (optional)
 
@@ -685,6 +818,8 @@ Tools are **prefixed by channel name** to avoid collisions. Each module controls
 
 **Adding a new channel** (e.g. Slack) means implementing `ChannelModule` interface in `mcp/tools/slack/module.ts` and registering it in `server.ts`.
 
+**Connectors** are the other half of the MCP picture: where the modules above are tools the gateway itself implements, a connector is an **external** MCP server the gateway injects into a session's `mcp-config.json`. The gateway stores only the connector definition, the per-connector secret (`~/.claude-gateway/mcp-token.env`) and the per-agent enablement — Claude Code then talks to that server directly. See [`gateway.customConnectors`](#gatewaycustomconnectors-optional) and [API.md](./API.md#connectors-api).
+
 ### Process Modes
 
 | Mode | Process | Behaviour |
@@ -859,6 +994,14 @@ Pass API key via `X-Api-Key: <key>` or `Authorization: Bearer <key>` header.
 | `POST` | `/api/v1/apps/:name/start\|stop\|restart` | Start/stop/restart app containers (admin) |
 | `POST` | `/api/v1/apps/:name/update` | Blue-green update with auto-rollback → `jobId` (admin) |
 | `POST` | `/api/v1/apps/:name/reconfigure` | Change env vars / host ports on an installed app, with rollback → `jobId` (admin) |
+| `GET` | `/api/v1/connectors` | List connectors with connected state |
+| `GET` | `/api/v1/connectors/:id/status` | Connected state for one connector (for polling) |
+| `POST` | `/api/v1/connectors/:id/connect` | Store a pasted token (admin) |
+| `POST` | `/api/v1/connectors/:id/oauth/receive` | Accept a token pushed by an external control plane (admin) |
+| `DELETE` | `/api/v1/connectors/:id` | Disconnect a connector (admin) |
+| `POST` | `/api/v1/connectors/custom` | Add a user-pasted connector (admin) |
+| `POST` | `/api/v1/connectors/custom/:id/oauth/start` | Begin OAuth 2.1 + PKCE sign-in → `authorizeUrl` (admin) |
+| `GET` | `/oauth/mcp/callback` | OAuth redirect target (public — guarded by a single-use `state`) |
 | `GET` | `/app/:name/:portName/*` | Reverse proxy to installed app (no auth) |
 
 **Wizard API** — create agents programmatically with the same flow as the interactive `claude-gateway agents create` terminal wizard. The wizard generates workspace files via Claude, writes them on confirm, and optionally pairs a Telegram/Discord bot. State is in-memory with a 30-minute TTL; nothing is written until `/confirm`. See [API.md](./API.md) for the full wizard flow.
@@ -1023,6 +1166,7 @@ claude-gateway/
 ```
 ~/.claude-gateway/
 ├── config.json                         ← gateway config
+├── mcp-token.env                       ← connector secrets, mode 0600 (see `gateway.customConnectors`)
 ├── logs/
 │   ├── alfred.log
 │   ├── alfred.log.1                    ← rotated generation (see `gateway.logs`)
