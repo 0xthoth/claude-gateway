@@ -16,6 +16,9 @@ import { TelegramModule } from './tools/telegram/module';
 import { DiscordModule } from './tools/discord/module';
 import { LineModule } from './tools/line/module';
 import { SlackModule } from './tools/slack/module';
+import { WhatsAppModule } from './tools/whatsapp/module';
+import { WhatsAppCloudModule } from './tools/whatsapp-cloud/module';
+import { WeChatModule } from './tools/wechat/module';
 import { CronModule } from './tools/cron/module';
 import { SkillsModule } from './tools/skills/module';
 import { AgentModule } from './tools/agent/module';
@@ -42,6 +45,9 @@ const modules: AnyModule[] = [
   new DiscordModule(),
   new LineModule(),
   new SlackModule(),
+  new WhatsAppModule(),
+  new WhatsAppCloudModule(),
+  new WeChatModule(),
   new CronModule(),
   new SkillsModule(),
   new AgentModule(),

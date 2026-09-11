@@ -6,7 +6,7 @@ import * as http from 'http';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { AgentConfig, CustomConnectorEntry, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment, ImageParams } from '../types';
+import { AgentConfig, CustomConnectorEntry, GatewayConfig, Logger, Message, ModelConfig, StreamEvent, ApiAttachment, ImageParams, VideoParams } from '../types';
 import { withConfigWriteLock, writeConfigAtomicSync } from '../config/config-write-lock';
 import { createLogger } from '../logger';
 import { SessionProcess, MAX_HISTORY_MESSAGES, resolveMaxHistoryMessages, INTERRUPTED_NO_REPLY_TEXT } from '../session/process';
@@ -16,6 +16,19 @@ import { TelegramReceiver } from '../telegram/receiver';
 import { DiscordReceiver } from '../discord/receiver';
 import { LineReplyManager } from './line-reply-manager';
 import { SlackClient } from '../api/slack-client';
+import { WhatsAppCloudClient } from '../api/whatsapp-cloud-client';
+import { WhatsAppManager, type WhatsAppStatus } from '../whatsapp/manager';
+import { DEFAULT_WHATSAPP_ACCOUNT_ID, resolveWhatsAppAccounts } from '../config/whatsapp-accounts';
+import { WeChatManager, type WeChatStatus } from '../wechat/manager';
+import {
+  createILinkClient,
+  createFakeILinkClient,
+  isWeChatILinkFakeEnabled,
+  downloadWeixinImage,
+  type ILinkUpdate,
+} from '../wechat/ilink-client';
+import { isWeChatConversationAllowed } from '../api/wechat-access';
+import { recordDeniedSender, getPendingSender, generatePairingCode, clearPendingSender } from '../api/pending-senders';
 import { hasMarkdown, normalizeTelegramLineBreaks, toTelegramHtml, containsTelegramHtml } from '../telegram/markdown';
 import { detectSkillCommand, formatSkillContext, type SkillRegistry } from '../skills';
 import { isBuiltinCommand } from './builtin-commands';
@@ -42,6 +55,7 @@ import { HistoryDB } from '../history/db';
 import { MediaStore } from '../history/media-store';
 import { scheduleCleanup, resolveRetentionDays } from '../history/cleanup';
 import type { HistorySource, ChatChannel, ChatChannelOrApi } from '../history/types';
+import { isChatChannel } from '../history/types';
 import type { SkillLearningManager } from './skill-learning';
 import { spawnArchiveReindex } from './knowledge';
 import { resolveEnabledConnectors } from '../connectors/resolve';
@@ -105,6 +119,17 @@ const PROTECTED_WORKSPACE_FILES = [
   'AGENTS.md', 'SOUL.md', 'MEMORY.md', 'CLAUDE.md',
   'IDENTITY.md', 'USER.md', 'HEARTBEAT.md',
 ];
+
+/**
+ * One-line reminder injected into every `whatsapp_cloud` turn's <channel>
+ * block (see buildChannelXml) — the 24h customer-service window is a
+ * WhatsApp-Business-only rule the agent cannot infer from the turn itself.
+ *
+ * Must stay free of `--` so it remains a well-formed XML comment.
+ */
+export const WHATSAPP_CLOUD_WINDOW_NOTE =
+  '[WhatsApp Business: free-form replies only work within 24h of the user\'s last message. ' +
+  'Outside that window, whatsapp_cloud_reply requires template_name + template_language (see templatesEnabled).]';
 
 const MAX_API_IMAGES = 5;
 /** Extra time an api turn may keep running AFTER its soft timeout already
@@ -238,6 +263,39 @@ export class AgentRunner extends EventEmitter {
   // it exists only so writeAutoForward's fallback/command-reply path (below) has
   // somewhere to actually deliver Slack messages instead of silently dropping them.
   private slackOutbound: SlackClient | null = null;
+  // WhatsApp Cloud mirrors Slack exactly: webhook-based, real credentials, no
+  // reply-token TTL to work around — a plain client so writeAutoForward's
+  // fallback/command-reply path has somewhere to deliver messages instead of
+  // silently dropping them (see the Slack comment just above).
+  private whatsAppCloudOutbound: WhatsAppCloudClient | null = null;
+  // One live Baileys socket per linked WhatsApp account, keyed by account id
+  // (Phase 1 of the WhatsApp feature-parity plan — this used to be a single
+  // `whatsapp: WhatsAppManager | null`). Populated in start() (needs
+  // this.callbackPort, only resolved once startCallbackServer() runs — same
+  // reason DiscordReceiver/TelegramReceiver are built there too) and then
+  // DIFFED, never rebuilt wholesale, by syncWhatsAppAccounts(): unlike
+  // SlackClient/DiscordReceiver there is no credential to re-read on a config
+  // change, since the credential IS the on-disk session (see
+  // WhatsAppAccountConfig's doc comment), so tearing a linked socket down on
+  // an unrelated config edit would be pure downtime. Each manager decides for
+  // itself whether there's anything to do on start (resumeIfLinked() no-ops
+  // if that account was never linked).
+  private readonly whatsappAccounts = new Map<string, WhatsAppManager>();
+  // Serialized `agentConfig.whatsapp` as of the last sync — lets
+  // updateAgentConfig() re-diff the account set ONLY when the WhatsApp block
+  // itself changed, not on every unrelated config edit.
+  private whatsappConfigSnapshot: string | undefined;
+  // chatId → the account id its last inbound message arrived on. Mirrors
+  // slackThreadTs above: it lets writeAutoForward (and a whatsapp_reply call
+  // that omits account_id) answer on the SAME number the user wrote to
+  // instead of guessing 'default' and replying from the wrong line.
+  private readonly whatsappAccountForChat = new Map<string, string>();
+  // WeChat: unlike every credential-input channel above, constructed
+  // unconditionally (there's no config field to gate on — the link flow is
+  // QR device-pairing, not a typed-in token, same reasoning WhatsApp/Baileys
+  // uses). Does nothing until startWeChatLinking() is called or a
+  // previously-linked session is resumed at start().
+  private wechat: WeChatManager | null = null;
   private readonly sessionStore: SessionStore;
   private readonly idleTimeoutMs: number;
   private readonly maxConcurrent: number;
@@ -462,14 +520,13 @@ export class AgentRunner extends EventEmitter {
           const chatId = meta['chat_id'] ?? '';
           const content = params.content ?? '';
 
-          // Set channel early so all handlers (including session commands) have it
-          const channelSource = (meta['source'] === 'discord'
-            ? 'discord'
-            : meta['source'] === 'line'
-              ? 'line'
-              : meta['source'] === 'slack'
-                ? 'slack'
-                : 'telegram') as ChatChannel;
+          // Set channel early so all handlers (including session commands) have it.
+          // Derived from the canonical CHAT_CHANNELS list (see history/types.ts's
+          // doc comment) — a hand-copied ternary here is exactly what silently
+          // turned every WeChat (and, historically, Slack) message into
+          // 'telegram' before, since a new channel added elsewhere is easy to
+          // forget adding to a chain of `=== 'x' ? 'x' : ...` checks.
+          const channelSource = (isChatChannel(meta['source']) ? meta['source'] : 'telegram') as ChatChannel;
           this.channelSourceMap.set(chatId, channelSource);
 
           // Slack: remember the current message's thread context so the
@@ -480,6 +537,15 @@ export class AgentRunner extends EventEmitter {
             const threadTs = meta['thread_ts'];
             if (threadTs) this.slackThreadTs.set(chatId, threadTs);
             else this.slackThreadTs.delete(chatId);
+          }
+
+          // WhatsApp: remember which linked number this chat last came in on,
+          // so a reply that doesn't name an account_id (the auto-forward
+          // fallback, or a whatsapp_reply call that omitted it) still goes out
+          // on the number the user actually wrote to. Same shape as the Slack
+          // thread-context stash just above.
+          if (channelSource === 'whatsapp' && meta['account_id']) {
+            this.whatsappAccountForChat.set(chatId, meta['account_id']);
           }
 
           // LINE slow-LLM postback: stash this turn's reply token + arm the
@@ -1126,7 +1192,21 @@ export class AgentRunner extends EventEmitter {
         for (const entry of entries) {
           const meta = entry.meta ?? {};
           const content = entry.content ?? '';
-          const userContent = content || (meta['attachment_file_id'] || meta['image_path'] ? '(photo)' : '');
+          // `image_path` is used for ANY attachment, not just photos (see
+          // handleWeChatInboundMessage's doc comment) — a non-image
+          // extension (e.g. WeChat's PDF/file support) must not show as
+          // "(photo)" in the transcript.
+          const isImagePath = /\.(jpe?g|png|gif|webp|heic|bmp)$/i.test(meta['image_path'] ?? '');
+          const attachmentPlaceholder = meta['attachment_file_id']
+            ? '(photo)'
+            : meta['image_path']
+              ? (isImagePath ? '(photo)' : '(file)')
+              : meta['document_path']
+                ? '(document)'
+                : meta['sticker_path']
+                  ? '(sticker)'
+                  : '';
+          const userContent = content || attachmentPlaceholder;
           const userTs = Date.now();
           await this.sessionStore.appendTelegramMessage(this.agentConfig.id, chatId, sessionId, {
             role: 'user',
@@ -1156,6 +1236,31 @@ export class AgentRunner extends EventEmitter {
               // Non-fatal — leave the original path so host agents still read it
             }
           }
+          // WhatsApp Cloud documents (PDF today — see MediaStore.isAllowedMime):
+          // same MediaStore copy + path-rewrite as image_path above, parallel
+          // key so an inbound document doesn't collide with an inbound image
+          // in the same turn.
+          if (meta['document_path']) {
+            try {
+              const rel = MediaStore.copyToMedia(this.agentsBaseDir, this.agentConfig.id, `${channelSource}-${chatId}`, meta['document_path']);
+              mediaFiles.push(rel);
+              meta['document_path'] = MediaStore.resolvePath(this.agentsBaseDir, this.agentConfig.id, rel);
+            } catch {
+              // Non-fatal — leave the original path so host agents still read it
+            }
+          }
+          // WhatsApp stickers (both channels — image/webp): same MediaStore
+          // copy + path-rewrite as image_path above, on its own key so an
+          // inbound sticker never masquerades as a photo.
+          if (meta['sticker_path']) {
+            try {
+              const rel = MediaStore.copyToMedia(this.agentsBaseDir, this.agentConfig.id, `${channelSource}-${chatId}`, meta['sticker_path']);
+              mediaFiles.push(rel);
+              meta['sticker_path'] = MediaStore.resolvePath(this.agentsBaseDir, this.agentConfig.id, rel);
+            } catch {
+              // Non-fatal — leave the original path so host agents still read it
+            }
+          }
           this.historyDb.insertMessage({
             chatId: `${channelSource}-${chatId}`,
             sessionId,
@@ -1166,6 +1271,14 @@ export class AgentRunner extends EventEmitter {
             senderId: meta['user_id'] ?? meta['chat_id'] ?? undefined,
             platformMessageId: meta['message_id'] ?? undefined,
             mediaFiles: mediaFiles.length > 0 ? mediaFiles : undefined,
+            // Reply context (WhatsApp Phase 2) — the same meta keys buildChannelXml
+            // renders into <replied> for the agent, persisted so the web dashboard
+            // can show "in reply to X" instead of losing it after the turn.
+            // whatsapp_cloud only ever sets replied_message_id (its webhook reports
+            // the quoted id and nothing else), so the other two stay undefined there.
+            repliedToMessageId: meta['replied_message_id'] ?? undefined,
+            repliedToText: meta['replied_text'] ?? undefined,
+            repliedToUser: meta['replied_user'] ?? undefined,
             ts: userTs,
           });
         }
@@ -1330,6 +1443,57 @@ export class AgentRunner extends EventEmitter {
   }
 
   /**
+   * Render composer-selected video options as a directive the agent reads and
+   * forwards to the generate_video MCP tool. Mirrors buildImageParamsNote. Returns
+   * '' when no usable options are present. Without this the agent gets no composer
+   * context for video and invents duration/aspect (a phantom 10s cap, an 8+8 scene
+   * split, or a landscape clip when 9:16 was picked).
+   */
+  private static buildVideoParamsNote(p: VideoParams): string {
+    const attrs = [
+      p.model ? `model="${AgentRunner.escapeXmlAttr(p.model)}"` : '',
+      p.resolution ? `resolution="${AgentRunner.escapeXmlAttr(p.resolution)}"` : '',
+      p.aspect_ratio ? `aspect_ratio="${AgentRunner.escapeXmlAttr(p.aspect_ratio)}"` : '',
+      typeof p.duration === 'number' ? `duration="${p.duration}"` : '',
+      p.image_ref ? `image_ref="${AgentRunner.escapeXmlAttr(p.image_ref)}"` : '',
+    ].filter(Boolean);
+    if (!attrs.length) return '';
+    // The generate_video schema lets the agent pick model/duration itself; when the
+    // composer selection isn't made authoritative the agent falls back to
+    // action="list" and self-selects, or invents a duration cap and splits the clip
+    // into multiple scenes. Nail every field down.
+    const modelNote = p.model
+      ? `The user explicitly SELECTED model="${AgentRunner.escapeXmlAttr(p.model)}" in the composer. ` +
+        `Call generate_video with that exact model — do NOT call action="list" to second-guess an ` +
+        `explicit selection or substitute a different model.\n`
+      : '';
+    const durationNote =
+      typeof p.duration === 'number'
+        ? `duration=${p.duration} is a valid length for the selected model — pass it verbatim as the "duration" ` +
+          `argument. Do NOT invent a maximum, do NOT clamp it to a smaller value, and do NOT split the request ` +
+          `into multiple shorter scenes/clips. Generate exactly ONE clip of this duration.\n`
+        : '';
+    const aspectNote = p.aspect_ratio
+      ? `Pass aspect_ratio="${AgentRunner.escapeXmlAttr(p.aspect_ratio)}" verbatim — do NOT change the orientation.\n`
+      : '';
+    const refNote = p.image_ref
+      ? `The user selected a source image for image-to-video. Pass image_ref="${AgentRunner.escapeXmlAttr(p.image_ref)}" ` +
+        `as the "image" argument of generate_video (the source frame's own aspect then wins). ` +
+        `Do NOT call list_refs to second-guess it, and do NOT open or Read the file first.\n`
+      : '';
+    return (
+      `<video-params ${attrs.join(' ')} />\n` +
+      `The user selected the video-generation options above in the composer. When the request involves ` +
+      `creating a video, call the generate_video tool (action="generate") using these exact values, then ` +
+      `deliver the returned video with your reply tool.\n` +
+      modelNote +
+      durationNote +
+      aspectNote +
+      refNote
+    );
+  }
+
+  /**
    * The durable slice of the composer image options — everything except
    * `image_refs`, which is a per-turn explicit selection (#73) and must never be
    * restored as sticky session config. Returns undefined when nothing is durable.
@@ -1349,18 +1513,31 @@ export class AgentRunner extends EventEmitter {
    * session path; refs that were never staged (catalog refs, artifact:<id>)
    * pass through untouched. (#74)
    */
-  static remapImageParamsRefs(
-    p: ImageParams | undefined,
+  // Build the staging→promoted path map: promoteUiUploads moves a turn's
+  // ui-upload files into per-session storage, so any ref built from a staging
+  // path must follow the file to its new location (#74). Empty map = nothing
+  // moved (or no uploads), so callers leave their refs untouched.
+  private static buildRefRemap(
     stagedPaths: readonly string[] | undefined,
     promotedPaths: readonly string[] | undefined,
-  ): ImageParams | undefined {
-    if (!p || !stagedPaths?.length || !promotedPaths?.length) return p;
+  ): Map<string, string> {
     const map = new Map<string, string>();
+    if (!stagedPaths?.length || !promotedPaths?.length) return map;
     for (let i = 0; i < Math.min(stagedPaths.length, promotedPaths.length); i++) {
       const from = stagedPaths[i]!;
       const to = promotedPaths[i]!;
       if (from !== to) map.set(from, to);
     }
+    return map;
+  }
+
+  static remapImageParamsRefs(
+    p: ImageParams | undefined,
+    stagedPaths: readonly string[] | undefined,
+    promotedPaths: readonly string[] | undefined,
+  ): ImageParams | undefined {
+    if (!p) return p;
+    const map = AgentRunner.buildRefRemap(stagedPaths, promotedPaths);
     if (!map.size) return p;
     const remap = (r: string): string => map.get(r) ?? r;
     return {
@@ -1370,6 +1547,21 @@ export class AgentRunner extends EventEmitter {
     };
   }
 
+  // Video analogue of remapImageParamsRefs. The composer's image-to-video
+  // source frame (VideoParams.image_ref) is built from a staging path; without
+  // this remap the raw ref dangles after promoteUiUploads moves the file, and
+  // generate_video fails share_ref_not_found. artifact:/catalog refs aren't in
+  // the map, so they pass through untouched.
+  static remapVideoParamsRefs(
+    p: VideoParams | undefined,
+    stagedPaths: readonly string[] | undefined,
+    promotedPaths: readonly string[] | undefined,
+  ): VideoParams | undefined {
+    if (!p?.image_ref) return p;
+    const to = AgentRunner.buildRefRemap(stagedPaths, promotedPaths).get(p.image_ref);
+    return to ? { ...p, image_ref: to } : p;
+  }
+
   private static buildChannelXml(params: {
     content?: string;
     meta?: Record<string, string>;
@@ -1377,6 +1569,11 @@ export class AgentRunner extends EventEmitter {
     const meta = params.meta ?? {};
     const optionalAttrs = [
       'image_path',
+      'document_path', // WhatsApp Cloud: inbound PDF document (see MediaStore.isAllowedMime)
+      'sticker_path',  // WhatsApp (both channels): inbound sticker — kept distinct from image_path so the agent can tell a sticker from a photo
+      'location_lat',  // WhatsApp (both channels): inbound location pin
+      'location_lng',
+      'vcard',         // WhatsApp: inbound contact card — raw vCard on Baileys, synthesized from Meta's structured payload on Cloud
       'attachment_file_id',
       'attachment_kind',
       'attachment_mime',
@@ -1384,6 +1581,8 @@ export class AgentRunner extends EventEmitter {
       'user_id',     // LINE: the userId the session passes back to line_reply
       'reply_token', // LINE: single-use reply token (push is preferred; surfaced for completeness)
       'thread_ts',   // Slack: set when the inbound message is inside a thread — pass back as thread_id to slack_reply to reply in-thread
+      'account_id',  // WhatsApp: which linked number this arrived on — pass back to whatsapp_reply to answer on the same one
+      'interactive_id', // WhatsApp Cloud: the id of the tapped button / picked list row (content already carries its title)
       // NOTE: message_id is NOT listed here — the base <channel> template below
       // already unconditionally emits it; adding it here would duplicate the
       // attribute in the XML whenever meta.message_id is set (any channel).
@@ -1413,10 +1612,22 @@ export class AgentRunner extends EventEmitter {
     }
 
     const source = meta['source'] ?? 'telegram';
+
+    // Per-turn channel note (Phase 3). WhatsApp Business enforces a 24h
+    // customer-service window that no other channel here has, and the agent
+    // cannot discover it from the turn itself — it only shows up as an opaque
+    // Meta error at send time. Emitted as an XML COMMENT so it can never be
+    // mistaken for part of the user's message, and kept to ONE short line
+    // because it repeats on every single whatsapp_cloud turn. (A frozen,
+    // system-prompt-level injection would be new infra for one warning; the
+    // per-turn wrapper is the existing seam.)
+    const channelNote =
+      source === 'whatsapp_cloud' ? `<!-- ${WHATSAPP_CLOUD_WINDOW_NOTE} -->` : '';
+
     return (
       `<channel source="${source}" chat_id="${meta['chat_id'] ?? ''}" ` +
       `message_id="${meta['message_id'] ?? ''}" user="${AgentRunner.escapeXmlAttr(meta['user'] ?? '')}" ` +
-      `ts="${meta['ts'] ?? new Date().toISOString()}"${optionalAttrs}>${repliedBlock}${params.content ?? ''}</channel>`
+      `ts="${meta['ts'] ?? new Date().toISOString()}"${optionalAttrs}>${channelNote}${repliedBlock}${params.content ?? ''}</channel>`
     );
   }
 
@@ -1704,6 +1915,9 @@ export class AgentRunner extends EventEmitter {
       let lastAssistantTextThisTurn = '';
       let typingDoneTimer: ReturnType<typeof setTimeout> | null = null;
       const TYPING_DONE_DELAY_MS = 3000;
+      // Same hand-copied-ternary gap CHAT_CHANNELS' doc comment warns about —
+      // 'wechat' was missing here too (confirmed live 2026-09-11), so this
+      // turn-completion tracking never recognized a wechat_reply tool call.
       const replyToolName =
         source === 'discord'
           ? 'mcp__gateway__discord_reply'
@@ -1711,7 +1925,13 @@ export class AgentRunner extends EventEmitter {
             ? 'mcp__gateway__line_reply'
             : source === 'slack'
               ? 'mcp__gateway__slack_reply'
-              : 'mcp__gateway__telegram_reply';
+              : source === 'whatsapp'
+                ? 'mcp__gateway__whatsapp_reply'
+                : source === 'whatsapp_cloud'
+                  ? 'mcp__gateway__whatsapp_cloud_reply'
+                  : source === 'wechat'
+                    ? 'mcp__gateway__wechat_reply'
+                    : 'mcp__gateway__telegram_reply';
 
       proc.on('output', (line: string) => {
         try {
@@ -2021,11 +2241,16 @@ export class AgentRunner extends EventEmitter {
                 } else if (
                   channelSrcForResult !== 'discord' &&
                   channelSrcForResult !== 'slack' &&
+                  channelSrcForResult !== 'whatsapp' &&
+                  channelSrcForResult !== 'whatsapp_cloud' &&
                   (hasMarkdown(channelText) || containsTelegramHtml(channelText))
                 ) {
                   // Telegram HTML entities — Slack has its own mrkdwn format and
                   // would display these tags literally, so Slack skips this and
-                  // falls through to the plain-text branch below.
+                  // falls through to the plain-text branch below. WhatsApp (and
+                  // WhatsApp Cloud, same lightweight markup) has
+                  // its own lightweight markup (*bold*/_italic_/~strike~, not
+                  // HTML), same reasoning.
                   this.writeAutoForward(mapKey, toTelegramHtml(channelText), 'html', replySendFailed);
                 } else {
                   this.writeAutoForward(mapKey, channelText, 'text', replySendFailed);
@@ -2938,6 +3163,51 @@ export class AgentRunner extends EventEmitter {
       }
       return;
     }
+    // WhatsApp likewise has no .forward consumer, and — unlike Slack/SMS's
+    // outbound REST clients — cannot open a fresh connection per call either
+    // (see WhatsAppManager's doc comment): reach the live socket this
+    // process already holds directly.
+    if (this.channelFor(chatId) === 'whatsapp') {
+      // No account_id to go on here (this is the fallback path, not a tool
+      // call), so whatsAppManagerFor falls back to the account this chat's
+      // last inbound message arrived on — the number the user wrote to.
+      void this.sendWhatsAppMessage(chatId, text).catch((err: unknown) => {
+        this.logger.warn('WhatsApp auto-forward failed', {
+          chatId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      return;
+    }
+    // WhatsApp Cloud mirrors Slack exactly (no .forward consumer, a real REST
+    // client that can open a fresh connection per call — unlike Baileys'
+    // `whatsapp` above, there's no live socket to reuse or reason to).
+    if (this.channelFor(chatId) === 'whatsapp_cloud') {
+      if (this.whatsAppCloudOutbound) {
+        void this.whatsAppCloudOutbound.sendText(chatId, text).catch((err: unknown) => {
+          this.logger.warn('WhatsApp Cloud auto-forward failed', {
+            chatId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+      return;
+    }
+    // WeChat has no .forward consumer either — same gap that used to silently
+    // drop every command reply / no-tool-call fallback for Slack (confirmed
+    // live 2026-09-11: the agent's plain-text reply showed up in the web
+    // session view but never reached the user's phone, because it landed in
+    // a chatId.forward file nothing reads for this channel). Deliver via the
+    // manager directly, mirroring Slack's branch above.
+    if (this.channelFor(chatId) === 'wechat') {
+      void this.wechat?.sendMessage(chatId, text).catch((err: unknown) => {
+        this.logger.warn('WeChat auto-forward failed', {
+          chatId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      return;
+    }
     const typingDir = this.getTypingDir(chatId);
     const forwardPath = path.join(typingDir, `${chatId}.forward`);
     try {
@@ -3043,6 +3313,17 @@ export class AgentRunner extends EventEmitter {
     // line_reply tool keeps the plain reply-first → push-fallback path).
     this.startLineReply();
     this.startSlackOutbound();
+    this.startWhatsAppCloudOutbound();
+    // Unconditional (unlike every credential-gated channel above) — each
+    // WhatsAppManager checks disk for a previously-linked session itself;
+    // there's no config field to gate on, and an agent with no `whatsapp`
+    // block still gets the implicit 'default' account (see
+    // resolveWhatsAppAccounts). A brand-new agent that's never linked just
+    // no-ops here and stays 'unlinked' until the user starts a QR/pairing
+    // flow via the API.
+    this.syncWhatsAppAccounts();
+    this.ensureWeChatManager();
+    await this.wechat?.resumeIfLinked();
     this.startIdleCleaner();
     this._startCleanupScheduler();
     this.logger.info('AgentRunner started', { agentId: this.agentConfig.id });
@@ -3095,6 +3376,303 @@ export class AgentRunner extends EventEmitter {
     // it up, same reasoning as LineReplyManager above.
     this.stopSlackOutbound();
     this.startSlackOutbound();
+    // WhatsApp Cloud credentials may have changed (or been cleared) — rebuild
+    // to pick it up, same reasoning as Slack above.
+    this.stopWhatsAppCloudOutbound();
+    this.startWhatsAppCloudOutbound();
+    // WhatsApp has no credential to rebuild on — push the new config
+    // (access-control fields) into every already-running manager, and
+    // add/remove managers only if the set of configured accounts changed.
+    this.syncWhatsAppAccounts();
+    // WeChat has no credential to react to (QR-linked, not config-driven) —
+    // just hand the manager the fresh config so its access-control reads
+    // (dmPolicy/dmAllowlist/pairing) see the latest values.
+    this.wechat?.updateAgentConfig(newConfig);
+  }
+
+  /**
+   * Reconcile `this.whatsappAccounts` with `agentConfig.whatsapp.accounts`.
+   *
+   * Diffing (rather than teardown+recreate) is load-bearing here: a manager
+   * holds a live, authenticated Baileys socket that can take tens of seconds
+   * to re-establish, so an edit to account "sales" must not drop account
+   * "default"'s connection. Accounts that survive the diff only get the new
+   * AgentConfig pushed into them — their socket is untouched.
+   *
+   * Removal uses stop() (socket teardown), never unlink(): dropping an
+   * account from config must not silently wipe its on-disk session. The
+   * DELETE .../whatsapp/accounts/:id route unlinks explicitly before it
+   * rewrites config.
+   */
+  private syncWhatsAppAccounts(): void {
+    const snapshot = JSON.stringify(this.agentConfig.whatsapp ?? null);
+    const accounts = resolveWhatsAppAccounts(this.agentConfig.whatsapp);
+
+    // Always push the fresh config into live managers — access-control fields
+    // are read live off it on every inbound message.
+    for (const manager of this.whatsappAccounts.values()) {
+      manager.updateAgentConfig(this.agentConfig);
+    }
+
+    // Nothing about the WhatsApp block moved ⇒ the account SET can't have
+    // changed either, so skip the diff entirely.
+    if (this.whatsappConfigSnapshot === snapshot && this.whatsappAccounts.size > 0) return;
+    this.whatsappConfigSnapshot = snapshot;
+
+    const wanted = new Set(accounts.map((a) => a.id));
+
+    for (const [accountId, manager] of [...this.whatsappAccounts]) {
+      if (wanted.has(accountId)) continue;
+      manager.stop();
+      this.whatsappAccounts.delete(accountId);
+      this.logger.info('WhatsApp account removed', { agentId: this.agentConfig.id, accountId });
+    }
+
+    for (const account of accounts) {
+      if (this.whatsappAccounts.has(account.id)) continue;
+      const manager = new WhatsAppManager(
+        this.agentConfig,
+        account.id,
+        this.callbackPort,
+        this.gatewayConfig.gateway.logDir,
+      );
+      this.whatsappAccounts.set(account.id, manager);
+      void manager.resumeIfLinked();
+      this.logger.info('WhatsApp account started', { agentId: this.agentConfig.id, accountId: account.id });
+    }
+  }
+
+  /** Live managers, in configured order. */
+  private whatsAppManagers(): WhatsAppManager[] {
+    return resolveWhatsAppAccounts(this.agentConfig.whatsapp)
+      .map((a) => this.whatsappAccounts.get(a.id))
+      .filter((m): m is WhatsAppManager => !!m);
+  }
+
+  /**
+   * Pick the manager a call should use.
+   *
+   * An EXPLICIT accountId must exist — silently falling back would send a
+   * reply from the wrong number, which on WhatsApp is visible to the
+   * recipient and unrecoverable. Without one, prefer the account the chat's
+   * last inbound message arrived on (so a reply leaves on the number the user
+   * actually wrote to), then 'default', then — for an agent whose only
+   * account is named something else — its single account.
+   */
+  private whatsAppManagerFor(chatId: string | undefined, accountId?: string): WhatsAppManager {
+    if (accountId) {
+      const explicit = this.whatsappAccounts.get(accountId);
+      if (!explicit) throw new Error(`Unknown WhatsApp account '${accountId}'`);
+      return explicit;
+    }
+    const remembered = chatId ? this.whatsappAccountForChat.get(chatId) : undefined;
+    const managers = this.whatsAppManagers();
+    const picked =
+      (remembered ? this.whatsappAccounts.get(remembered) : undefined) ??
+      this.whatsappAccounts.get(DEFAULT_WHATSAPP_ACCOUNT_ID) ??
+      managers[0];
+    if (!picked) throw new Error('Agent not started');
+    return picked;
+  }
+
+  /**
+   * Which account id a send to `chatId` (with an optional explicit
+   * `accountId`) would actually use — the same resolution
+   * `sendWhatsAppMessage` applies internally, exposed read-only so a caller
+   * (the `/whatsapp/send` route) can run access-control/path-confinement
+   * checks against the REAL target account without duplicating or
+   * second-guessing this resolution logic. Throws the same errors
+   * `whatsAppManagerFor` would (unknown account / agent not started).
+   */
+  resolveWhatsAppAccountId(chatId: string | undefined, accountId?: string): string {
+    return this.whatsAppManagerFor(chatId, accountId).accountId;
+  }
+
+  /** Live link status for one account (defaults to 'default'). */
+  getWhatsAppStatus(accountId: string = DEFAULT_WHATSAPP_ACCOUNT_ID): WhatsAppStatus | undefined {
+    return this.whatsappAccounts.get(accountId)?.getStatus();
+  }
+
+  /** Configured account ids that currently have a live manager. */
+  getWhatsAppAccountIds(): string[] {
+    return this.whatsAppManagers().map((m) => m.accountId);
+  }
+
+  async startWhatsAppLinking(accountId?: string): Promise<void> {
+    await this.whatsAppManagerFor(undefined, accountId).startLinking();
+  }
+
+  async requestWhatsAppPairingCode(phoneNumber: string, accountId?: string): Promise<string> {
+    return this.whatsAppManagerFor(undefined, accountId).requestPairingCode(phoneNumber);
+  }
+
+  async unlinkWhatsApp(accountId?: string): Promise<void> {
+    await this.whatsAppManagerFor(undefined, accountId).unlink();
+  }
+
+  async sendWhatsAppMessage(
+    jid: string,
+    text: string,
+    imagePath?: string,
+    accountId?: string,
+    /**
+     * Phase 2 extras, all optional so existing callers (auto-forward, older
+     * MCP builds) are unaffected: quote an inbound message, send the image
+     * uncompressed as a document, and clear the ⏳ ack left on the inbound
+     * message once the send lands.
+     */
+    opts?: { quotedMessageId?: string; asDocument?: boolean; ackMessageId?: string },
+  ): Promise<void> {
+    await this.whatsAppManagerFor(jid, accountId).sendMessage(jid, text, imagePath, opts);
+  }
+
+  /** Lazily construct this agent's WeChatManager — safe to call repeatedly. */
+  private ensureWeChatManager(): WeChatManager {
+    if (!this.wechat) {
+      // WECHAT_ILINK_FAKE is local-testing-only (see ilink-client.ts's
+      // createFakeILinkClient doc comment) — never set in a real deployment.
+      // The real client needs no account/credential of its own (confirmed
+      // against Tencent's own protocol doc — see ilink-client.ts's module
+      // comment), this flag exists purely to skip a real QR scan while
+      // iterating on the UI.
+      const client = isWeChatILinkFakeEnabled()
+        ? createFakeILinkClient()
+        : createILinkClient(process.env.ILINK_BASE_URL ?? '', this.agentConfig.wechat?.botAgent);
+      this.wechat = new WeChatManager(
+        this.agentConfig,
+        this.gatewayConfig.gateway.logDir,
+        client,
+        (update) => this.handleWeChatInboundMessage(update),
+      );
+    }
+    return this.wechat;
+  }
+
+  getWeChatStatus(): WeChatStatus {
+    return this.ensureWeChatManager().getStatus();
+  }
+
+  async startWeChatLinking(): Promise<void> {
+    await this.ensureWeChatManager().startLinking();
+  }
+
+  async unlinkWeChat(): Promise<void> {
+    await this.ensureWeChatManager().unlink();
+  }
+
+  async sendWeChatMessage(toId: string, text: string): Promise<void> {
+    await this.ensureWeChatManager().sendMessage(toId, text);
+  }
+
+  /**
+   * Gate + forward one inbound WeChat message. Mirrors the LINE webhook
+   * router's own gate-then-forward-to-/channel shape exactly (see
+   * src/api/line-webhook-router.ts's `recordDeniedSender` call and its
+   * "forward to the agent's existing /channel intake" comment) — WeChat has
+   * no webhook of its own, so this is the equivalent point for a message
+   * arriving off WeChatManager's long-poll loop instead of an Express route.
+   */
+  private handleWeChatInboundMessage(update: ILinkUpdate): void {
+    const cfg = this.agentConfig.wechat;
+    const allowed = isWeChatConversationAllowed(cfg, { fromId: update.fromId });
+    if (!allowed) {
+      const pairingOn = cfg?.pairing !== false; // absent ⇒ on, mirrors line.pairing/slack.pairing
+      const existing = getPendingSender('wechat', this.agentConfig.id, update.fromId);
+      const code = pairingOn ? (existing?.code ?? generatePairingCode()) : undefined;
+      const isNew = recordDeniedSender(
+        'wechat',
+        this.agentConfig.id,
+        update.fromId,
+        update.displayName,
+        Date.now(),
+        code,
+      );
+      if (isNew && pairingOn && code) {
+        this.wechat
+          ?.sendMessage(
+            update.fromId,
+            `This account isn't approved to message this agent yet. Give the admin this code: ${code}`,
+          )
+          .catch((err) =>
+            this.logger.warn('WeChat pairing-code reply failed', { error: (err as Error).message }),
+          );
+      }
+      return;
+    }
+
+    // Self-heal a stale pending-knock record for a sender who's now allowed.
+    // Approving a sender already clears their pending entry (router.ts's
+    // wechat_dm_allowlist PATCH handler), but confirmed live 2026-09-11: a
+    // sender can still show as both allowed AND pending in the UI, most
+    // likely a race between that approval and a message processed in the
+    // same window. Clearing it here too means any such staleness can't
+    // outlive this sender's very next allowed message.
+    clearPendingSender('wechat', this.agentConfig.id, update.fromId);
+
+    const meta: Record<string, string> = {
+      source: 'wechat',
+      chat_id: update.fromId,
+      user_id: update.fromId,
+      user: update.displayName || update.fromId,
+      message_id: update.id,
+      ts: new Date(update.timestamp ?? Date.now()).toISOString(),
+    };
+
+    void (async () => {
+      // Stage an inbound image or file to a temp path the same way LINE's
+      // webhook router does (src/api/line-webhook-router.ts's
+      // downloadLineImage/drainToFile pattern) — AgentRunner.injectTurn
+      // already knows how to take meta.image_path from here (the field name
+      // is historical; the mechanism itself is content-agnostic — it just
+      // copies whatever's at that path into MediaStore), rewrite the path
+      // for the agent's sandbox, and clean up the ephemeral original. No
+      // format sniffing for images: always staged as .jpg, matching
+      // Hermes-agent's own assumption for this same protocol. Files keep
+      // their real name/extension (sniffing isn't needed — it's given).
+      // update.id (Tencent's message_id) arrives as a JSON number at runtime
+      // despite ILinkUpdate declaring it a string (confirmed live
+      // 2026-09-11: `.replace is not a function` on a real image message) —
+      // String() it before sanitizing.
+      const safeId = String(update.id).replace(/[^a-zA-Z0-9_-]/g, '_');
+      if (update.image) {
+        try {
+          const bytes = await downloadWeixinImage(update.image, { maxBytes: MediaStore.maxUploadBytes });
+          const tempPath = path.join(os.tmpdir(), `wechat-img-${safeId}-${Date.now()}.jpg`);
+          await fsPromises.writeFile(tempPath, bytes);
+          meta.image_path = tempPath;
+          meta.media_ephemeral = '1';
+        } catch (err) {
+          this.logger.warn('WeChat image download failed, forwarding text only', {
+            error: (err as Error).message,
+          });
+        }
+      } else if (update.file) {
+        try {
+          const bytes = await downloadWeixinImage(update.file, { maxBytes: MediaStore.maxUploadBytes });
+          // Preserve the sender's real filename/extension (unlike images,
+          // which are always staged as .jpg) — the agent's Read tool needs a
+          // correct extension to make sense of a PDF/docx/etc.
+          const safeName = update.file.fileName.replace(/[^a-zA-Z0-9_.-]/g, '_') || 'file';
+          const tempPath = path.join(os.tmpdir(), `wechat-file-${safeId}-${Date.now()}-${safeName}`);
+          await fsPromises.writeFile(tempPath, bytes);
+          meta.image_path = tempPath;
+          meta.media_ephemeral = '1';
+        } catch (err) {
+          this.logger.warn('WeChat file download failed, forwarding text only', {
+            error: (err as Error).message,
+          });
+        }
+      }
+      try {
+        await fetch(`http://127.0.0.1:${this.callbackPort}/channel`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: update.text ?? '', meta }),
+        });
+      } catch (err) {
+        this.logger.error('WeChat: failed to forward to callback', { error: (err as Error).message });
+      }
+    })();
   }
 
   startSlackOutbound(): void {
@@ -3108,6 +3686,21 @@ export class AgentRunner extends EventEmitter {
 
   stopSlackOutbound(): void {
     this.slackOutbound = null;
+  }
+
+  startWhatsAppCloudOutbound(): void {
+    const cfg = this.agentConfig.whatsapp_cloud;
+    if (!cfg?.accessToken || !cfg?.phoneNumberId || !cfg?.appSecret || !cfg?.verifyToken) return;
+    if (this.whatsAppCloudOutbound) return; // already running
+    this.whatsAppCloudOutbound = new WhatsAppCloudClient({
+      accessToken: cfg.accessToken,
+      phoneNumberId: cfg.phoneNumberId,
+      logDir: this.gatewayConfig.gateway.logDir,
+    });
+  }
+
+  stopWhatsAppCloudOutbound(): void {
+    this.whatsAppCloudOutbound = null;
   }
 
   startLineReply(): void {
@@ -3213,6 +3806,15 @@ export class AgentRunner extends EventEmitter {
     // teardown rather than serially — both are bounded, neither depends on the
     // other, and shutdown latency is user-visible.
     const receiversStopped = [this.receiver?.stop(), this.discordReceiver?.stop()];
+    // stop(), not unlink() — gateway shutdown should NOT wipe a linked
+    // session; resumeIfLinked() picks each account back up on next boot.
+    // Synchronous (no socket-close promise to await), unlike the receivers above.
+    for (const manager of this.whatsappAccounts.values()) manager.stop();
+    this.whatsappAccounts.clear();
+    this.whatsappAccountForChat.clear();
+    // Force syncWhatsAppAccounts() to rebuild from scratch if this runner is
+    // started again, rather than short-circuiting on a stale snapshot.
+    this.whatsappConfigSnapshot = undefined;
     this.stopLineReply();
     await Promise.all([
       ...receiversStopped,
@@ -3309,7 +3911,7 @@ export class AgentRunner extends EventEmitter {
     sessionId: string,
     chatId: string,
     message: string,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams; videoParams?: VideoParams },
   ): Promise<{ text: string; attachments: ApiAttachment[] }> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -3335,6 +3937,8 @@ export class AgentRunner extends EventEmitter {
     // Refs built from staging paths must follow the files to their promoted
     // location — see remapImageParamsRefs (#74).
     const imageParams = AgentRunner.remapImageParamsRefs(opts.imageParams, opts.mediaFiles, finalMediaFiles);
+    // The image-to-video source frame follows the same staging→promoted move.
+    const videoParams = AgentRunner.remapVideoParamsRefs(opts.videoParams, opts.mediaFiles, finalMediaFiles);
 
     // Resolve media files to absolute paths for file-path based image passing
     // (same pattern as Telegram — Claude Code reads files via Read tool instead of base64 inline)
@@ -3396,6 +4000,7 @@ export class AgentRunner extends EventEmitter {
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttr = effectiveImagePaths.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePaths[0]!)}"` : '';
     const imageParamsNote = imageParams ? AgentRunner.buildImageParamsNote(imageParams) : '';
+    const videoParamsNote = videoParams ? AgentRunner.buildVideoParamsNote(videoParams) : '';
     // Persist the composer image options to session meta so the web can restore the
     // selection on reload (SessionMeta.imageConfig). Only when the send carries them
     // (the web sends image_params on first-set/change), so this holds the latest.
@@ -3407,11 +4012,18 @@ export class AgentRunner extends EventEmitter {
         .updateSessionMeta(this.agentConfig.id, chatId, sessionId, { imageConfig: durableImageConfig }, 'api')
         .catch(() => {});
     }
+    // Persist composer video options the same way (SessionMeta.videoConfig).
+    if (videoParams) {
+      this.sessionStore
+        .updateSessionMeta(this.agentConfig.id, chatId, sessionId, { videoConfig: videoParams }, 'api')
+        .catch(() => {});
+    }
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttr}>\n` +
       `${message}\n\n` +
       `${systemNote}` +
       `${imageParamsNote}` +
+      `${videoParamsNote}` +
       `</channel>` +
       (skillInvocation ? `\n${formatSkillContext(skillInvocation)}` : '');
 
@@ -3606,7 +4218,7 @@ export class AgentRunner extends EventEmitter {
     chatId: string,
     message: string,
     callbacks: ApiStreamCallbacks,
-    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams; requestId?: string },
+    opts: { timeoutMs: number; allowTools?: boolean; mediaFiles?: string[]; model?: string; skipUserMessage?: boolean; imageParams?: ImageParams; videoParams?: VideoParams; requestId?: string },
   ): Promise<() => void> {
     if (this.pendingApiSessions.has(sessionId)) {
       const err = Object.assign(
@@ -3632,6 +4244,8 @@ export class AgentRunner extends EventEmitter {
     // Refs built from staging paths must follow the files to their promoted
     // location — see remapImageParamsRefs (#74).
     const imageParamsStream = AgentRunner.remapImageParamsRefs(opts.imageParams, opts.mediaFiles, finalMediaFilesStream);
+    // The image-to-video source frame follows the same staging→promoted move.
+    const videoParamsStream = AgentRunner.remapVideoParamsRefs(opts.videoParams, opts.mediaFiles, finalMediaFilesStream);
 
     // Resolve media files to absolute paths for file-path based image passing
     const imagePathsStream = finalMediaFilesStream?.length ? this.resolveMediaPaths(finalMediaFilesStream) : [];
@@ -3911,6 +4525,7 @@ export class AgentRunner extends EventEmitter {
     // Build channel XML with image_path attribute (like Telegram) for first image
     const imageAttrStream = effectiveImagePathsStream.length ? ` image_path="${AgentRunner.escapeXmlAttr(effectiveImagePathsStream[0]!)}"` : '';
     const imageParamsNoteStream = imageParamsStream ? AgentRunner.buildImageParamsNote(imageParamsStream) : '';
+    const videoParamsNoteStream = videoParamsStream ? AgentRunner.buildVideoParamsNote(videoParamsStream) : '';
     // Persist composer image config to session meta (SessionMeta.imageConfig) so the
     // web restores the selection on reload. This is the streaming path the web uses.
     // image_refs are per-turn and deliberately excluded (#73).
@@ -3923,11 +4538,18 @@ export class AgentRunner extends EventEmitter {
         .updateSessionMeta(this.agentConfig.id, chatId, sessionId, { imageConfig: durableImageConfigStream }, 'api')
         .catch(() => {});
     }
+    // Persist composer video options the same way (SessionMeta.videoConfig).
+    if (videoParamsStream) {
+      this.sessionStore
+        .updateSessionMeta(this.agentConfig.id, chatId, sessionId, { videoConfig: videoParamsStream }, 'api')
+        .catch(() => {});
+    }
     const channelXml =
       `<channel source="api" chat_id="${chatId}" session_id="${sessionId}" ts="${new Date().toISOString()}"${imageAttrStream}>\n` +
       `${message}\n\n` +
       systemNote +
       imageParamsNoteStream +
+      videoParamsNoteStream +
       `</channel>` +
       (skillInvocationStream ? `\n${formatSkillContext(skillInvocationStream)}` : '');
 
@@ -4081,7 +4703,7 @@ export class AgentRunner extends EventEmitter {
     return this.historyDb;
   }
 
-  getAllSessionMeta(): Promise<Map<string, { name: string; imageConfig?: ImageParams; model?: string }>> {
+  getAllSessionMeta(): Promise<Map<string, { name: string; imageConfig?: ImageParams; videoConfig?: VideoParams; model?: string }>> {
     return this.sessionStore.getAllSessionMeta(this.agentConfig.id);
   }
 
