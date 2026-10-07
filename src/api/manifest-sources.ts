@@ -17,7 +17,7 @@ export function collectManifest(): RouteDef[] {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   createCronRouter(undefined as any);
-  createProjectsRouter([]);
+  createProjectsRouter([], '');
 
   return getRegisteredRoutes();
 }
