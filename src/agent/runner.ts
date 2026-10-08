@@ -491,6 +491,14 @@ export class AgentRunner extends EventEmitter {
     return Boolean(this.agentConfig.orchestration?.enabled && (this.agentConfig.orchestration.channels ?? ['api']).includes('api'));
   }
 
+  /** apiChatIds must be set before the spawn so the session's index can be found. */
+  private async apiSessionProject(sessionId: string): Promise<ProjectName | undefined> {
+    const chatId = this.apiChatIds.get(sessionId);
+    if (!chatId) return undefined;
+    const index = await this.sessionStore.loadIndex(this.agentConfig.id, chatId, 'api');
+    return index?.sessions.find((s) => s.id === sessionId)?.project as ProjectName | undefined;
+  }
+
   async resolveApiProject(name: ProjectName): Promise<Result<ProjectCwd, ProjectChatError>> {
     if (this.agentConfig.type === 'app-agent') return { ok: false, error: { code: 'project_unsupported_agent', reason: 'container' } };
     if (this.apiChannelOrchestrated()) return { ok: false, error: { code: 'project_unsupported_agent', reason: 'orchestrated' } };
@@ -2304,9 +2312,10 @@ export class AgentRunner extends EventEmitter {
         }
       }
 
-      // Restart if model changed (including switching back to the agent default)
-      if (existing.modelOverride !== effectiveOverride) {
-        this.logger.info('Model changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: effectiveOverride ?? agentDefaultModel });
+      // Restart if model changed (including switching back to the agent default),
+      // or if the bound project moved: the respawn re-resolves it or fails.
+      if (existing.modelOverride !== effectiveOverride || await existing.projectMoved()) {
+        this.logger.info('Model or project changed, restarting session', { mapKey, oldModel: existing.modelOverride, newModel: effectiveOverride ?? agentDefaultModel });
         const respawn = (async () => {
           await existing.stop();
           this.sessions.delete(mapKey);
@@ -2370,6 +2379,8 @@ export class AgentRunner extends EventEmitter {
 
     // Apply per-session model override (caller already normalized to undefined when == agent default)
     if (modelOverride) proc.modelOverride = modelOverride;
+    const project = source === 'api' ? await this.apiSessionProject(actualSessionId) : undefined;
+    if (project) proc.projectResolver = () => this.resolveApiProject(project);
 
     // Keep the searchable memory archive (planning-64) fresh for the memory_search
     // tool. Fire-and-forget, detached, OFF the event loop — never blocks the spawn.
@@ -4624,8 +4635,8 @@ export class AgentRunner extends EventEmitter {
     });
 
     // Use model from request body if provided, otherwise use agent default
-    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
     this.apiChatIds.set(sessionId, chatId);
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFiles = opts.mediaFiles?.length
@@ -4953,8 +4964,8 @@ export class AgentRunner extends EventEmitter {
     });
 
     // Use model from request body if provided, otherwise use agent default
-    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
     this.apiChatIds.set(sessionId, chatId);
+    const session = await this.getOrSpawnSession(sessionId, 'api', undefined, opts.model);
 
     // Promote UI-uploaded files from staging to permanent per-session storage
     const finalMediaFilesStream = opts.mediaFiles?.length
