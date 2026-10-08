@@ -34,7 +34,7 @@ import {
   truncateDetail,
 } from '../utils/tool-labels';
 import { resolveEnabledConnectors } from '../connectors/resolve';
-import { projectContext, type ProjectChatError, type ProjectCwd } from '../projects/chat';
+import { projectContext, projectUnavailableError, type ProjectChatError, type ProjectCwd } from '../projects/chat';
 import type { Result } from '../projects/paths';
 import { isReservedConnectorId } from '../connectors/custom';
 
@@ -1083,7 +1083,7 @@ export class SessionProcess extends EventEmitter {
     if (this.projectResolver) {
       const project = await this.projectResolver();
       if (epoch !== this.spawnEpoch) return false;
-      if (!project.ok) throw projectUnavailable(project.error);
+      if (!project.ok) throw projectUnavailableError(project.error);
       this.projectCwd = project.value;
       this.projectContext = await projectContext(this.gatewayConfig, project.value);
       if (epoch !== this.spawnEpoch) return false;
@@ -2210,9 +2210,4 @@ export class SessionProcess extends EventEmitter {
     if (this.process === proc) this.process = null;
     removeSessionDir();
   }
-}
-
-function projectUnavailable(error: ProjectChatError): Error {
-  const reason = error.code === 'project_not_found' ? 'not_found' : error.reason;
-  return Object.assign(new Error(`Project folder is unavailable (${reason})`), { code: 'PROJECT_UNAVAILABLE', reason });
 }
