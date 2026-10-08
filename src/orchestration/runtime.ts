@@ -75,7 +75,7 @@ import { HistoryDB } from '../history/db';
 import { RuntimeProfile } from '../session/runtime-profile';
 import { OrchestrationStore, AcceptInput, channelVoiceKey, payloadHash } from './store';
 import { resolveOrchestrationConfig } from './config';
-import { TaskService, taskIndexEntry } from './tasks/service';
+import { SessionProject, TaskService, taskIndexEntry } from './tasks/service';
 import { DecisionService, DecisionReceipt } from './decisions';
 import { TaskBridge } from './bridge';
 import { TaskWorkspaces } from './tasks/workspace';
@@ -123,6 +123,7 @@ export interface AgentOrchestrationHost {
   transcribeNote?: typeof transcribeVoiceNote;
   createAgentSession(sessionId: string, profile: RuntimeProfile, model?: string, scope?: ConversationScope): Promise<SessionProcess>;
   releaseAgentSession(sessionId: string, process: SessionProcess): Promise<void>;
+  sessionProject?: SessionProject;
 }
 export class AgentOrchestrationRuntime {
   private providerAdmission!: ProviderAdmissionStore;
@@ -240,7 +241,7 @@ export class AgentOrchestrationRuntime {
         if (agent.claude.extraFlags?.length) throw new OrchestrationError('PROFILE_FLAGS_CONFLICT');
       }
     } catch (error) { store.close(); releaseLock(); throw error; }
-    const tasks = new TaskService(store, agent.orchestration, agent.workspace);
+    const tasks = new TaskService(store, agent.orchestration, agent.workspace, host.sessionProject);
     const files = new TaskFiles(store, join(agent.workspace, '../..'), agent.type === 'app-agent' ? join(root, 'container-files') : undefined, agent.workspace);
     const safemodeAllowed = () => agent.type !== 'app-agent' && Boolean(gateway.safemode?.allowedAgentIds?.includes(agent.id));
     const gatewayAdapters = new Map<string, GatewayTaskAdapter>(agent.type === 'app-agent' ? [] : [['safemode',new SafemodeTaskAdapter(agent.id, safemodeAllowed)]]);
@@ -1156,8 +1157,9 @@ export class AgentOrchestrationRuntime {
       const pendingChanges = replayPending ? [{id:'pending',value:pendingState}] : pendingDelta;
 
       if (!semantic && input.skill && input.modality !== 'live_voice' && !channelSpeech && !visualInput.images.length && !visualInput.unavailable.length) {
-        const task = this.tasks.spawn({ ...capabilities, ...receipt, ...decision, principalId: input.scope.principalId,
-          model: options.model ?? this.agent.claude.model, actionId: `skill:${receipt.inputId}` }, {
+        const skillContext = { ...capabilities, ...receipt, ...decision, principalId: input.scope.principalId,
+          model: options.model ?? this.agent.claude.model, actionId: `skill:${receipt.inputId}` };
+        const task = this.tasks.spawn(skillContext, { project: await this.tasks.projectPin(skillContext),
           title: `/${input.skill.name}`, targetProfile: 'skill-worker', skill: input.skill,
           instructions: `Invoke the installed Skill tool named ${input.skill.name} with args ${JSON.stringify(input.skill.args)}. Follow its instructions within the worker capabilities. Report results and stage output files.`,
         });
