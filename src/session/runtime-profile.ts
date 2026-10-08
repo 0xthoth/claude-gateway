@@ -29,6 +29,8 @@ export interface RuntimeProfile {
   /** Explicit execution tool set resolved by gateway policy. */
   workerTools?: string[];
   hostExecution?: boolean;
+  /** A host worker in a project not in gateway.projects.trusted: the repo's hooks, MCP servers and settings must not load. */
+  untrustedProject?: boolean;
   containerExecution?: boolean;
   /** Captured optional evaluation-tool inventory for this process; permissions remain live. */
   jevEnabled?: boolean;
@@ -85,6 +87,7 @@ export function runtimeProfileArgs(profile: RuntimeProfile, extraFlags: string[]
     // Omitted means the complete native inventory (including Bash). An explicit
     // resolved policy must not silently widen back to all tools on the host.
     return ['--tools', profile.workerTools === undefined ? 'default' : profile.workerTools.join(','), '--mcp-config', profile.mcpConfigPath,
+      ...(profile.untrustedProject ? ['--setting-sources', 'user'] : []),
       ...(profile.checkpointCommand ? ['--settings', JSON.stringify({hooks:checkpointSettings(profile.checkpointCommand).hooks})] : []),
       ...(profile.skillPluginDir ? ['--plugin-dir', profile.skillPluginDir] : []),
       '--append-system-prompt', [profile.context, profile.overlay].filter(Boolean).join('\n\n')];
