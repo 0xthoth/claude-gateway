@@ -4845,12 +4845,15 @@ export class AgentRunner extends EventEmitter {
         fail(Object.assign(new Error('Session process exited unexpectedly before responding.'), { code: 'PROCESS_EXITED' }), buffer.join(''));
       };
 
+      const onStartupError = (error: Error) => fail(error, buffer.join(''));
+
       const cleanup = () => {
         clearTimeout(globalTimer);
         if (hardCapTimer) clearTimeout(hardCapTimer);
         if (quietTimer) clearTimeout(quietTimer);
         session.off('output', onOutput);
         session.off('exit', onExit);
+        session.off('startup-error', onStartupError);
         this.pendingApiSessions.delete(sessionId);
       };
 
@@ -4929,6 +4932,7 @@ export class AgentRunner extends EventEmitter {
 
       session.on('output', onOutput);
       session.on('exit', onExit);
+    session.on('startup-error', onStartupError);
       session.setProcessing(true);
       session.sendMessage(channelXml);
       // Do NOT call resetQuiet() here — the quiet timer should only start
@@ -5128,11 +5132,14 @@ export class AgentRunner extends EventEmitter {
       fail(Object.assign(new Error('Session process exited unexpectedly before responding.'), { code: 'PROCESS_EXITED' }), buffer.join(''));
     };
 
+    const onStartupError = (error: Error) => fail(error, buffer.join(''));
+
     const cleanup = () => {
       clearTimeout(globalTimer);
       if (hardCapTimer) clearTimeout(hardCapTimer);
       session.off('output', onOutput);
       session.off('exit', onExit);
+      session.off('startup-error', onStartupError);
       this.pendingApiSessions.delete(sessionId);
     };
 
@@ -5257,6 +5264,7 @@ export class AgentRunner extends EventEmitter {
 
     session.on('output', onOutput);
     session.on('exit', onExit);
+    session.on('startup-error', onStartupError);
 
     // Image paths only work when allowTools:true — Claude needs the Read tool to access them
     const allowToolsStream = opts.allowTools ?? false;
