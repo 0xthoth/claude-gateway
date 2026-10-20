@@ -95,15 +95,81 @@ describe('DELETE /api/v1/projects/:name', () => {
     expect(exists('api')).toBe(false);
   });
 
-  it('answers 500 and removes nothing when the busy check throws', async () => {
-    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
-    const a = express();
-    a.use(express.json());
-    a.use('/api', createProjectsRouter(apiKeys, root, { logger: silentLogger, chatTurnActive: async () => { throw new Error('store gone'); } }));
-    const res = await request(a).delete('/api/v1/projects/api').set(as('k-write')).send({ confirm: 'api' });
-    error.mockRestore();
-    expect([res.status, res.body]).toEqual([500, { error: 'Internal error' }]);
-    expect(exists('api', 'src', 'index.js')).toBe(true);
+  it('answers project_deleting to a second delete of the folder, by its name or through a symlink alias', async () => {
+    fs.symlinkSync(path.join(root, 'api'), path.join(root, 'alias'));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const atRename = new Promise<void>((resolve) => { reached = resolve; });
+    const realRename = fs.promises.rename.bind(fs.promises);
+    const rename = jest.spyOn(fs.promises, 'rename').mockImplementation(async (from, to) => {
+      if (path.basename(String(to)).startsWith('.deleting-')) { reached(); await gate; }
+      return realRename(from, to);
+    });
+    try {
+      const first = Promise.resolve(del());
+      await atRename;
+      const again = await del();
+      const viaAlias = await del('alias');
+      release();
+      expect([again.status, again.body.code]).toEqual([409, 'project_deleting']);
+      expect([viaAlias.status, viaAlias.body.code]).toEqual([409, 'project_deleting']);
+      expect((await first).status).toBe(200);
+    } finally {
+      release();
+      rename.mockRestore();
+    }
+  });
+
+  describe('when the busy check throws', () => {
+    let failOn: (call: number) => boolean;
+    let logged: string[];
+    const throwingApp = (): express.Express => {
+      const a = express();
+      a.use(express.json());
+      let calls = 0;
+      const logger = { ...silentLogger, error: (m: string) => { logged.push(m); } };
+      a.use('/api', createProjectsRouter(apiKeys, root, {
+        logger,
+        chatTurnActive: (name) => {
+          if (failOn(++calls)) throw new Error(`store gone at ${root}/${name} token=hunter2`);
+          return false;
+        },
+      }));
+      return a;
+    };
+    const delVia = (a: express.Express) => request(a).delete('/api/v1/projects/api').set(as('k-write')).send({ confirm: 'api' });
+
+    beforeEach(() => {
+      failOn = () => true;
+      logged = [];
+    });
+
+    it('answers 500 internal and removes nothing', async () => {
+      const res = await delVia(throwingApp());
+      expect([res.status, res.body]).toEqual([500, { error: 'Internal error', code: 'internal' }]);
+      expect(exists('api', 'src', 'index.js')).toBe(true);
+    });
+
+    it('logs one line to the injected logger, without the message, and nothing to the console', async () => {
+      const spies = (['error', 'warn', 'log', 'info'] as const).map((m) => jest.spyOn(console, m).mockImplementation(() => {}));
+      try {
+        await delVia(throwingApp());
+        for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+      } finally {
+        for (const spy of spies) spy.mockRestore();
+      }
+      expect(logged).toEqual(['projects: DELETE /v1/projects/api failed: Error']);
+    });
+
+    it('releases the deleting mark, so a later delete succeeds', async () => {
+      failOn = (call) => call === 2;
+      const a = throwingApp();
+      expect((await delVia(a)).status).toBe(500);
+      const res = await delVia(a);
+      expect([res.status, res.body]).toEqual([200, { name: 'api' }]);
+      expect(exists('api')).toBe(false);
+    });
   });
 
   it('removes a link inside the project without touching what it points to', async () => {

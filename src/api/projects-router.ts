@@ -60,8 +60,14 @@ export interface ProjectsRouterDeps {
  * one changes the pod and needs an admin key.
  */
 export function createProjectsRouter(apiKeys: ApiKey[], root: string, deps: ProjectsRouterDeps): Router {
-  const router = guardAsyncRoutes(Router());
   const { logger } = deps;
+  // The message and stack can carry paths and secrets, so only the error's class and errno code are logged.
+  const router = guardAsyncRoutes(Router(), (req, res, err) => {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    logger.error(`projects: ${req.method} ${req.path} failed: ${err instanceof Error ? err.name : typeof err}${typeof code === 'string' ? ` ${code}` : ''}`);
+    if (res.headersSent) res.end();
+    else fail(res, 'internal');
+  });
   const auth = createApiAuthMiddleware(apiKeys);
 
   defineRoute(

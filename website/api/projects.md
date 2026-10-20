@@ -97,8 +97,8 @@ downgrade.
 
 Every error has the shape `{ "error": string, "code": string }`. Branch on
 `code`; `error` is human-readable and may change. The git routes add their own
-codes, listed under [Git errors](#git-errors). The one exception is an unexpected failure inside
-the gateway, which answers `500` with `{ "error": "Internal error" }` and no `code`.
+codes, listed under [Git errors](#git-errors). An unexpected failure inside the gateway answers
+`500` with `{ "error": "Internal error", "code": "internal" }`.
 
 | Status | `code` | When |
 |--------|--------|------|
@@ -112,7 +112,7 @@ the gateway, which answers `500` with `{ "error": "Internal error" }` and no `co
 | 409 | `project_exists` | `POST` named a project, file or symlink that already exists, compared case-insensitively (`Site` collides with `site`). |
 | 409 | `project_running` | `DELETE` found a chat turn running in the project (a turn still starting, an accepted message not yet handled, or a task that has not finished), or a chat or task that works in the folder through a symlink alias. Deleting the chat session does not release it while its turn, accepted message or task is still live. |
 | 409 | `project_deleting` | The project is being deleted: a second `DELETE` of the same folder (by its name or through a symlink alias) found the delete already in progress. |
-| 500 | `internal` | Any other filesystem error. |
+| 500 | `internal` | Any other filesystem error, or an unexpected failure inside the gateway. |
 
 **Project name.** Matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Directories under
 the root whose names do not match are not listed.
