@@ -93,7 +93,6 @@ describe("createProject", () => {
         path: path.join(root, "app"),
         modified_at: expect.any(String),
         is_git: false,
-        stack: null,
       },
     });
     fs.writeFileSync(path.join(root, "app", "keep.txt"), "precious");

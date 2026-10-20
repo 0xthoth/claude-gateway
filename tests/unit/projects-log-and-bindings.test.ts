@@ -4,22 +4,13 @@ import * as path from 'path';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
-import { setProjectsLogger } from '../../src/projects/log';
-import { startProject } from '../../src/projects/start';
-import type { AgentConfig, ApiKey, GatewayConfig, Logger } from '../../src/types';
+import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
 
 const KEYS = {
   admin: { key: 'k-admin', agents: '*', admin: true },
   podRead: { key: 'k-ro', agents: '*' },
 } satisfies Record<string, ApiKey>;
 const A = '/api/v1/agents/alfred';
-
-const sink = () => {
-  const warn = jest.fn();
-  setProjectsLogger({ debug: jest.fn(), info: jest.fn(), warn, error: jest.fn() } as unknown as Logger);
-  return warn;
-};
-afterEach(() => setProjectsLogger(undefined));
 
 describe('a bindings folder that cannot be read', () => {
   let base: string;
@@ -50,20 +41,5 @@ describe('a bindings folder that cannot be read', () => {
         expect([key, url, (await request(gw).get(url).set('Authorization', `Bearer ${key}`)).status]).toEqual([key, url, 200]);
       }
     }
-  });
-});
-
-describe('a project start that never launched', () => {
-  it('logs the message and errno to the gateway logger and returns only the bare reason', async () => {
-    const warn = sink();
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'start-fail-'));
-    fs.mkdirSync(path.join(dir, '.pod'));
-    fs.writeFileSync(path.join(dir, '.pod', 'start.sh'), 'exit 0\n');
-    const sys = { listeners: async () => [], sleep: async () => {} } as never;
-    const launcher = async () => { throw Object.assign(new Error('spawn sh ENOENT /secret/path'), { code: 'ENOENT' }); };
-    const res = await startProject(sys, launcher as never, { realProject: dir, name: 'site', logPath: path.join(dir, 'x.log') });
-    fs.rmSync(dir, { recursive: true, force: true });
-    expect(res).toEqual({ ok: false, error: { code: 'start_failed', reason: 'ENOENT' } });
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ENOENT /secret/path'), { code: 'ENOENT' });
   });
 });

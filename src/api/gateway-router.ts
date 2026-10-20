@@ -12,7 +12,6 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { expandHome } from '../utils/paths';
 import { Server } from 'http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { AgentRunner } from '../agent/runner';
@@ -51,7 +50,6 @@ import { createCapabilitiesRouter } from './capabilities';
 import { GATEWAY_VERSION } from './gateway-version';
 import { createWorkspaceRouter } from './workspace-router';
 import { createProjectsRouter } from './projects-router';
-import { StopLimiter, systemSys } from '../projects/running';
 import { projectsEnabled, resolveProjectsRoot } from '../projects/chat';
 import { createSkillsRouter } from './skills-router';
 import { createPackagesRouter } from './packages';
@@ -750,9 +748,6 @@ export class GatewayRouter {
     // Mount the pod-wide Projects API (gateway.projects.root, default ~/projects)
     if (this.gatewayConfig?.gateway?.api?.keys && projectsEnabled(this.gatewayConfig)) {
       this.app.use('/api', createProjectsRouter(this.gatewayConfig.gateway.api.keys, resolveProjectsRoot(this.gatewayConfig), {
-        sys: systemSys(),
-        limiter: new StopLimiter(),
-        logDir: this.gatewayConfig.gateway.logDir ? path.join(expandHome(this.gatewayConfig.gateway.logDir), 'projects') : undefined,
         chatTurnActive: async (name) => (await Promise.all([...this.agents.values()].map((runner) => runner.hasActiveProjectTurn(name)))).some(Boolean),
       }));
     }

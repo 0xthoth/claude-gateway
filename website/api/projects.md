@@ -2,32 +2,31 @@
 
 List the project directories under the pod's projects root, `~/projects` by
 default. The web dashboard uses these routes to list projects, create and delete
-one, read the git status of each project, and see, start and stop what runs in
-it. The gateway does not serve project files: it has no route that lists a
+one, and read the git status of each project. The gateway does not serve project files: it has no route that lists a
 project's folders or returns a file's contents. View project files in
 code-server. Editing files and changing a repository (commit, push, pull) are
 out of scope too. Use code-server or the git connector for that.
 
-**Auth.** Projects belong to the pod, not to an agent, so any valid API key can read the list, git status and
-running status. Creating, starting, stopping and deleting a project
+**Auth.** Projects belong to the pod, not to an agent, so any valid API key can read the list and git status.
+Creating and deleting a project
 change the pod and need an admin API key (`admin: true`). Any other key, a pod-wide write key included, gets
-`403 forbidden_key` on those four routes, with the message `An admin API key is required for Projects`.
+`403 forbidden_key` on those two routes, with the message `An admin API key is required for Projects`.
 A project-bound chat belongs to its agent and follows the agent's rules like any other chat: see
 [Sessions](/api/sessions#post-apiv1agentsagentidsessions).
 
 **Feature detection.** `GET /api/v1/capabilities` lists
-`"projects": ["list", "create", "git", "chat", "run", "start", "delete", "stop", "disk", "cleanup"]` for an admin key.
-A key that is not an admin key gets `["list", "git", "chat", "run", "disk"]`. Show the project list
+`"projects": ["list", "create", "git", "chat", "delete"]` for an admin key.
+A key that is not an admin key gets `["list", "git", "chat"]`. Show the project list
 only when the array includes `"list"`, project create only when it includes `"create"`, the git status view only when it includes `"git"` (read-only: the gateway has no route that changes a repository),
 and [project-bound chat](/api/sessions#post-apiv1agentsagentidsessions) only when
-it includes `"chat"`. Show running status only when it includes `"run"`, the Stop button only when it includes `"stop"`, the Start button only when it includes `"start"`, the Delete action only when it includes `"delete"`, disk sizes only when it includes `"disk"`, and [Free up space](#cleanup) only when it includes `"cleanup"`.
+it includes `"chat"`. Show the Delete action only when it includes `"delete"`.
 When the array is empty, `projectsUnavailable` is `"disabled"`: the gateway serves no Projects API. The field is
 absent when Projects is usable. An older gateway omits the key, lists projects without
-`"git"`, `"chat"`, `"run"`, `"stop"`, `"disk"` or `"cleanup"`, or answers `"admin_required"` for a key that is not an admin key.
+`"git"` or `"chat"`, or answers `"admin_required"` for a key that is not an admin key.
 
 **On by default.** The routes are on for every install, with the root `~/projects`, and
-need no configuration. Every valid key can list the projects in that folder and read their git and running status, and every key with
-`admin: true` can also create, start, stop and delete projects there, and free up space in them. To switch Projects off, set
+need no configuration. Every valid key can list the projects in that folder and read their git status, and every key with
+`admin: true` can also create and delete projects there. To switch Projects off, set
 `gateway.projects.enabled` to `false` and restart. Only a boolean counts: the string `"false"`, `0` or `null` is
 ignored with a warning in `gateway.log`, and Projects keeps its default, which is on:
 
@@ -37,7 +36,7 @@ ignored with a warning in `gateway.log`, and Projects keeps its default, which i
 
 **Security model.** An admin key can do everything, for every agent. Any other key reaches the agents it lists
 (or every agent with `agents: "*"`), can write only when it has `write: true`, and can list every project
-and read its git and running status. Admin-only means only create, start, stop and delete. The gateway does
+and read its git status. Admin-only means only create and delete. The gateway does
 not serve project files to any key, so files are viewed in code-server. The git routes remove credentials from
 remote URLs. Every listing also carries the host path of the projects root as `root`, which usually includes the home directory.
 These checks are not a filesystem boundary.
@@ -81,13 +80,12 @@ inside `gateway.projects` are ignored, and the gateway logs a warning that names
 **Requirements and files.** Projects needs `git` 2.26 or newer on the pod. The read calls
 (`git status --porcelain=v2`, `rev-parse --absolute-git-dir`, `log`, `rev-list`) work from 2.13,
 but the check that blanks a repository's own filter commands uses `git config --show-scope`
-(2.26). On an older git that check finds nothing, and the filter protection below does not apply. Projects also uses
-`ss`, or `/proc` when `ss` is missing, to find listeners, and writes these files:
+(2.26). On an older git that check finds nothing, and the filter protection below does not apply. Projects writes
+these files:
 
 | Path | Holds |
 | ---- | ----- |
 | `<agent dir>/project-bindings/<sessionId>.json` | Which project a chat is bound to. Written only for project chats and deleted with the session |
-| `<gateway.logDir>/projects/<name>.log` | Output of a project started with `running/start`. With the default `logDir` this is `~/.claude-gateway/logs/projects/` |
 | `<root>/.deleting-<name>-<id>` | What a `DELETE` could not remove. Safe to delete by hand |
 
 **Downgrading.** Gateways without Projects ignore the `projects` block. A project chat opened
@@ -99,8 +97,7 @@ downgrade.
 
 Every error has the shape `{ "error": string, "code": string }`. Branch on
 `code`; `error` is human-readable and may change. The git routes add their own
-codes, listed under [Git errors](#git-errors). The one exception is a malformed
-[`POST /api/v1/projects/cleanup`](#post-cleanup) body, which answers `400` with `error` only.
+codes, listed under [Git errors](#git-errors).
 
 | Status | `code` | When |
 |--------|--------|------|
@@ -108,13 +105,12 @@ codes, listed under [Git errors](#git-errors). The one exception is a malformed
 | 400 | `not_a_directory` | The project is a link to a file, or the root exists but is not a directory. |
 | 403 | `path_escape` | The project's real path (after symlinks) leaves the root or is the root itself (for example a link `all -> .`). |
 | 403 | `permission_denied` | The gateway's user cannot read it. |
-| 403 | `forbidden_key` | Create, delete, stop, start or [Free up space](#cleanup) with a key that is not an admin key. |
+| 403 | `forbidden_key` | Create or delete with a key that is not an admin key. |
 | 404 | `not_found` | The project does not exist. |
 | 400 | `confirm_mismatch` | `DELETE` did not send `confirm` equal to the project name. |
 | 409 | `project_exists` | `POST` named a project, file or symlink that already exists, compared case-insensitively (`Site` collides with `site`). |
-| 409 | `project_running` | `DELETE` found a process listening from inside the project, a chat turn running in it (a turn still starting, an accepted message not yet handled, or a task that has not finished), a `running/start` still waiting for its listener, or a chat or task that works in the folder through a symlink alias. Deleting the chat session does not release it while its turn, accepted message or task is still live. |
-| 409 | `project_deleting` | The project is being deleted. `running/start` arrived meanwhile, or a second `DELETE` of the same folder (by its name or through a symlink alias) found the delete already in progress. |
-| 409 | `cleanup_in_progress` | `POST /api/v1/projects/cleanup` while another cleanup runs. |
+| 409 | `project_running` | `DELETE` found a chat turn running in the project (a turn still starting, an accepted message not yet handled, or a task that has not finished), or a chat or task that works in the folder through a symlink alias. Deleting the chat session does not release it while its turn, accepted message or task is still live. |
+| 409 | `project_deleting` | The project is being deleted: a second `DELETE` of the same folder (by its name or through a symlink alias) found the delete already in progress. |
 | 500 | `internal` | Anything else. |
 
 **Project name.** Matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`. Directories under
@@ -135,7 +131,7 @@ curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/projects
   "root": "/home/user/projects",
   "exists": true,
   "projects": [
-    { "name": "demo", "path": "/home/user/projects/demo", "modified_at": "2026-10-06T07:41:58.706Z", "is_git": true, "stack": "nextjs" }
+    { "name": "demo", "path": "/home/user/projects/demo", "modified_at": "2026-10-06T07:41:58.706Z", "is_git": true }
   ]
 }
 ```
@@ -154,18 +150,10 @@ why a folder is missing. Both are absent when empty, and `projects` is not affec
 `is_git` is true when the project has a `.git` entry (a directory, or the file a
 worktree or submodule uses).
 
-`stack` is a guess from the project's root files, or `null` when nothing marks one. It is one of
-`nextjs`, `astro`, `react`, `vue`, `svelte`, `node`, `python`, `go`, `rust`, `ruby`, `php`, `java`
-or `html`. A `package.json` decides first, by its dependencies (`next`, `astro`, `react`, `vue`,
-`svelte`, else `node`). Without one, `pyproject.toml`, `go.mod`, `Cargo.toml`, `Gemfile`,
-`composer.json`, `pom.xml` and similar files decide, and a lone `index.html` means `html`. Clients
-should treat an unknown value as `null`.
-
 ## POST /api/v1/projects {#post-projects}
 
 Create `<root>/<name>`, creating the root first if needed. Needs an admin key. Returns
-`201` with the new project in the same shape [the list](#get-projects) uses. Its `stack` is
-`null`, since a new directory has no files to mark one.
+`201` with the new project in the same shape [the list](#get-projects) uses.
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -178,7 +166,7 @@ curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json"
 ```
 
 ```json
-{ "project": { "name": "demo", "path": "/home/user/projects/demo", "modified_at": "2026-10-06T07:41:58.686Z", "is_git": true, "stack": null } }
+{ "project": { "name": "demo", "path": "/home/user/projects/demo", "modified_at": "2026-10-06T07:41:58.686Z", "is_git": true } }
 ```
 
 If the name is already taken the response is `409 project_exists` and the
@@ -190,7 +178,7 @@ installed). It never includes git's output, which the gateway logs instead.
 
 ```json
 {
-  "project": { "name": "nogit", "path": "/home/user/projects/nogit", "modified_at": "2026-10-06T07:41:58.698Z", "is_git": false, "stack": null },
+  "project": { "name": "nogit", "path": "/home/user/projects/nogit", "modified_at": "2026-10-06T07:41:58.698Z", "is_git": false },
   "warning": "git init failed (ENOENT)"
 }
 ```
@@ -209,9 +197,9 @@ curl -X DELETE -H "Authorization: Bearer $KEY" -H "Content-Type: application/jso
   -d '{"confirm":"demo"}' http://localhost:10850/api/v1/projects/demo
 ```
 
-While something listens on a port from inside the project, or a chat bound to the project has a
-turn in flight, the response is `409 project_running` and nothing is removed. Stop the listener
-with [`running/stop`](#running), or wait for or stop the chat turn. While a delete is in progress,
+While a chat bound to the project has a turn in flight, the response is `409 project_running` and
+nothing is removed. Wait for or stop the chat turn. The gateway does not check for processes, such
+as a dev server, that run inside the folder: stop them before you delete. While a delete is in progress,
 a message or task start in the project fails with `409 PROJECT_UNAVAILABLE` (`reason`
 `project_deleting`), and a second `DELETE` answers `409 project_deleting`. Links inside the project
 are removed, never followed, so a link out of the project cannot delete what it points to. A
@@ -388,279 +376,3 @@ curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/projects/app/
 | 503 | `git_unavailable` | Git is not installed, or is not on the gateway's `PATH`. `git-summary` answers it too, since no repository can be read. The gateway logs a warning once. |
 | 504 | `timeout` | Git ran past its limit of 3 seconds. |
 | 500 | `git_failed` | Any other git failure. Git's output is not returned. |
-
-## Disk usage {#disk}
-
-### GET /api/v1/projects/disk {#get-disk}
-
-How much disk space each project occupies, and how full the disk that holds the projects root is. Any valid key can
-read it. Send it after the project list has rendered: it runs one `du` per project and can take seconds on a large root.
-
-The size of a project is the space its folder really occupies on disk, `node_modules` and `.git` included. A file with
-several hard links counts once, a symlink counts as the link itself and is never followed, and a folder mounted from
-another filesystem inside the project is not counted (`du -s -k -x`). The gateway runs `du` without a shell and with a
-trimmed environment, 3 at a time, with 10 seconds per project and 30 seconds for the whole request. The same folders
-as [`GET /api/v1/projects`](#get-projects) are measured: valid names, real folders inside the root, no `.deleting-*`.
-
-```bash
-curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/projects/disk
-```
-
-```json
-{
-  "supported": true,
-  "disk": { "total": 53687091200, "used": 16642998272, "free": 34359738368 },
-  "projects": [
-    { "name": "app", "bytes": 431194112, "state": "ok" },
-    { "name": "huge", "bytes": null, "state": "partial" },
-    { "name": "locked", "bytes": null, "state": "failed" }
-  ],
-  "computedAt": "2026-01-01T12:00:00.000Z",
-  "cached": false
-}
-```
-
-| Field | Type | Meaning |
-|-------|------|---------|
-| `supported` | `boolean` | `false` on a host that cannot be measured (Windows). `disk` is then `null` and `projects` is empty. |
-| `disk` | `{ total, used, free }` or `null` | Bytes of the filesystem that holds the root, from `statfs`. `free` is what a non-root user can still write, so `used + free` can be less than `total`. `null` when the root does not exist or cannot be read. |
-| `projects[].bytes` | integer or `null` | Bytes the folder occupies. `null` when no size is known. |
-| `projects[].state` | `"ok"`, `"partial"`, `"failed"` | `ok`: measured. `partial`: the time ran out (`bytes` is `null`), or `du` could not read part of the folder (`bytes` counts what it could read, so it is a lower bound). `failed`: no size could be read. |
-| `computedAt` | ISO 8601 string | When the numbers were measured. |
-| `cached` | `boolean` | `true` when the answer came from the cache. |
-
-**Cache.** The whole answer is kept for 60 seconds. Requests that arrive while a measurement runs share it. `?refresh=1`
-skips the cache but still joins a measurement already running, and the gateway honours it at most once every 5 seconds:
-a refresh sooner than that is answered like a plain read, so check `cached` and `computedAt` rather than assuming a
-fresh measurement. A root that cannot be listed answers the same errors as `GET /api/v1/projects` and is not cached.
-
-## Free up space {#cleanup}
-
-Removes folders that a project's own tools can create again, to give disk space back. Both routes need an admin key; any
-other key gets `403 forbidden_key`. Only these folders, at the top level of a project folder, are ever removed:
-
-| Folder | `kind` | Removed only when |
-|--------|--------|-------------------|
-| `node_modules` | `node_modules` | The project root has a `package.json` file. |
-| `.venv`, `venv` | `venv` | The project root has one of `requirements.txt`, any `requirements*.txt`, `pyproject.toml`, `Pipfile`, `Pipfile.lock`, `poetry.lock`, `uv.lock` or `setup.py`, and the folder holds a `pyvenv.cfg` file. |
-
-The folder must be a real directory, not a symlink, on the same filesystem as the project. Source code, `.git`, `.env`,
-databases, build output (`dist`, `build`, `target`, `.next`) and caches are never removed. Folders deeper in the
-project are not looked at, so the packages of a monorepo keep their own `node_modules`. A project that is a symlink
-alias of another project is not listed; its target is listed under its own name.
-
-### GET /api/v1/projects/cleanup {#get-cleanup}
-
-What a cleanup would remove now. Reads only: nothing is changed. Sizes come from the same `du -s -k -x` as
-[disk usage](#get-disk), 3 at a time, 10 seconds per folder and 30 seconds for the request. Only projects with at least
-one folder that qualifies are listed.
-
-```bash
-curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/projects/cleanup
-```
-
-```json
-{
-  "supported": true,
-  "projects": [
-    {
-      "name": "api",
-      "skipped": null,
-      "folders": [
-        { "path": ".venv", "kind": "venv", "bytes": 98304000, "restore": "uv sync" }
-      ]
-    },
-    {
-      "name": "web",
-      "skipped": "running",
-      "folders": [
-        { "path": "node_modules", "kind": "node_modules", "bytes": 431194112, "restore": "npm ci" }
-      ]
-    }
-  ],
-  "totalBytes": 98304000,
-  "computedAt": "2026-01-01T12:00:00.000Z"
-}
-```
-
-| Field | Type | Meaning |
-|-------|------|---------|
-| `supported` | `boolean` | `false` on Windows, where `projects` is empty. |
-| `projects[].skipped` | `null`, `"running"`, `"chat_active"`, `"deleting"` | Why the project cannot be cleaned now. `running`: a process listens on a port from inside the project, or a `running/start` is waiting for its listener. `chat_active`: a chat bound to the project has a turn in flight. `deleting`: the project is being deleted. A skipped project still lists its folders and sizes. |
-| `projects[].folders[].bytes` | integer or `null` | Bytes the folder occupies. `null` when `du` gave no total in time. |
-| `projects[].folders[].restore` | string or `null` | A command that creates the folder again. `node_modules`: `npm ci` with `package-lock.json`, `pnpm install` with `pnpm-lock.yaml`, `yarn install` with `yarn.lock`, `bun install` with `bun.lock` or `bun.lockb`, `npm install` without a lockfile. A virtual environment: `uv sync` with `uv.lock`, `python3 -m venv <folder> && <folder>/bin/pip install -r requirements.txt` with `requirements.txt`, `poetry install` with `poetry.lock`, `null` otherwise. The first lockfile in that order wins. |
-| `totalBytes` | integer | Sum of the known sizes in projects that are not skipped. |
-
-### POST /api/v1/projects/cleanup {#post-cleanup}
-
-Removes the chosen folders. The gateway decides again, for every folder, whether it qualifies, with the same rules as
-the preview: a folder the client names that does not qualify is skipped, never removed.
-
-```bash
-curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"items":[{"project":"api","folders":[".venv"]},{"project":"web","folders":["node_modules"]}]}' \
-  http://localhost:10850/api/v1/projects/cleanup
-```
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `items` | Yes | 1 to 200 `{ "project": string, "folders": string[] }` entries. `project` follows the project name rules. `folders` holds one or more of `node_modules`, `.venv`, `venv`. A project named twice is merged. |
-
-A body over 64 KiB, or any other value, answers `400` with an `error` message and no `code`.
-
-```json
-{
-  "results": [
-    { "project": "api", "folder": ".venv", "state": "removed", "bytes": 98304000 },
-    { "project": "web", "folder": "node_modules", "state": "skipped", "bytes": null, "reason": "running" }
-  ],
-  "freedBytes": 98304000
-}
-```
-
-| `state` | `reason` | Meaning |
-|---------|----------|---------|
-| `removed` | none | The folder is gone. `bytes` is its size just before removal, `null` if `du` gave no total. |
-| `skipped` | `running`, `chat_active`, `deleting` | The project became busy, as in the preview. Checked when its turn comes and again before each folder is removed. |
-| `skipped` | `not_eligible` | The folder does not qualify, or stopped qualifying while it was measured. |
-| `skipped` | `not_found` | The project does not exist, or is a symlink alias. |
-| `skipped` | `unsupported` | Windows. |
-| `failed` | `rename_failed`, `remove_failed` | See below. `bytes` is `null`. |
-
-Projects are handled one at a time, in request order. Each folder is moved to a hidden sibling
-`.pod-cleanup-<id>` in the same project, then that folder is removed. Links inside it are removed, not followed. If
-the removal fails partway, the result is `failed` with `remove_failed`, and what is left stays in `.pod-cleanup-<id>`;
-the next cleanup of that project removes it first. `freedBytes` is the sum of `bytes` of the removed folders. Each
-removed folder is logged with its project, folder and size. The [disk usage](#get-disk) cache is dropped, so the next
-read measures again.
-
-Only one cleanup runs at a time: another `POST` meanwhile answers `409 cleanup_in_progress`.
-
-## Running processes {#running}
-
-A project counts as running when a process listens on a TCP port and either its
-working directory is inside the project folder (`via: "cwd"`) or one of its
-arguments is an absolute path inside the project folder (`via: "argv"`, for example
-`python3 -m http.server --directory <project>` started from `/tmp`). Listening sockets come from `ss -H -ltnp`,
-or from `/proc/net/tcp` and `/proc/<pid>/fd` when `ss` is missing. Any valid key can read
-running status. Stop and start need an admin key.
-
-### GET /api/v1/projects/:name/running {#get-running}
-
-Returns `200` with one entry per port, sorted by port:
-
-```json
-{ "supported": true, "processes": [ { "port": 3000, "pids": [123, 456], "command": "node server.js", "address": "127.0.0.1", "via": "cwd" } ] }
-```
-
-`via` is `"cwd"` or `"argv"` and says how the first listener on that port was tied
-to the project. A client that does not know the field can ignore it. `command` is the first listener's argument list joined by spaces and cut to 120
-characters. The value after any flag whose name contains `token`, `password`,
-`passwd`, `pass` (as a word of its own, so `--requirepass` but not `--passWithNoTests`), `secret`, `key`,
-`auth`, `credential` or `bearer` (such as `--api-key`, `--auth`, `-passwd` or `--client-secret=...`)
-is replaced with `[redacted]`. For `ttyd`, `-c user:pw` is too. `-p` is redacted by program. For `sshpass`, both
-`-p pw` and `-ppw` are. For `mysql`, `mysqldump`, `mysqladmin`, `mariadb` and
-`mariadb-dump`, the attached `-ppw` is, even when it is all digits; a bare `-p` is
-left alone, since the next argument is a database name. For any other program only a
-non-numeric `-ppw` is, so a port such as `-p 3000` or `-p3000` stays visible. User and password in a URL (`postgres://user:pw@db/x`)
-are removed. All of this happens before the cut. The environment is never returned. On a host that is not
-Linux, or where `/proc` cannot be read, the response is
-`{ "supported": false, "processes": [] }`.
-
-### GET /api/v1/projects/running {#get-running-all}
-
-Every project's listeners in one answer, for project cards. The gateway scans the
-listening sockets once and ties each one to a project with the same rules, the same
-`via` and the same `command` redaction as
-[`GET /api/v1/projects/:name/running`](#get-running). Projects are the ones
-[`GET /api/v1/projects`](#get-projects) lists: a symlink that leaves the root is
-skipped. Only the first 200 projects, in name order, are looked at, and `truncated` says whether more existed. A client must not read a missing project as "not running" when `truncated` is `true`; ask [`GET /api/v1/projects/:name/running`](#get-running) for it. A listener that
-matches more than one project counts only for the deepest project folder. This
-route never stops anything. It needs the same key as the per-project route.
-
-Returns `200`. `projects` holds only the projects with at least one listener, in
-name order, each with one entry per port sorted by port. `truncated` is `true` when
-the root holds more than 200 projects and the rest were not scanned:
-
-```bash
-curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/projects/running
-```
-
-```json
-{
-  "supported": true,
-  "projects": {
-    "api": [ { "port": 3000, "pids": [123], "command": "node server.js", "address": "127.0.0.1", "via": "cwd" } ],
-    "docs": [ { "port": 8000, "pids": [456], "command": "python3 -m http.server 8000 --directory /home/me/projects/docs", "address": "0.0.0.0", "via": "argv" } ]
-  },
-  "truncated": false
-}
-```
-
-On a host that is not Linux, or where `/proc` cannot be read, the response is
-`{ "supported": false, "projects": {}, "truncated": false }`. A project named `running` is still
-reached by name at `/api/v1/projects/running/running`.
-
-Errors: a projects root that cannot be read gets the same error as `GET /api/v1/projects`.
-
-### POST /api/v1/projects/:name/running/stop {#post-running-stop}
-
-Needs an admin key. Body `{}` stops every listener of the project. `{ "port": 3000 }` stops only that
-port. A `port` that is not an integer from 1 to 65535 gets `400 invalid_port`.
-
-The gateway sends SIGTERM to each listener pid and to its descendants, waits up to
-3 seconds, sends SIGKILL to survivors, then scans again. Returns `200` with
-
-```json
-{ "stopped": [ { "port": 3000, "pids": [123] } ], "remaining": [ { "port": 3000, "pids": [123] } ] }
-```
-
-`remaining` lists whatever still listens. When nothing in the project matches, the
-response is `409 nothing_running`. A second stop for the same project within one
-second is ignored: it returns `200` with `stopped: []` and the current `remaining`.
-
-Safety rules the gateway enforces:
-
-- Only processes that own a LISTEN socket and whose working directory resolves (symlinks followed) inside the project folder are candidates. `projects/api` never matches `projects/api-v2`.
-- A listener also qualifies when any argument is an absolute path (after stripping a leading `--flag=`) whose real path is the project folder or inside it. This covers the value after `--directory`, `--dir`, `-C`, `--cwd`, `--prefix` and `--root`. The comparison is the same as for the working directory. Relative paths, paths that leave the project through `..` or a symlink, environment variables, open files and substrings of the command line never count. A non-listening process that mentions the project is never touched.
-- The gateway process, all of its ancestors, pid 1, any process whose executable or name is `claude` or `claude.exe`, and any process owned by another user are never signalled. A listener that is an ancestor of the gateway is skipped with its whole tree.
-- Signals go to single pids, never to a process group or session.
-- Before each signal the gateway checks the pid again: same start time, same owner, and for a listener still inside the project (by working directory or argument) and still listening. A pid that changed is skipped.
-
-Errors: `400 invalid_name`, `400 invalid_port`, `403 forbidden_key`,
-`403 path_escape`, `404 not_found`, `409 nothing_running`.
-
-### POST /api/v1/projects/:name/running/start {#post-running-start}
-
-Starts the project without an agent. Needs an admin key. Body `{}` picks the first free port from 3000
-to 3099. `{ "port": 3005 }` asks for that port and gets `409 port_in_use` when
-something listens on it.
-
-The gateway does not guess how to run a project. The project's agent writes
-`.pod/start.sh` once, and a start only runs that file as `sh .pod/start.sh` in the
-project folder, with `PORT` set to the port the gateway picked (or the one asked for).
-The script must listen on `$PORT` and on `0.0.0.0`, and exit non-zero when it fails.
-The command is never taken from the request.
-
-The script must be a regular file (a symlink is refused), at most 64 KiB, and must
-resolve inside the project. Without one, the start answers `422 no_start_command`
-("The project has no start script yet"). `GET /api/v1/projects/:name/running` answers
-`start` with `{ "command": "sh .pod/start.sh" }` when the script exists, `null` otherwise.
-
-The process runs detached in the project folder with only `PATH`, `HOME`, `USER`,
-`LOGNAME`, `LANG`, `LC_ALL`, `SHELL`, `TMPDIR` and `PORT` in its environment, and
-its output goes to `<gateway.logDir>/projects/<name>.log` (`~/.claude-gateway/logs/projects/<name>.log` by default). The response waits
-up to 20 seconds for a listener on that port from inside the project, then returns
-`200` with
-
-```json
-{ "port": 3001, "pid": 4242, "command": "PORT=3001 sh .pod/start.sh" }
-```
-
-On failure the body also carries `log`, the last 2000 characters of the output with
-credentials and long tokens masked. A start that never listens is stopped again. When the process could not be launched at all (for example the log folder is not writable), `start_failed` carries `reason`, an errno code such as `EACCES`, or `spawn_failed`, and the gateway logs the full error.
-
-Errors: `400 invalid_name`, `400 invalid_port`, `403 forbidden_key`,
-`403 path_escape`, `404 not_found`, `409 already_running`, `409 port_in_use`,
-`409 no_free_port`, `409 project_deleting`, `422 no_start_command`, `502 start_failed`, `504 start_timeout`.
-A second start while one is in flight for the same project gets `409 already_running`.

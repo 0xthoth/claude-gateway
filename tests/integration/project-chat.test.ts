@@ -476,7 +476,8 @@ describe('a project-bound legacy chat turn', () => {
     h = await harness();
     const sessionId = await projectSession(h);
     const held = send(h, sessionId, 'HOLD-TURN').then((r) => r, (e: unknown) => e);
-    await waitForCondition(() => h.runners[0]!.hasActiveApiSession(sessionId), 10_000);
+    // Spawned, not only reserved: a restart or session delete before the spawn leaves the held turn running.
+    await waitForCondition(() => spawns(h).length > 0, 10_000);
     const del = () => supertest(h.app).delete('/api/v1/projects/site')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).send({ confirm: 'site' });
 
@@ -497,7 +498,8 @@ describe('a project-bound legacy chat turn', () => {
     h = await harness();
     const sessionId = await projectSession(h);
     const held = send(h, sessionId, 'HOLD-TURN').then((r) => r, (e: unknown) => e);
-    await waitForCondition(() => h.runners[0]!.hasActiveApiSession(sessionId), 10_000);
+    // Spawned, not only reserved: a restart or session delete before the spawn leaves the held turn running.
+    await waitForCondition(() => spawns(h).length > 0, 10_000);
     const del = () => supertest(h.app).delete('/api/v1/projects/site')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).send({ confirm: 'site' });
 
@@ -647,7 +649,7 @@ describe('capabilities follow orchestration', () => {
     try {
       const res = await supertest(h.app).get('/api/v1/capabilities').set('Authorization', `Bearer ${KEYS.admin!.key}`);
       const projects = res.body.capabilities.projects as string[];
-      expect(projects).toEqual(['list', 'create', 'git', ...(chat ? ['chat'] : []), 'run', 'start', 'delete', 'stop', 'disk', 'cleanup']);
+      expect(projects).toEqual(['list', 'create', 'git', ...(chat ? ['chat'] : []), 'delete']);
     } finally {
       await teardown(h);
     }
@@ -782,15 +784,6 @@ describe('the project delete guard follows the folder and the work, not the sess
     }
     runtime().store.run("UPDATE tasks SET state='completed' WHERE id=?", 'task-pinned');
     expect((await del()).status).toBe(200);
-  }, 40_000);
-
-  it('writes the start log under the configured log dir', async () => {
-    h = await harness();
-    fs.mkdirSync(path.join(h.root, 'site', '.pod'));
-    fs.writeFileSync(path.join(h.root, 'site', '.pod', 'start.sh'), 'echo 1\nexit 1\n');
-    const res = await supertest(h.app).post('/api/v1/projects/site/running/start').set(admin()).send({});
-    expect(res.body.code).toBe('start_failed');
-    expect(fs.existsSync(path.join(h.base, 'logs', 'projects', 'site.log'))).toBe(true);
   }, 40_000);
 
   it('sees a chat bound to a symlink alias of the project', async () => {

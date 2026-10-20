@@ -71,27 +71,27 @@ describe('GET /api/v1/capabilities', () => {
 
   it('advertises every project token to an admin key', async () => {
     const res = await request(buildApp(apiKeys)).get('/api/v1/capabilities').set(AUTH);
-    expect(res.body.capabilities.projects).toEqual(['list', 'create', 'git', 'chat', 'run', 'start', 'delete', 'stop', 'disk', 'cleanup']);
+    expect(res.body.capabilities.projects).toEqual(['list', 'create', 'git', 'chat', 'delete']);
   });
 
   it('drops chat without orchestration and everything when the Projects API is disabled', () => {
     const gw = (g: Record<string, unknown>) => ({ gateway: g, agents: [] }) as never;
-    expect(buildCapabilitiesResponse('1', gw({ orchestration: false })).capabilities.projects).toEqual(['list', 'create', 'git', 'run', 'start', 'delete', 'stop', 'disk', 'cleanup']);
-    expect(buildCapabilitiesResponse('1', gw({ orchestration: true })).capabilities.projects).toEqual(['list', 'create', 'git', 'chat', 'run', 'start', 'delete', 'stop', 'disk', 'cleanup']);
+    expect(buildCapabilitiesResponse('1', gw({ orchestration: false })).capabilities.projects).toEqual(['list', 'create', 'git', 'delete']);
+    expect(buildCapabilitiesResponse('1', gw({ orchestration: true })).capabilities.projects).toEqual(['list', 'create', 'git', 'chat', 'delete']);
     expect(buildCapabilitiesResponse('1', gw({ orchestration: true, projects: { enabled: false } })).capabilities.projects).toEqual([]);
   });
 
-  it.each(['sk-pod-write', 'sk-pod-read', 'sk-agent'])('%s gets every project token but create, start, delete, stop and cleanup (disk included)', async (key) => {
+  it.each(['sk-pod-write', 'sk-pod-read', 'sk-agent'])('%s gets every project token but create and delete', async (key) => {
     const res = await request(buildApp(apiKeys)).get('/api/v1/capabilities').set(as(key));
     expect(res.status).toBe(200);
-    expect(res.body.capabilities.projects).toEqual(['list', 'git', 'chat', 'run', 'disk']);
+    expect(res.body.capabilities.projects).toEqual(['list', 'git', 'chat']);
     expect(res.body).not.toHaveProperty('projectsUnavailable');
     expect(res.body.capabilities.cross_channel_message).toContain('telegram');
   });
 
   it('drops chat for a non-admin key too when orchestration is off', () => {
     const config = { gateway: { orchestration: false }, agents: [] } as never;
-    expect(buildCapabilitiesResponse('1', config, apiKeys[2]).capabilities.projects).toEqual(['list', 'git', 'run', 'disk']);
+    expect(buildCapabilitiesResponse('1', config, apiKeys[2]).capabilities.projects).toEqual(['list', 'git']);
   });
 
   it('omits projectsUnavailable for an admin key when Projects is usable', async () => {

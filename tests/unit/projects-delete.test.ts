@@ -1,11 +1,9 @@
-import { ChildProcess, spawn } from 'child_process';
 import express from 'express';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
 import { createProjectsRouter } from '../../src/api/projects-router';
-import { StopLimiter, systemSys } from '../../src/projects/running';
 import type { ApiKey } from '../../src/types';
 
 const apiKeys: ApiKey[] = [
@@ -14,34 +12,24 @@ const apiKeys: ApiKey[] = [
   { key: 'k-agent', agents: ['alfred'], write: true },
 ];
 const as = (key: string) => ({ Authorization: `Bearer ${key}` });
-const SERVER = "const s=require('http').createServer((q,r)=>r.end('ok'));s.listen(0,'127.0.0.1',()=>console.log('LISTENING'));setInterval(()=>{},1e6)";
 
 let base: string;
 let root: string;
 let outside: string;
-const children: ChildProcess[] = [];
+let chatting: Set<string>;
 
 const app = (): express.Express => {
   const a = express();
   a.use(express.json());
-  a.use('/api', createProjectsRouter(apiKeys, root, { sys: systemSys(), limiter: new StopLimiter(0) }));
+  a.use('/api', createProjectsRouter(apiKeys, root, { chatTurnActive: (name) => chatting.has(name) }));
   return a;
 };
 const del = (name = 'api', body: object = { confirm: name }, key = 'k-write') =>
   request(app()).delete(`/api/v1/projects/${name}`).set(as(key)).send(body);
 const exists = (...p: string[]) => fs.existsSync(path.join(root, ...p));
 
-function listen(cwd: string): Promise<ChildProcess> {
-  const child = spawn(process.execPath, ['-e', SERVER], { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
-  children.push(child);
-  return new Promise((resolve, reject) => {
-    child.stdout?.on('data', (d: Buffer) => d.toString().includes('LISTENING') && resolve(child));
-    child.on('error', reject);
-    child.on('exit', () => reject(new Error('child exited early')));
-  });
-}
-
 beforeEach(() => {
+  chatting = new Set();
   base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'delete-')));
   root = path.join(base, 'projects');
   outside = path.join(base, 'outside');
@@ -53,13 +41,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const c of children.splice(0)) {
-    try {
-      process.kill(c.pid as number, 'SIGKILL');
-    } catch {
-      // gone
-    }
-  }
   fs.rmSync(base, { recursive: true, force: true });
 });
 
@@ -99,15 +80,15 @@ describe('DELETE /api/v1/projects/:name', () => {
     expect(bad.body.code).toBe('invalid_name');
   });
 
-  it('refuses while something listens from inside the project, and deletes once it stops', async () => {
-    const child = await listen(path.join(root, 'api'));
+  it('refuses while a chat turn runs in the project, and deletes once it ends', async () => {
+    chatting.add('api');
     const blocked = await del();
     expect(blocked.status).toBe(409);
     expect(blocked.body.code).toBe('project_running');
     expect(exists('api', 'src', 'index.js')).toBe(true);
+    expect((await del('keep')).status).toBe(200);
 
-    child.kill('SIGKILL');
-    await new Promise((r) => child.once('exit', r));
+    chatting.delete('api');
     const res = await del();
     expect(res.status).toBe(200);
     expect(exists('api')).toBe(false);

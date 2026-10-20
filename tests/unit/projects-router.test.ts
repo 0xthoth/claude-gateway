@@ -45,7 +45,7 @@ describe("auth", () => {
     ["GET /projects", (r) => r.get("/api/v1/projects")],
     ["POST /projects", (r) => r.post("/api/v1/projects").send({ name: "x" })],
     ["GET git", (r) => r.get("/api/v1/projects/app/git")],
-    ["GET running", (r) => r.get("/api/v1/projects/app/running")],
+    ["GET git-summary", (r) => r.get("/api/v1/projects/git-summary")],
   ];
 
   it.each(["k-agent", "k-star-list", "k-pod-read"])(
@@ -53,7 +53,7 @@ describe("auth", () => {
     async (key) => {
       seed();
       expect((await request(app).get("/api/v1/projects").set(as(key))).status).toBe(200);
-      expect((await request(app).get("/api/v1/projects/app/running").set(as(key))).status).toBe(200);
+      expect((await request(app).get("/api/v1/projects/git-summary").set(as(key))).status).toBe(200);
       const res = await request(app).post("/api/v1/projects").set(as(key)).send({ name: "x" });
       expect([res.status, res.body.code]).toEqual([403, "forbidden_key"]);
       expect(fs.existsSync(path.join(root, "x"))).toBe(false);
@@ -89,7 +89,7 @@ describe("a root that is a regular file", () => {
       "POST /projects",
       () => request(app).post("/api/v1/projects").send({ name: "x" }),
     ],
-    ["GET running", () => request(app).get("/api/v1/projects/x/running")],
+    ["GET git", () => request(app).get("/api/v1/projects/x/git")],
   ])("%s returns 400 not_a_directory", async (_label, call) => {
     fs.writeFileSync(root, "not a dir");
     const res = await call().set(POD);
@@ -111,7 +111,6 @@ describe("POST /api/v1/projects", () => {
         path: path.join(root, "app"),
         modified_at: expect.any(String),
         is_git: false,
-        stack: null,
       },
     });
     fs.writeFileSync(path.join(root, "app", "work.txt"), "unsaved work");
@@ -198,7 +197,7 @@ describe("GET /api/v1/projects/:name routes", () => {
     fs.mkdirSync(root, { recursive: true });
     fs.symlinkSync("/etc", path.join(root, "etc"));
     const res = await request(app)
-      .get("/api/v1/projects/etc/running")
+      .get("/api/v1/projects/etc/git")
       .set(POD);
     expect([res.status, res.body.code]).toEqual([403, "path_escape"]);
     const list = await request(app).get("/api/v1/projects").set(POD);
@@ -207,7 +206,7 @@ describe("GET /api/v1/projects/:name routes", () => {
 
   it("answers 404 not_found for a missing project", async () => {
     seed();
-    const res = await request(app).get("/api/v1/projects/ghost/running").set(POD);
+    const res = await request(app).get("/api/v1/projects/ghost/git").set(POD);
     expect([res.status, res.body.code]).toEqual([404, "not_found"]);
   });
 });

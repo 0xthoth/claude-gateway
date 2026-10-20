@@ -4,7 +4,6 @@ import { Dirent, promises as fsp } from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import { hardenedGit } from "./git-runner";
-import { readStack, type Stack } from "./stack";
 import {
   err,
   errnoToCode,
@@ -23,8 +22,6 @@ export interface Project {
   path: string;
   modified_at: string;
   is_git: boolean;
-  /** Best guess at the project's stack from its root files; null when nothing marks one. */
-  stack: Stack | null;
 }
 
 /** Why a folder under the root is not a project. */
@@ -79,7 +76,6 @@ async function describeProject(
     path: path.join(root, name),
     modified_at: st.mtime.toISOString(),
     is_git: isGit,
-    stack: await readStack(realDir),
   };
 }
 

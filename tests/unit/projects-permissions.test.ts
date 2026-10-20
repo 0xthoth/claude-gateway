@@ -19,12 +19,10 @@ const NON_ADMIN = [KEYS.podWrite, KEYS.podRead, KEYS.alfredOnly];
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
 
 const ADMIN_ONLY_ROUTES = [
-  'POST /v1/projects', 'DELETE /v1/projects/:name', 'POST /v1/projects/:name/running/stop', 'POST /v1/projects/:name/running/start',
-  'GET /v1/projects/cleanup', 'POST /v1/projects/cleanup',
+  'POST /v1/projects', 'DELETE /v1/projects/:name',
 ];
 const READ_ROUTES = [
-  'GET /v1/projects', 'GET /v1/projects/git-summary', 'GET /v1/projects/disk',
-  'GET /v1/projects/running', 'GET /v1/projects/:name/git', 'GET /v1/projects/:name/running',
+  'GET /v1/projects', 'GET /v1/projects/git-summary', 'GET /v1/projects/:name/git',
 ];
 
 describe('the /v1/projects routes', () => {
@@ -55,7 +53,7 @@ describe('the /v1/projects routes', () => {
     return (key ? req.set('Authorization', `Bearer ${key.key}`) : req).send({ name: 'made-by-test', confirm: 'app' });
   };
 
-  it('registers the twelve routes, and marks exactly create, delete, stop, start and both cleanup routes as admin', () => {
+  it('registers the five routes, and marks exactly create and delete as admin', () => {
     const all = routes().map((r) => `${r.method} ${r.path}`);
     expect(all.sort()).toEqual([...ADMIN_ONLY_ROUTES, ...READ_ROUTES].sort());
     expect(routes().filter((r) => r.auth === 'admin').map((r) => `${r.method} ${r.path}`).sort()).toEqual([...ADMIN_ONLY_ROUTES].sort());
@@ -69,7 +67,7 @@ describe('the /v1/projects routes', () => {
     }
   });
 
-  it.each(NON_ADMIN)('refuses $key on create, delete, stop, start and cleanup with 403 forbidden_key, and changes nothing', async (key) => {
+  it.each(NON_ADMIN)('refuses $key on create and delete with 403 forbidden_key, and changes nothing', async (key) => {
     for (const route of ADMIN_ONLY_ROUTES) {
       const res = await call(route, key);
       expect([route, res.status, res.body.code, res.body.error]).toEqual([route, 403, 'forbidden_key', 'An admin API key is required for Projects']);
