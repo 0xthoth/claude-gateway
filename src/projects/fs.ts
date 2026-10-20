@@ -4,16 +4,8 @@ import { Dirent, promises as fsp } from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import { hardenedGit } from "./git-runner";
-import {
-  err,
-  errnoToCode,
-  ok,
-  parseProjectName,
-  ProjectName,
-  ProjectsErrorCode,
-  resolveInside,
-  Result,
-} from "./paths";
+import { errnoToCode, parseProjectName, ProjectName, ProjectsErrorCode, resolveInside } from "./paths";
+import { err, ok, Result } from "../utils/result";
 
 const GIT_INIT_TIMEOUT_MS = 10_000;
 

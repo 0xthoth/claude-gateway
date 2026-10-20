@@ -2,7 +2,7 @@ import { spawn } from 'child_process';
 import { projectsWarn } from './log';
 import { existsSync } from 'fs';
 import * as path from 'path';
-import { err, ok, Result } from './paths';
+import { err, ok, Result } from '../utils/result';
 import { redactCredentials } from './git-status';
 
 export const GIT_READ_TIMEOUT_MS = 3_000;

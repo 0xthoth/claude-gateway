@@ -91,7 +91,8 @@ import { ProjectChatError, ProjectCwd, ProjectUnsupportedReason, projectUnavaila
 import { resolveProjectDir } from '../projects/fs';
 import { resolveOrchestrationConfig } from '../orchestration/config';
 import { resolveWorkerHarness } from '../orchestration/worker-harness';
-import { err, ProjectName, Result } from '../projects/paths';
+import { ProjectName } from '../projects/paths';
+import { err, Result } from '../utils/result';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
 const DEFAULT_MAX_CONCURRENT = 20;

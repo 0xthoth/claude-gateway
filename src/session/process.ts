@@ -38,7 +38,7 @@ import {
 } from '../utils/tool-labels';
 import { resolveEnabledConnectors } from '../connectors/resolve';
 import { projectContext, projectUnavailableError, type ProjectChatError, type ProjectCwd } from '../projects/chat';
-import type { Result } from '../projects/paths';
+import type { Result } from '../utils/result';
 import { isReservedConnectorId } from '../connectors/custom';
 
 export const MAX_HISTORY_MESSAGES = 50;

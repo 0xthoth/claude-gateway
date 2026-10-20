@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { GitOutput, runGit } from '../../src/projects/git-runner';
-import { err, Result } from '../../src/projects/paths';
+import { err, Result } from '../../src/utils/result';
 
 const GATEWAY_SECRET_ENV = ['ADMIN_API_KEY', 'ANTHROPIC_API_KEY', 'ALFRED_BOT_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'HTTPS_PROXY', 'SSH_AUTH_SOCK', 'GIT_ASKPASS', 'GIT_SSH_COMMAND'];
 

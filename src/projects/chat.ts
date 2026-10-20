@@ -5,7 +5,8 @@ import { expandHome } from '../utils/paths';
 import { resolveProjectDir } from './fs';
 import { getStatusSummary } from './git';
 import { remoteHostname } from './git-status';
-import { DEFAULT_PROJECTS_ROOT, err, ok, ProjectName, ProjectsErrorCode, resolveInside, Result } from './paths';
+import { DEFAULT_PROJECTS_ROOT, ProjectName, ProjectsErrorCode, resolveInside } from './paths';
+import { err, ok, Result } from '../utils/result';
 
 /** `gateway.projects.root`, which loadConfig has already validated. */
 export function resolveProjectsRoot(config: GatewayConfig): string {

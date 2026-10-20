@@ -1,15 +1,11 @@
 import { promises as fsp } from 'fs';
 import * as path from 'path';
+import { err, ok, Result } from '../utils/result';
 
 /** The projects root when gateway.projects.root is not set. */
 export const DEFAULT_PROJECTS_ROOT = '~/projects';
 
 export type ProjectName = string & { readonly __brand: 'ProjectName' };
-
-export type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
-
-export const ok = <T>(value: T): { ok: true; value: T } => ({ ok: true, value });
-export const err = <E>(error: E): { ok: false; error: E } => ({ ok: false, error });
 
 export type ProjectsErrorCode =
   | 'invalid_name'

@@ -13,7 +13,8 @@ import {
   parseStatusV2,
   toSummary,
 } from './git-status';
-import { err, ok, ProjectName, ProjectsErrorCode, Result } from './paths';
+import { ProjectName, ProjectsErrorCode } from './paths';
+import { err, ok, Result } from '../utils/result';
 
 export type GitErrorCode =
   | 'not_a_git_repo'

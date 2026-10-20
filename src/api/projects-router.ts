@@ -6,7 +6,8 @@ import { createProject, resolveProjectDir, listProjects } from '../projects/fs';
 import { getStatus, getSummaries, GitError, GitErrorCode } from '../projects/git';
 import { DeleteErrorCode, removeProject } from '../projects/delete';
 import { isProjectDeleting, markProjectDeleting } from '../projects/chat';
-import { parseProjectName, ProjectName, ProjectsErrorCode, Result } from '../projects/paths';
+import { parseProjectName, ProjectName, ProjectsErrorCode } from '../projects/paths';
+import { Result } from '../utils/result';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 

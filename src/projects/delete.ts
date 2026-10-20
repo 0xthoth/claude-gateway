@@ -2,7 +2,8 @@ import { randomUUID } from 'crypto';
 import { projectsWarn } from './log';
 import { promises as fsp } from 'fs';
 import * as path from 'path';
-import { err, errnoToCode, ok, ProjectName, ProjectsErrorCode, Result } from './paths';
+import { errnoToCode, ProjectName, ProjectsErrorCode } from './paths';
+import { err, ok, Result } from '../utils/result';
 
 export type DeleteErrorCode = 'confirm_mismatch' | 'project_running' | 'project_deleting';
 

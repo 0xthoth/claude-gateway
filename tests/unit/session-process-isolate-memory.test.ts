@@ -44,7 +44,8 @@ import { SessionProcess } from '../../src/session/process';
 import { sandboxContainerName } from '../../src/apps/conversation-sandbox';
 import { SessionStore } from '../../src/session/store';
 import { chatMemoryDir } from '../../src/agent/workspace-loader';
-import { ok, type ProjectName } from '../../src/projects/paths';
+import type { ProjectName } from '../../src/projects/paths';
+import { ok } from '../../src/utils/result';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 
 let tmpDir: string;

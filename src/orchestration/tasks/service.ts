@@ -9,7 +9,7 @@ import { parentVerifiableBrowserResult } from '../../jev/browser-contract';
 import { promises as fsp } from 'fs';
 import { isAbsolute } from 'path';
 import { resolveInProject, type ProjectChatError, type ProjectCwd } from '../../projects/chat';
-import type { Result } from '../../projects/paths';
+import type { Result } from '../../utils/result';
 import { parseWorkflow, advanceWorkflow } from '../workflow';
 import { advanceTiming } from './timing';
 import { taskDirective } from './task-directive';
