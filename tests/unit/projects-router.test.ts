@@ -6,6 +6,7 @@ import request from "supertest";
 import { createProjectsRouter } from "../../src/api/projects-router";
 import { resolveProjectsRoot } from "../../src/projects/chat";
 import type { ApiKey, GatewayConfig } from "../../src/types";
+import { silentLogger } from "../helpers/silent-logger";
 
 const apiKeys: ApiKey[] = [
   { key: "k-admin", agents: ["alfred"], admin: true },
@@ -28,7 +29,7 @@ beforeEach(() => {
   root = path.join(base, "projects");
   app = express();
   app.use(express.json());
-  app.use("/api", createProjectsRouter(apiKeys, root));
+  app.use("/api", createProjectsRouter(apiKeys, root, { logger: silentLogger }));
 });
 
 afterEach(() => fs.rmSync(base, { recursive: true, force: true }));

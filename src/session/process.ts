@@ -1208,7 +1208,7 @@ export class SessionProcess extends EventEmitter {
       if (epoch !== this.spawnEpoch) return false;
       if (!project.ok) throw projectUnavailableError(project.error);
       this.projectCwd = project.value;
-      this.projectContext = await projectContext(this.gatewayConfig, project.value);
+      this.projectContext = await projectContext(this.gatewayConfig, project.value, this.logger);
       if (epoch !== this.spawnEpoch) return false;
     }
 

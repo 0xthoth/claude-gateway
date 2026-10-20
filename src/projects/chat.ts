@@ -1,6 +1,6 @@
 import { promises as fsp } from 'fs';
 import * as path from 'path';
-import { GatewayConfig } from '../types';
+import { GatewayConfig, Logger } from '../types';
 import { expandHome } from '../utils/paths';
 import { resolveProjectDir } from './fs';
 import { getStatusSummary } from './git';
@@ -122,9 +122,9 @@ const PLAIN_BRANCH_RE = /^[\w./-]{1,100}$/;
  * within the read timeout, branch, change count and remote host. Never a remote URL, which
  * can carry a token, and never a branch name outside the whitelist.
  */
-export async function projectContext(config: GatewayConfig, project: ProjectCwd): Promise<string> {
+export async function projectContext(config: GatewayConfig, project: ProjectCwd, logger: Logger): Promise<string> {
   const where = projectLocation(project);
-  const status = await getStatusSummary(resolveProjectsRoot(config), project.name).catch(() => null);
+  const status = await getStatusSummary(resolveProjectsRoot(config), project.name, logger).catch(() => null);
   if (!status?.ok) return where;
   const s = status.value;
   const host = s.remote ? remoteHostname(s.remote.url) : null;

@@ -1,11 +1,11 @@
 import { execFile } from "child_process";
-import { projectsWarn } from './log';
 import { Dirent, promises as fsp } from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import { hardenedGit } from "./git-runner";
 import { errnoToCode, parseProjectName, ProjectName, ProjectsErrorCode, resolveInside } from "./paths";
 import { err, ok, Result } from "../utils/result";
+import type { Logger } from "../types";
 
 const GIT_INIT_TIMEOUT_MS = 10_000;
 
@@ -229,6 +229,7 @@ export async function createProject(
   root: string,
   name: ProjectName,
   gitInit: boolean,
+  logger: Logger,
 ): Promise<FsResult<CreatedProject>> {
   const dir = path.join(root, name);
   const made = await serializeCreate(root, () =>
@@ -247,7 +248,7 @@ export async function createProject(
       });
     } catch (e) {
       warning = gitInitWarning(e as GitInitError);
-      projectsWarn(
+      logger.warn(
         `projects: git init in ${dir} failed: ${(e as Error).message}`,
       );
     }

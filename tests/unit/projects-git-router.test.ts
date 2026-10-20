@@ -6,6 +6,7 @@ import * as path from 'path';
 import request from 'supertest';
 import { createProjectsRouter } from '../../src/api/projects-router';
 import type { ApiKey } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const apiKeys: ApiKey[] = [
   { key: 'k-pod-write', agents: '*', write: true, admin: true },
@@ -73,7 +74,10 @@ function commitUpstream(file: string, content: string): void {
 
 const status = (name: string, key = POD) => request(app).get(`/api/v1/projects/${name}/git`).set(key);
 
+let warn: jest.Mock;
+
 beforeEach(() => {
+  warn = jest.fn();
   base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-git-')));
   root = path.join(base, 'projects');
   remote = path.join(base, 'remote.git');
@@ -84,7 +88,7 @@ beforeEach(() => {
   fs.mkdirSync(process.env.HOME);
   app = express();
   app.use(express.json());
-  app.use('/api', createProjectsRouter(apiKeys, root));
+  app.use('/api', createProjectsRouter(apiKeys, root, { logger: { ...silentLogger, warn } }));
 });
 
 afterEach(() => {
@@ -324,18 +328,13 @@ describe('git missing from PATH', () => {
     const empty = path.join(base, 'empty-bin');
     fs.mkdirSync(empty);
     process.env.PATH = empty;
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      const detail = await status('app');
-      expect([detail.status, detail.body.code]).toEqual([503, 'git_unavailable']);
-      expect(detail.body.error).toMatch(/git is not installed/i);
-      const summary = await request(app).get('/api/v1/projects/git-summary').set(POD);
-      expect([summary.status, summary.body.code]).toEqual([503, 'git_unavailable']);
-      await status('web');
-      expect(warn.mock.calls.filter(([m]) => String(m).includes('git is not installed'))).toHaveLength(1);
-    } finally {
-      warn.mockRestore();
-    }
+    const detail = await status('app');
+    expect([detail.status, detail.body.code]).toEqual([503, 'git_unavailable']);
+    expect(detail.body.error).toMatch(/git is not installed/i);
+    const summary = await request(app).get('/api/v1/projects/git-summary').set(POD);
+    expect([summary.status, summary.body.code]).toEqual([503, 'git_unavailable']);
+    await status('web');
+    expect(warn.mock.calls.filter(([m]) => String(m).includes('git is not installed'))).toHaveLength(1);
   });
 
   it('still answers a missing folder as not_found and not as a missing git', async () => {

@@ -7,6 +7,7 @@ import * as path from 'path';
 import { createProject } from '../../src/projects/fs';
 import { getStatus, getSummaries } from '../../src/projects/git';
 import { parseProjectName, ProjectName } from '../../src/projects/paths';
+import { silentLogger } from '../helpers/silent-logger';
 
 /**
  * A project folder is untrusted: it may have been cloned from anywhere. Every fixture here plants a command that
@@ -80,8 +81,8 @@ async function controlRuns(dir: string, ...args: string[]): Promise<boolean> {
 /** Reads the repository both ways and says whether anything ran. */
 async function gatewayRuns(n: string) {
   reset();
-  const detail = await getStatus(root, name(n));
-  const summary = await getSummaries(root);
+  const detail = await getStatus(root, name(n), silentLogger);
+  const summary = await getSummaries(root, silentLogger);
   const ran = planted();
   reset();
   return { ran, detail, summary };
@@ -262,7 +263,7 @@ describe('filter drivers the repository defines', () => {
     write(path.join(process.env.HOME!, '.gitconfig'), `[filter "op"]\n\tclean = ${filterScript}\n`);
     attributes(dir, 'op');
     touchAll(dir);
-    await getStatus(root, name('hostile'));
+    await getStatus(root, name('hostile'), silentLogger);
     expect(planted()).toBe(true);
   });
 
@@ -270,9 +271,9 @@ describe('filter drivers the repository defines', () => {
     makeRepo('good');
     const dir = makeRepo('bad');
     git(dir, 'config', `filter.${'x'.repeat(2000)}.clean`, filterScript);
-    const res = await getStatus(root, name('bad'));
+    const res = await getStatus(root, name('bad'), silentLogger);
     expect(res).toEqual({ ok: false, error: { code: 'git_unreadable' } });
-    const summary = await getSummaries(root);
+    const summary = await getSummaries(root, silentLogger);
     expect(summary).toMatchObject({ ok: true, value: { summaries: { good: expect.objectContaining({ branch: 'main' }), bad: null } } });
   });
 
@@ -323,7 +324,7 @@ describe('filter drivers the repository defines', () => {
   it('refuses a repository that defines more drivers than it blanks', async () => {
     const dir = makeRepo('many');
     for (let i = 0; i < 80; i++) git(dir, 'config', `filter.f${i}.clean`, filterScript);
-    expect(await getStatus(root, name('many'))).toEqual({ ok: false, error: { code: 'git_unreadable' } });
+    expect(await getStatus(root, name('many'), silentLogger)).toEqual({ ok: false, error: { code: 'git_unreadable' } });
   });
 
   it('lists the other repositories when one is hostile', async () => {
@@ -332,7 +333,7 @@ describe('filter drivers the repository defines', () => {
     filterConfig(dir);
     attributes(dir);
     touchAll(dir);
-    const summary = await getSummaries(root);
+    const summary = await getSummaries(root, silentLogger);
     expect(planted()).toBe(false);
     expect(summary).toMatchObject({ ok: true, value: { summaries: { good: expect.objectContaining({ branch: 'main' }), evil: expect.objectContaining({ branch: 'main' }) } } });
   });
@@ -349,7 +350,7 @@ describe('other config that names a command', () => {
     git(dir, 'config', 'log.showSignature', 'true');
     git(dir, 'config', 'gpg.program', script);
     expect(await controlRuns(dir, 'log', '-1')).toBe(true);
-    const res = await getStatus(root, name('signed'));
+    const res = await getStatus(root, name('signed'), silentLogger);
     expect(planted()).toBe(false);
     expect(res).toMatchObject({ ok: true, value: { last_commit: { subject: 'signed' } } });
   });
@@ -392,7 +393,7 @@ describe('a repository with many files', () => {
     git(dir, 'commit', '-q', '-m', 'many');
     for (let i = 0; i < 50; i++) write(path.join(dir, 'src', `d${i}`, `f${i}.txt`), 'changed\n');
     const started = Date.now();
-    const res = await getStatus(root, name('big'));
+    const res = await getStatus(root, name('big'), silentLogger);
     expect(Date.now() - started).toBeLessThan(7_000);
     if (res.ok) expect(res.value.change_count).toBe(50);
     else expect(res.error.code).toBe('timeout');
@@ -412,18 +413,18 @@ describe('errors that say what is wrong', () => {
   it('reports a repository owned by another user as git_unsafe_owner, not as a missing repository', async () => {
     makeRepo('theirs');
     otherOwner();
-    expect(await getStatus(root, name('theirs'))).toEqual({ ok: false, error: { code: 'git_unsafe_owner' } });
+    expect(await getStatus(root, name('theirs'), silentLogger)).toEqual({ ok: false, error: { code: 'git_unsafe_owner' } });
   });
 
   it('keeps the list working: the other-owner repository is null, the rest read', async () => {
     makeRepo('theirs');
     otherOwner();
-    expect(await getSummaries(root)).toEqual({ ok: true, value: { summaries: { theirs: null } } });
+    expect(await getSummaries(root, silentLogger)).toEqual({ ok: true, value: { summaries: { theirs: null } } });
   });
 
   it('still says not_a_git_repo for a plain folder', async () => {
     fs.mkdirSync(path.join(root, 'plain'));
-    expect(await getStatus(root, name('plain'))).toEqual({ ok: false, error: { code: 'not_a_git_repo' } });
+    expect(await getStatus(root, name('plain'), silentLogger)).toEqual({ ok: false, error: { code: 'not_a_git_repo' } });
   });
 
   const nonRoot = process.getuid?.() !== 0;
@@ -431,7 +432,7 @@ describe('errors that say what is wrong', () => {
     const dir = makeRepo('locked');
     fs.chmodSync(path.join(dir, '.git'), 0o000);
     try {
-      expect(await getStatus(root, name('locked'))).toEqual({ ok: false, error: { code: 'git_unreadable' } });
+      expect(await getStatus(root, name('locked'), silentLogger)).toEqual({ ok: false, error: { code: 'git_unreadable' } });
     } finally {
       fs.chmodSync(path.join(dir, '.git'), 0o755);
     }
@@ -440,7 +441,7 @@ describe('errors that say what is wrong', () => {
   it('reports a .git file that points nowhere as git_unreadable', async () => {
     fs.mkdirSync(path.join(root, 'dangling'));
     write(path.join(root, 'dangling', '.git'), 'gitdir: /nonexistent/nowhere\n');
-    expect(await getStatus(root, name('dangling'))).toEqual({ ok: false, error: { code: 'git_unreadable' } });
+    expect(await getStatus(root, name('dangling'), silentLogger)).toEqual({ ok: false, error: { code: 'git_unreadable' } });
   });
 });
 
@@ -453,7 +454,7 @@ describe('git init on project creation', () => {
     fs.chmodSync(path.join(bin, 'git'), 0o755);
     process.env.PATH = `${bin}:${process.env.PATH}`;
     process.env.GATEWAY_SECRET_TOKEN = 'leak';
-    const res = await createProject(root, name('fresh'), true);
+    const res = await createProject(root, name('fresh'), true, silentLogger);
     if (!res.ok) throw new Error(res.error);
     expect(res.value.project.is_git).toBe(true);
     const out = fs.readFileSync(seen, 'utf8');

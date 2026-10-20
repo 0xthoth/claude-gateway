@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
 import { createProjectsRouter } from '../../src/api/projects-router';
+import { silentLogger } from '../helpers/silent-logger';
 
 const H = { Authorization: 'Bearer k' };
 let base: string;
@@ -19,7 +20,7 @@ beforeEach(() => {
   fs.mkdirSync(outside);
   app = express();
   app.use(express.json());
-  app.use('/api', createProjectsRouter([{ key: 'k', agents: '*', admin: true }], root, { chatTurnActive: () => false }));
+  app.use('/api', createProjectsRouter([{ key: 'k', agents: '*', admin: true }], root, { logger: silentLogger, chatTurnActive: () => false }));
 });
 afterEach(() => {
   for (const e of fs.readdirSync(root)) {

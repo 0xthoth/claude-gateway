@@ -1,7 +1,7 @@
 import { promises as fsp } from 'fs';
 import * as path from 'path';
 import { listProjects, mapLimit, resolveProjectDir } from './fs';
-import { GIT_READ_TIMEOUT_MS, GitOutput, MAX_BLANKED_FILTER_KEYS, MAX_FILTER_KEY, runGit } from './git-runner';
+import { GIT_READ_TIMEOUT_MS, GitOutput, MAX_BLANKED_FILTER_KEYS, MAX_FILTER_KEY, RunOptions, runGit } from './git-runner';
 import {
   buildStatus,
   GitCommitInfo,
@@ -14,6 +14,7 @@ import {
   toSummary,
 } from './git-status';
 import { ProjectName, ProjectsErrorCode } from './paths';
+import type { Logger } from '../types';
 import { err, ok, Result } from '../utils/result';
 
 export type GitErrorCode =
@@ -86,16 +87,16 @@ async function readFailure(dir: string, out: GitOutput): Promise<GitError> {
  * otherwise run a driver's clean command on any file whose stat changed. A driver that cannot be blanked safely makes
  * the repository unreadable rather than risking the run.
  */
-async function readRepo(dir: string, read: ReadOptions): Promise<GitResult<GitStatus>> {
+async function readRepo(dir: string, read: ReadOptions, logger: Logger): Promise<GitResult<GitStatus>> {
   const started = Date.now();
-  const listed = await runGit(dir, ['config', '--list', '-z', '--show-scope'], { timeoutMs: read.timeoutMs });
+  const listed = await runGit(dir, ['config', '--list', '-z', '--show-scope'], { timeoutMs: read.timeoutMs, logger });
   if (!listed.ok) return fail(listed.error);
   if (listed.value.code !== 0) return err(await readFailure(dir, listed.value));
   if (hasUndecodableFilterKey(listed.value.stdoutBytes)) return fail('git_unreadable');
   const { config, filterKeys } = parseConfigList(listed.value.stdout);
   if (filterKeys.length > MAX_BLANKED_FILTER_KEYS || filterKeys.some((k) => k.length > MAX_FILTER_KEY)) return fail('git_unreadable');
 
-  const opts = { timeoutMs: Math.max(read.timeoutMs - (Date.now() - started), 1), blankFilterKeys: filterKeys };
+  const opts = { timeoutMs: Math.max(read.timeoutMs - (Date.now() - started), 1), blankFilterKeys: filterKeys, logger };
   const skipped = Promise.resolve(ok({ code: 0, stdout: '', stdoutBytes: Buffer.alloc(0), stderr: '' }));
   const full = read.commitAndOperation;
   const runs = await Promise.all([
@@ -122,7 +123,7 @@ async function readRepo(dir: string, read: ReadOptions): Promise<GitResult<GitSt
 }
 
 /** git prints no `branch.ab` for an unborn branch, so count what a pull would bring: every commit the tracking branch has, or 0 without one. */
-async function unbornBehind(dir: string, opts: { timeoutMs: number }): Promise<number> {
+async function unbornBehind(dir: string, opts: RunOptions): Promise<number> {
   const count = await runGit(dir, ['rev-list', '--count', '@{upstream}', '--'], opts);
   return count.ok && count.value.code === 0 ? Number(count.value.stdout.trim()) || 0 : 0;
 }
@@ -132,27 +133,27 @@ export async function projectDir(root: string, name: ProjectName): Promise<GitRe
   return dir.ok ? dir : fail(dir.error);
 }
 
-async function readStatus(root: string, name: ProjectName, read: ReadOptions): Promise<GitResult<GitStatus>> {
+async function readStatus(root: string, name: ProjectName, read: ReadOptions, logger: Logger): Promise<GitResult<GitStatus>> {
   const dir = await projectDir(root, name);
   if (!dir.ok) return dir;
-  return readRepo(dir.value, read);
+  return readRepo(dir.value, read, logger);
 }
 
-export function getStatus(root: string, name: ProjectName): Promise<GitResult<GitStatus>> {
-  return readStatus(root, name, DETAIL_READ);
+export function getStatus(root: string, name: ProjectName, logger: Logger): Promise<GitResult<GitStatus>> {
+  return readStatus(root, name, DETAIL_READ, logger);
 }
 
 /** The cheaper read for a chat's context note: an untracked folder counts once, no secret check needs its files, and no last commit or operation. */
-export function getStatusSummary(root: string, name: ProjectName): Promise<GitResult<GitStatus>> {
-  return readStatus(root, name, SUMMARY_READ);
+export function getStatusSummary(root: string, name: ProjectName, logger: Logger): Promise<GitResult<GitStatus>> {
+  return readStatus(root, name, SUMMARY_READ, logger);
 }
 
 /** Every project with a `.git`; null when its status timed out or failed. Non-git folders are left out. */
-export async function getSummaries(root: string): Promise<GitResult<{ summaries: Record<string, GitSummary | null> }>> {
+export async function getSummaries(root: string, logger: Logger): Promise<GitResult<{ summaries: Record<string, GitSummary | null> }>> {
   const list = await listProjects(root);
   if (!list.ok) return fail(list.error);
   const repos = list.value.projects.filter((p) => p.is_git);
-  const reads = await mapLimit(repos, SUMMARY_CONCURRENCY, (p) => readStatus(root, p.name, SUMMARY_READ));
+  const reads = await mapLimit(repos, SUMMARY_CONCURRENCY, (p) => readStatus(root, p.name, SUMMARY_READ, logger));
   const noGit = reads.find((r) => !r.ok && r.error.code === 'git_unavailable');
   if (noGit && !noGit.ok) return fail(noGit.error.code);
   const results = reads.map((r) => (r.ok ? toSummary(r.value) : null));

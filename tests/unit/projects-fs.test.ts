@@ -8,6 +8,7 @@ import {
   resolveProjectDir,
 } from "../../src/projects/fs";
 import { ProjectName } from "../../src/projects/paths";
+import { silentLogger } from "../helpers/silent-logger";
 
 const name = (s: string) => s as ProjectName;
 
@@ -85,7 +86,7 @@ describe("listProjects", () => {
 
 describe("createProject", () => {
   it("creates the root on demand and refuses a second create without touching the first", async () => {
-    const first = await createProject(root, name("app"), false);
+    const first = await createProject(root, name("app"), false, silentLogger);
     if (!first.ok) throw new Error(first.error);
     expect(first.value).toEqual({
       project: {
@@ -97,7 +98,7 @@ describe("createProject", () => {
     });
     fs.writeFileSync(path.join(root, "app", "keep.txt"), "precious");
 
-    expect(await createProject(root, name("app"), false)).toEqual({
+    expect(await createProject(root, name("app"), false, silentLogger)).toEqual({
       ok: false,
       error: "project_exists",
     });
@@ -107,9 +108,9 @@ describe("createProject", () => {
   });
 
   it("treats a name differing only in case as existing and leaves the first untouched", async () => {
-    const first = await createProject(root, name("Site"), false);
+    const first = await createProject(root, name("Site"), false, silentLogger);
     if (!first.ok) throw new Error(first.error);
-    expect(await createProject(root, name("site"), false)).toEqual({
+    expect(await createProject(root, name("site"), false, silentLogger)).toEqual({
       ok: false,
       error: "project_exists",
     });
@@ -122,7 +123,7 @@ describe("createProject", () => {
     fs.symlinkSync(base, path.join(root, "alink"));
     fs.symlinkSync(path.join(base, "nowhere"), path.join(root, "dangling"));
     for (const n of ["afile", "alink", "dangling", "AFILE"]) {
-      expect(await createProject(root, name(n), true)).toEqual({
+      expect(await createProject(root, name(n), true, silentLogger)).toEqual({
         ok: false,
         error: "project_exists",
       });
@@ -134,7 +135,7 @@ describe("createProject", () => {
 
   it("lets exactly one of many concurrent creates of the same name win", async () => {
     const results = await Promise.all(
-      Array.from({ length: 12 }, () => createProject(root, name("race"), false)),
+      Array.from({ length: 12 }, () => createProject(root, name("race"), false, silentLogger)),
     );
     expect(results.filter((r) => r.ok)).toHaveLength(1);
     for (const r of results.filter((r) => !r.ok)) {
@@ -149,7 +150,7 @@ describe("createProject", () => {
       fs.mkdirSync(path.join(trialRoot, "other"));
       const results = await Promise.all(
         ["Foo", "foo", "FOO", "fOo"].map((n) =>
-          createProject(trialRoot, name(n), false),
+          createProject(trialRoot, name(n), false, silentLogger),
         ),
       );
       expect(results.filter((r) => r.ok)).toHaveLength(1);
@@ -167,7 +168,7 @@ describe("createProject", () => {
     const link = path.join(base, "projects-link");
     fs.symlinkSync(root, link);
 
-    const created = await createProject(link, name("app"), false);
+    const created = await createProject(link, name("app"), false, silentLogger);
     if (!created.ok) throw new Error(created.error);
     expect(created.value.project.path).toBe(path.join(root, "app"));
 
@@ -179,7 +180,7 @@ describe("createProject", () => {
   });
 
   it("runs git init when asked", async () => {
-    const res = await createProject(root, name("repo"), true);
+    const res = await createProject(root, name("repo"), true, silentLogger);
     if (!res.ok) throw new Error(res.error);
     expect(res.value.warning).toBeUndefined();
     expect(res.value.project.is_git).toBe(true);
@@ -197,7 +198,7 @@ describe("createProject", () => {
     process.env.GIT_DIR = elsewhere;
     process.env.GIT_WORK_TREE = base;
     try {
-      const res = await createProject(root, name("g1"), true);
+      const res = await createProject(root, name("g1"), true, silentLogger);
       if (!res.ok) throw new Error(res.error);
       expect(res.value.warning).toBeUndefined();
       expect(res.value.project.is_git).toBe(true);
@@ -215,7 +216,7 @@ describe("createProject", () => {
     const savedPath = process.env.PATH;
     process.env.PATH = fs.mkdtempSync(path.join(base, "empty-bin-"));
     try {
-      const res = await createProject(root, name("nogit"), true);
+      const res = await createProject(root, name("nogit"), true, silentLogger);
       if (!res.ok) throw new Error(res.error);
       expect(res.value.warning).toBe("git init failed (ENOENT)");
       expect(res.value.project.is_git).toBe(false);
@@ -237,11 +238,11 @@ describe("createProject", () => {
         `#!/bin/sh\necho "SECRET-STDERR $HOME" >&2\n${ending}\n`,
         { mode: 0o755 },
       );
-      const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const warn = jest.fn();
       const savedPath = process.env.PATH;
       process.env.PATH = `${bin}:${savedPath}`;
       try {
-        const res = await createProject(root, name("broken"), true);
+        const res = await createProject(root, name("broken"), true, { ...silentLogger, warn });
         if (!res.ok) throw new Error(res.error);
         expect(res.value.warning).toBe(warning);
       } finally {

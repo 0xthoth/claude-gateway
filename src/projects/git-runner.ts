@@ -1,9 +1,9 @@
 import { spawn } from 'child_process';
-import { projectsWarn } from './log';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import { err, ok, Result } from '../utils/result';
 import { redactCredentials } from './git-status';
+import type { Logger } from '../types';
 
 export const GIT_READ_TIMEOUT_MS = 3_000;
 
@@ -77,6 +77,7 @@ export function hardenedGit(cwd: string, args: string[], blankFilterKeys: readon
 
 export interface RunOptions {
   timeoutMs: number;
+  logger: Logger;
   /** The repository's own `filter.*` keys, to blank for this call. */
   blankFilterKeys?: readonly string[];
 }
@@ -130,11 +131,11 @@ export async function runGit(cwd: string, args: string[], opts: RunOptions): Pro
       if ((e as NodeJS.ErrnoException).code === 'ENOENT' && existsSync(cwd)) {
         if (!warnedGitMissing) {
           warnedGitMissing = true;
-          projectsWarn('projects: git is not installed or not on PATH, so project git status is unavailable');
+          opts.logger.warn('projects: git is not installed or not on PATH, so project git status is unavailable');
         }
         return settle(err('git_unavailable'));
       }
-      projectsWarn(`projects: git ${args[0]} in ${cwd} failed: ${redactCredentials(e.message)}`);
+      opts.logger.warn(`projects: git ${args[0]} in ${cwd} failed: ${redactCredentials(e.message)}`);
       settle(err('git_failed'));
     });
     const finish = (code: number | null) => {

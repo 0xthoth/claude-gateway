@@ -15,7 +15,7 @@ import * as path from 'path';
 import { Server } from 'http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { AgentRunner } from '../agent/runner';
-import { AgentConfig, AgentStats, ApiKey, GatewayConfig, HeartbeatResult } from '../types';
+import { AgentConfig, AgentStats, ApiKey, GatewayConfig, HeartbeatResult, Logger } from '../types';
 import { agentsDirForConfig } from '../config/agent-env';
 import { ptyStreamRegistry } from '../shell/pty-stream-registry';
 import { shouldRoutePtyInput, MAX_PTY_INPUT_BYTES } from '../shell/control-channel';
@@ -297,6 +297,8 @@ export class GatewayRouter {
    *  and an OAuth-flow completion can't race each other's read-modify-write
    *  of gateway.customConnectors — see custom-connectors-store.ts. */
   private readonly customConnectorsStore: CustomConnectorsStore;
+  /** The gateway-wide logger (logs/gateway.log); console when a test builds the router without one. */
+  private readonly logger: Logger;
 
   constructor(
     agents: Map<string, AgentRunner>,
@@ -308,6 +310,7 @@ export class GatewayRouter {
     appsRegistry?: AppsRegistry,
     appInstaller?: AppInstaller,
     appRegistryClient?: RegistryClient,
+    logger?: Logger,
   ) {
     this.agents = agents;
     this.configs = configs;
@@ -319,6 +322,7 @@ export class GatewayRouter {
     this.appsRegistry = appsRegistry;
     this.appInstaller = appInstaller;
     this.appRegistryClient = appRegistryClient;
+    this.logger = logger ?? console;
     this.customConnectorsStore = createCustomConnectorsStore(configPath);
     this.app = express();
 
@@ -748,6 +752,7 @@ export class GatewayRouter {
     // Mount the pod-wide Projects API (gateway.projects.root, default ~/projects)
     if (this.gatewayConfig?.gateway?.api?.keys && projectsEnabled(this.gatewayConfig)) {
       this.app.use('/api', createProjectsRouter(this.gatewayConfig.gateway.api.keys, resolveProjectsRoot(this.gatewayConfig), {
+        logger: this.logger,
         chatTurnActive: async (name) => (await Promise.all([...this.agents.values()].map((runner) => runner.hasActiveProjectTurn(name)))).some(Boolean),
       }));
     }

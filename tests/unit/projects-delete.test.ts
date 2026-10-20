@@ -5,6 +5,7 @@ import * as path from 'path';
 import request from 'supertest';
 import { createProjectsRouter } from '../../src/api/projects-router';
 import type { ApiKey } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const apiKeys: ApiKey[] = [
   { key: 'k-write', agents: '*', write: true, admin: true },
@@ -21,7 +22,7 @@ let chatting: Set<string>;
 const app = (): express.Express => {
   const a = express();
   a.use(express.json());
-  a.use('/api', createProjectsRouter(apiKeys, root, { chatTurnActive: (name) => chatting.has(name) }));
+  a.use('/api', createProjectsRouter(apiKeys, root, { logger: silentLogger, chatTurnActive: (name) => chatting.has(name) }));
   return a;
 };
 const del = (name = 'api', body: object = { confirm: name }, key = 'k-write') =>
@@ -92,6 +93,17 @@ describe('DELETE /api/v1/projects/:name', () => {
     const res = await del();
     expect(res.status).toBe(200);
     expect(exists('api')).toBe(false);
+  });
+
+  it('answers 500 and removes nothing when the busy check throws', async () => {
+    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const a = express();
+    a.use(express.json());
+    a.use('/api', createProjectsRouter(apiKeys, root, { logger: silentLogger, chatTurnActive: async () => { throw new Error('store gone'); } }));
+    const res = await request(a).delete('/api/v1/projects/api').set(as('k-write')).send({ confirm: 'api' });
+    error.mockRestore();
+    expect([res.status, res.body]).toEqual([500, { error: 'Internal error' }]);
+    expect(exists('api', 'src', 'index.js')).toBe(true);
   });
 
   it('removes a link inside the project without touching what it points to', async () => {

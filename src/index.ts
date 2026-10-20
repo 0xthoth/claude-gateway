@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { setProjectsLogger } from './projects/log';
 import { AgentLifecycle } from './config/agent-lifecycle';
 import { setConfigValue } from './config/reload-policy';
 import { gatewayCapacity } from './orchestration/capacity';
@@ -669,7 +668,6 @@ async function main(): Promise<void> {
   const globalLogger = createLogger('gateway', expandTilde(config.gateway.logDir));
   logSkippedAgents(globalLogger, startupSkips, 'Agent skipped at startup');
   for (const message of startupWarnings) globalLogger.warn(message);
-  setProjectsLogger(globalLogger);
   // Same #427 rationale as skipped agents: the console.warn already happened
   // inside loadConfig (before logDir/globalLogger could exist), replay it here
   // so it also reaches logs/gateway.log under structured/JSON logging (#472).
@@ -923,7 +921,7 @@ async function main(): Promise<void> {
   const restorePending = await appInstaller.markRestorePending();
 
   // Start gateway router
-  const router = new GatewayRouter(agentRunners, agentConfigs, undefined, config, cronManager, CONFIG_PATH, appsRegistry, appInstaller, registryClient);
+  const router = new GatewayRouter(agentRunners, agentConfigs, undefined, config, cronManager, CONFIG_PATH, appsRegistry, appInstaller, registryClient, globalLogger);
   await router.start(PORT);
   console.log(`[gateway] Listening on port ${PORT}`);
 

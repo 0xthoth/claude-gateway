@@ -1,9 +1,9 @@
 import { randomUUID } from 'crypto';
-import { projectsWarn } from './log';
 import { promises as fsp } from 'fs';
 import * as path from 'path';
 import { errnoToCode, ProjectName, ProjectsErrorCode } from './paths';
 import { err, ok, Result } from '../utils/result';
+import type { Logger } from '../types';
 
 export type DeleteErrorCode = 'confirm_mismatch' | 'project_running' | 'project_deleting';
 
@@ -21,7 +21,7 @@ export interface RemovedProject {
  * so what it could not remove stays hidden and the caller gets a warning instead of a project
  * that is listed with half its files gone.
  */
-export async function removeProject(root: string, name: ProjectName): Promise<Result<RemovedProject, ProjectsErrorCode>> {
+export async function removeProject(root: string, name: ProjectName, logger: Logger): Promise<Result<RemovedProject, ProjectsErrorCode>> {
   let trash: string;
   try {
     const realRoot = await fsp.realpath(root);
@@ -41,7 +41,7 @@ export async function removeProject(root: string, name: ProjectName): Promise<Re
     await fsp.rm(trash, { recursive: true, force: false });
     return ok({ name });
   } catch (e) {
-    projectsWarn(`projects: removing ${trash} failed: ${(e as Error).message}`);
+    logger.warn(`projects: removing ${trash} failed: ${(e as Error).message}`);
     return ok({ name, warning: `Some files could not be removed and remain in ${trash}. Remove that folder by hand: rm -rf ${trash}` });
   }
 }

@@ -8,6 +8,7 @@ import { GatewayRouter } from '../../src/api/gateway-router';
 import { createProjectsRouter } from '../../src/api/projects-router';
 import { getRegisteredRoutes } from '../../src/api/route-registry';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const KEYS = {
   admin: { key: 'k-admin', agents: '*', admin: true },
@@ -37,12 +38,12 @@ describe('the /v1/projects routes', () => {
     fs.writeFileSync(path.join(root, 'app', 'README.md'), '# app\n');
     app = express();
     app.use(express.json());
-    app.use('/api', createProjectsRouter(Object.values(KEYS), root));
+    app.use('/api', createProjectsRouter(Object.values(KEYS), root, { logger: silentLogger }));
   });
   afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
 
   const routes = () => {
-    createProjectsRouter([], '');
+    createProjectsRouter([], '', { logger: silentLogger });
     return getRegisteredRoutes().filter((r) => r.path.startsWith('/v1/projects'));
   };
   const call = (route: string, key?: ApiKey) => {

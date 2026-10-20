@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response, Router } from 'express';
-import { ApiKey } from '../types';
+import { ApiKey, Logger } from '../types';
 import { createApiAuthMiddleware, isAdmin, PROJECTS_ADMIN_REQUIRED } from './auth';
+import { guardAsyncRoutes } from './async-guard';
 import { defineRoute } from './route-registry';
 import { createProject, resolveProjectDir, listProjects } from '../projects/fs';
 import { getStatus, getSummaries, GitError, GitErrorCode } from '../projects/git';
@@ -47,30 +48,27 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   else fail(res, 'forbidden_key');
 }
 
-function handle(fn: (req: Request, res: Response) => Promise<void>) {
-  return (req: Request, res: Response): void => {
-    fn(req, res).catch(() => fail(res, 'internal'));
-  };
+export interface ProjectsRouterDeps {
+  /** The gateway logger, for warnings such as a failed `git init` or a delete that left files behind. */
+  logger: Logger;
+  /** A chat bound to the project has a turn running, whose agent process works inside the folder. */
+  chatTurnActive?: (name: ProjectName) => boolean | Promise<boolean>;
 }
 
 /**
  * Pod-wide project routes under `root`. Projects belong to no agent, so any key may read them; creating and deleting
  * one changes the pod and needs an admin key.
  */
-export interface ProjectsRouterDeps {
-  /** A chat bound to the project has a turn running, whose agent process works inside the folder. */
-  chatTurnActive?: (name: ProjectName) => boolean | Promise<boolean>;
-}
-
-export function createProjectsRouter(apiKeys: ApiKey[], root: string, deps: ProjectsRouterDeps = {}): Router {
-  const router = Router();
+export function createProjectsRouter(apiKeys: ApiKey[], root: string, deps: ProjectsRouterDeps): Router {
+  const router = guardAsyncRoutes(Router());
+  const { logger } = deps;
   const auth = createApiAuthMiddleware(apiKeys);
 
   defineRoute(
     router,
     { method: 'GET', path: '/v1/projects', auth: 'key', summary: 'List projects under the configured projects root', cli: null },
     auth,
-    handle(async (_req, res) => respond(res, await listProjects(root))),
+    async (_req: Request, res: Response) => respond(res, await listProjects(root)),
   );
 
   defineRoute(
@@ -78,12 +76,12 @@ export function createProjectsRouter(apiKeys: ApiKey[], root: string, deps: Proj
     { method: 'POST', path: '/v1/projects', auth: 'admin', summary: 'Create a project directory', cli: null },
     auth,
     requireAdmin,
-    handle(async (req, res) => {
+    async (req: Request, res: Response) => {
       const body = (req.body ?? {}) as { name?: unknown; git_init?: unknown };
       const name = parseProjectName(body.name);
       if (!name.ok) return fail(res, name.error);
-      respond(res, await createProject(root, name.value, body.git_init === true), 201);
-    }),
+      respond(res, await createProject(root, name.value, body.git_init === true, logger), 201);
+    },
   );
 
   defineRoute(
@@ -91,7 +89,7 @@ export function createProjectsRouter(apiKeys: ApiKey[], root: string, deps: Proj
     { method: 'DELETE', path: '/v1/projects/:name', auth: 'admin', summary: 'Delete a project folder and everything in it', cli: null },
     auth,
     requireAdmin,
-    handle(async (req, res) => {
+    async (req: Request, res: Response) => {
       const name = parseProjectName(req.params.name);
       if (!name.ok) return fail(res, name.error);
       if ((req.body ?? {}).confirm !== name.value) return fail(res, 'confirm_mismatch');
@@ -105,29 +103,29 @@ export function createProjectsRouter(apiKeys: ApiKey[], root: string, deps: Proj
       if (!release) return fail(res, 'project_deleting');
       try {
         if (await busy()) return fail(res, 'project_running');
-        respond(res, await removeProject(root, name.value));
+        respond(res, await removeProject(root, name.value, logger));
       } finally {
         release();
       }
-    }),
+    },
   );
 
   defineRoute(
     router,
     { method: 'GET', path: '/v1/projects/git-summary', auth: 'key', summary: 'Git sync summary for every project that is a repository', cli: null },
     auth,
-    handle(async (_req, res) => respond(res, await getSummaries(root))),
+    async (_req: Request, res: Response) => respond(res, await getSummaries(root, logger)),
   );
 
   defineRoute(
     router,
     { method: 'GET', path: '/v1/projects/:name/git', auth: 'key', summary: 'Git status of a project', cli: null },
     auth,
-    handle(async (req, res) => {
+    async (req: Request, res: Response) => {
       const name = parseProjectName(req.params.name);
       if (!name.ok) return fail(res, name.error);
-      respond(res, await getStatus(root, name.value));
-    }),
+      respond(res, await getStatus(root, name.value, logger));
+    },
   );
 
   return router;
