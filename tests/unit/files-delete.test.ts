@@ -342,6 +342,18 @@ describe('DELETE /api/v1/files', () => {
       expect(exists('api', 'src', 'index.js')).toBe(true);
     });
 
+    it('refuses a nested folder on another device than its parent, and keeps the parent', async () => {
+      const target = path.join(root, 'api', 'src');
+      const realLstat = fs.promises.lstat.bind(fs.promises);
+      jest.spyOn(fs.promises, 'lstat').mockImplementation((async (p: fs.PathLike) => {
+        const st = await realLstat(p);
+        return String(p) === target ? Object.assign(st, { dev: st.dev + 1 }) : st;
+      }) as typeof fs.promises.lstat);
+      const res = await del('api/src');
+      expect([res.status, res.body.code]).toEqual([409, 'cross_device']);
+      expect(exists('api', 'src', 'index.js')).toBe(true);
+    });
+
     it('refuses a folder that holds a mount point, and removes nothing', async () => {
       const mounted = path.join(root, 'api', 'src');
       const realReadFile = fs.promises.readFile.bind(fs.promises);
