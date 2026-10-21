@@ -107,11 +107,11 @@ gets the gateway's usual `401` or `403` before it reaches these routes.
 | 403 | `forbidden_key` | mkdir, delete, busy or marks with a key that is not an admin key. |
 | 404 | `not_found` | The folder, or the parent of a new folder, does not exist. |
 | 409 | `already_exists` | mkdir named a folder, file or symlink that already exists, compared case-insensitively (`Site` collides with `site`). |
-| 409 | `symlink_in_path` | `DELETE` of a nested path whose parent folders include a symbolic link. |
+| 409 | `symlink_in_path` | `DELETE` or mkdir of a nested path whose parent folders include a symbolic link. |
 | 409 | `cross_device` | `DELETE` of a folder on another filesystem than its parent, or one that holds a mount point. |
 | 409 | `in_use` | `DELETE` or `POST /files/marks` found a chat or task working in the folder, in a folder inside it, or in a folder holding it. A mark answer adds `reasons`. |
-| 409 | `deleting` | The folder, a folder inside it, or a folder holding it is being deleted by another request. |
-| 409 | `marked` | A [mark](#marks) holds the folder, a folder inside it, or a folder holding it. `DELETE` and `POST /files/marks` answer it. |
+| 409 | `deleting` | The folder, a folder inside it, or a folder holding it is being deleted by another request. mkdir answers it for a new folder inside one being deleted. |
+| 409 | `marked` | A [mark](#marks) holds the folder, a folder inside it, or a folder holding it. `DELETE`, `POST /files/marks` and mkdir (for a new folder inside a marked one) answer it. |
 | 409 | `not_a_git_repo` | Git status of a folder that is not a repository. |
 | 409 | `git_unsafe_owner` | The repository belongs to another user and git refuses it. |
 | 409 | `git_unreadable` | The folder has a `.git` that git cannot read safely. |
@@ -186,7 +186,9 @@ curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json"
 If the name is taken, compared case-insensitively within the parent, the response is `409 already_exists` and the
 existing entry is not touched. Creates in one parent run one at a time, and the create is an atomic `mkdir`, so of
 several concurrent requests for one name exactly one gets `201`. A missing parent is `404 not_found`, and nothing is
-created above the new folder. If `git init` fails, the folder is kept and the response is still `201`, with a
+created above the new folder. A parent reached through a symbolic link is `409 symlink_in_path`, as for
+[`DELETE`](#delete-files), so a folder never appears under two names. A new folder inside one a [mark](#marks) holds is
+`409 marked`, and inside one a `DELETE` is removing is `409 deleting`. If `git init` fails, the folder is kept and the response is still `201`, with a
 `warning` that names only the exit code, the signal, or the spawn error (such as `ENOENT` when git is not installed).
 Git's output goes to the gateway log, never to the client.
 
@@ -312,6 +314,7 @@ with these codes:
 | `400` | `invalid_path`, `invalid_name` | `path` fails the [path rules](#paths) or names the root. |
 | `403` | `path_escape` | The real path leaves the root, or is the root itself. |
 | `403` | `forbidden_key` | The key is not an admin key. |
+| `400` | `not_a_directory` | `path` names a file, or a link to a file. |
 | `404` | `not_found` | The folder does not exist. |
 | `409` | `in_use` | A turn, spawn or task works in the folder, in a folder inside it, or in a folder holding it. `reasons` lists them, as in the [busy check](#post-files-busy). An idle session process does not block a mark. |
 | `409` | `marked` | Another mark holds the folder, a folder inside it, or a folder holding it. |
@@ -323,10 +326,22 @@ holds it:
 - [Session create](/api/sessions#post-apiv1agentsagentidsessions) with that `cwd` answers `409 path_marked`.
 - A chat turn or a session spawn in such a folder fails with `409 PATH_MARKED`.
 - An orchestrated task fails to queue or start with `PATH_MARKED`.
+- A streaming turn (`"stream": true`) answers `200` and sends an SSE `error` frame with code `PATH_MARKED`.
 - [`DELETE /files`](#delete-files) answers `409 marked`.
 - Another `POST /files/marks` answers `409 marked`.
+- [mkdir](#post-files-mkdir) of a new folder inside the marked folder answers `409 marked`. A new folder beside it, in
+  the folder that holds it, is allowed.
 
 The mark is kept on the folder's real path, so a symlink that leads to the folder is held too.
+
+**Known limitation.** A mark sees only work the gateway starts: chat turns, starting session processes and
+orchestrated tasks. An idle session process does not make a folder busy, so it neither fails a mark nor shows `busy`.
+Processes the gateway did not start, such as a dev server or another listener in the folder, are not seen at all until
+the gateway tracks processes. Stop them yourself before you clean.
+
+Marks live in the gateway's memory only. A gateway restart drops every mark, so a cleaner that must survive a restart
+takes its mark again. An expired mark is removed lazily, the next time a request checks holds, and it holds nothing
+after `expiresAt` either way.
 
 ### DELETE /api/v1/files/marks/:markId {#delete-files-marks}
 

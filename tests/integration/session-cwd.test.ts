@@ -205,6 +205,8 @@ describe('session cwd', () => {
     expect([clear.status, clear.body.code]).toEqual([409, 'SESSION_ID_IN_USE']);
     const turn = await send(h, sid, 'hi', 'evil');
     expect([turn.status, turn.body.code]).toEqual([404, 'SESSION_NOT_FOUND']);
+    const accepted = await supertest(h.app).post('/api/v1/agents/alfred/messages/accept').set(AUTH).send({ message: 'hi', chat_id: 'evil', session_id: sid });
+    expect([accepted.status, accepted.body.code]).toEqual([404, 'SESSION_NOT_FOUND']);
 
     expect(spawns(h)).toEqual([]);
     const evilIndex = fs.existsSync(indexFile(h, 'evil')) ? fs.readFileSync(indexFile(h, 'evil'), 'utf8') : '';

@@ -124,9 +124,12 @@ describe('GET /api/v1/files', () => {
     expect(top.body.skipped).toEqual([{ name: 'escape', reason: 'symlink_outside_root' }]);
   });
 
-  it('answers 404 not_found for a missing folder under an existing root', async () => {
+  it('answers HTTP 404 not_found for a missing folder under an existing root, on the list and on git status', async () => {
     seed();
-    expect((await list('ghost')).body.code).toBe('not_found');
+    const listed = await list('ghost');
+    expect([listed.status, listed.body.code]).toEqual([404, 'not_found']);
+    const status = await request(app).get('/api/v1/git/status').query({ path: 'ghost' }).set(POD);
+    expect([status.status, status.body.code]).toEqual([404, 'not_found']);
   });
 });
 
@@ -185,6 +188,18 @@ describe('POST /api/v1/files/mkdir', () => {
     const res = await mkdir({ path: 'escape/new' });
     expect([res.status, res.body.code]).toEqual([403, 'path_escape']);
     expect(fs.readdirSync(outside)).toEqual(['secret.txt']);
+  });
+
+  it('refuses to create under a symlinked parent inside the root with 409 symlink_in_path, as DELETE does', async () => {
+    seed();
+    fs.symlinkSync(path.join(root, 'app'), path.join(root, 'parentlink'));
+    for (const rel of ['parentlink/viakid', 'parentlink/src/viakid']) {
+      const res = await mkdir({ path: rel });
+      expect([rel, res.status, res.body.code]).toEqual([rel, 409, 'symlink_in_path']);
+    }
+    expect(fs.readdirSync(path.join(root, 'app')).sort()).toEqual(['README.md', 'src']);
+    expect(fs.readdirSync(path.join(root, 'app', 'src'))).toEqual([]);
+    expect((await mkdir({ path: 'app/viakid' })).status).toBe(201);
   });
 
   it.each(['../x', '.', '..', '.git', '.hidden', 'a'.repeat(65), 'app/../x', 'app/.git'])('rejects path %p with 400 invalid_name', async (rel) => {

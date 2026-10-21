@@ -220,9 +220,11 @@ message fails with `PATH_MARKED`. A synchronous [`POST /messages`](/api/messages
 answers `409`. A streaming request gets an SSE `error` frame with that code.
 
 **A session id belongs to one chat.** Each session id belongs to one `chat_id` of an agent. A request that would
-register the id under another `chat_id` answers `409 SESSION_ID_IN_USE` and writes nothing. That covers
-[`POST /messages`](/api/messages), [`POST /messages/accept`](/api/messages), rename (`PATCH`), `clear`, `compact`,
-`stop` and `restart`.
+register the id under another `chat_id` answers `409 SESSION_ID_IN_USE` and writes nothing. That covers rename
+(`PATCH`), `clear`, `compact`, `stop` and `restart`, including two such requests for one new id sent at once from two
+chats: one wins and the other answers `409 SESSION_ID_IN_USE`. [`POST /messages`](/api/messages) and
+[`POST /messages/accept`](/api/messages) check the chat first, so they answer `404 SESSION_NOT_FOUND` for an id
+that belongs to another chat.
 
 **Who can use a folder-bound chat.** A folder-bound chat belongs to its agent. Every route answers a key for a
 folder-bound chat exactly as it does for a plain chat of the same agent: an admin key reaches every agent; any other key

@@ -3,6 +3,7 @@ import { Dirent, promises as fsp } from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import { hardenedGit } from '../git/runner';
+import { findHold } from './holds';
 import { EntryName, errnoToCode, FilesErrorCode, joinRel, parseEntryName, pathSegments, RelPath, resolveInside } from './paths';
 import { err, ok, Result } from '../utils/result';
 import type { Logger } from '../types';
@@ -187,7 +188,14 @@ function serializeCreate<T>(parent: string, fn: () => Promise<T>): Promise<T> {
 
 /** The real parent folder of a new entry. A missing root is created, as the first mkdir on a fresh pod needs; a missing deeper parent is not. */
 async function parentOf(root: string, parentRel: RelPath): Promise<FsResult<string>> {
-  if (parentRel !== '') return resolveDir(root, parentRel);
+  if (parentRel !== '') {
+    const dir = await resolveDir(root, parentRel);
+    if (!dir.ok) return dir;
+    // As DELETE does: a new folder never lands through a symlinked parent, where it would appear under two names.
+    const realRoot = await realRootOf(root);
+    if (!realRoot.ok) return realRoot;
+    return dir.value === path.join(realRoot.value, parentRel) ? dir : err('symlink_in_path');
+  }
   try {
     await fsp.mkdir(root, { recursive: true });
   } catch (e) {
@@ -197,13 +205,18 @@ async function parentOf(root: string, parentRel: RelPath): Promise<FsResult<stri
   return realRootOf(root);
 }
 
-async function makeOneDir(parent: string, dir: string, name: EntryName): Promise<FsResult<void>> {
+export type MakeDirError = FilesErrorCode | 'marked' | 'deleting';
+
+async function makeOneDir(parent: string, dir: string, name: EntryName): Promise<Result<void, MakeDirError>> {
   // Case-folding filesystems already answer EEXIST; this makes Linux agree so a client never gets "Site" and "site"
   // side by side. The check and mkdir run serialized per parent so concurrent case variants cannot both pass the
   // check; the atomic mkdir stays the authority for exact-name races.
   try {
     const lower = name.toLowerCase();
     if ((await fsp.readdir(parent)).some((n) => n.toLowerCase() === lower)) return err('already_exists');
+    // A cleaner holding the parent (or a delete removing it) expects no new folder to appear inside.
+    const hold = findHold(dir);
+    if (hold) return err(hold.kind === 'deleting' ? 'deleting' : 'marked');
     await fsp.mkdir(dir);
     return ok(undefined);
   } catch (e) {
@@ -212,7 +225,7 @@ async function makeOneDir(parent: string, dir: string, name: EntryName): Promise
 }
 
 /** Creates exactly one new directory, `rel`, whose parent must already exist under the root. */
-export async function makeDir(root: string, rel: RelPath, gitInit: boolean, logger: Logger): Promise<FsResult<CreatedEntry>> {
+export async function makeDir(root: string, rel: RelPath, gitInit: boolean, logger: Logger): Promise<Result<CreatedEntry, MakeDirError>> {
   const segments = pathSegments(rel);
   const name = segments.pop();
   if (name === undefined) return err('invalid_path');

@@ -86,7 +86,9 @@ describe('files marks', () => {
     ['a traversal', cleaning('../x'), 400, 'invalid_name'],
     ['a link out of the root', cleaning('escape'), 403, 'path_escape'],
     ['a missing folder', cleaning('nope'), 404, 'not_found'],
+    ['a file', cleaning('notes.txt'), 400, 'not_a_directory'],
   ])('refuses %s', async (_name, body, status, code) => {
+    fs.writeFileSync(path.join(h.root, 'notes.txt'), 'x');
     const res = await mark(h, body);
     expect([res.status, res.body.code]).toEqual([status, code]);
   });
@@ -120,6 +122,20 @@ describe('files marks', () => {
     expect((await del(h, 'other')).status).toBe(200);
   });
 
+  it('refuses a new folder inside a marked folder with 409 marked, and creates it once released; a sibling of a marked folder is free', async () => {
+    const mkdir = (rel: string) => supertest(h.app).post('/api/v1/files/mkdir').set('Authorization', as(ADMIN)).send({ path: rel });
+    const held = await mark(h, cleaning('site'));
+    for (const rel of ['site/new', 'site/web/new']) {
+      const res = await mkdir(rel);
+      expect([rel, res.status, res.body.code]).toEqual([rel, 409, 'marked']);
+      expect(fs.existsSync(path.join(h.root, rel))).toBe(false);
+    }
+    await release(h, held.body.markId);
+    await mark(h, cleaning('site/web'));
+    expect((await mkdir('site/new')).status).toBe(201);
+    expect((await mkdir('site/web/new')).body.code).toBe('marked');
+  });
+
   it('releases idempotently, and an unknown id is not an error', async () => {
     const held = await mark(h, cleaning('site'));
     expect((await release(h, held.body.markId)).status).toBe(204);
@@ -146,6 +162,10 @@ describe('files marks', () => {
     expect([created.status, created.body.code]).toEqual([409, 'path_marked']);
     const turn = await send(h, bound.body.sessionId, 'hello');
     expect([turn.status, turn.body.code]).toEqual([409, 'PATH_MARKED']);
+    const streamed = await supertest(h.app).post('/api/v1/agents/alfred/messages').set('Authorization', as(ADMIN))
+      .send({ message: 'hello', chat_id: 'web', session_id: bound.body.sessionId, stream: true });
+    expect(streamed.status).toBe(200);
+    expect(streamed.text).toMatch(/"type":"error"[^\n]*"code":"PATH_MARKED"/);
     expect(spawnCount(h)).toBe(0);
     const list = await supertest(h.app).get('/api/v1/agents/alfred/sessions').set('Authorization', as(ADMIN)).query({ chat_id: 'web' });
     expect(list.body.sessions.find((s: { id: string }) => s.id === bound.body.sessionId)).toMatchObject({ cwd: path.join(h.root, 'site', 'web'), cwdState: 'unavailable', active: false });

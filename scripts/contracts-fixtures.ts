@@ -87,6 +87,7 @@ function seed(root: string, outside: string): void {
   fs.mkdirSync(path.join(root, 'busy'));
   fs.mkdirSync(path.join(root, 'locked', 'sub'), { recursive: true });
   fs.writeFileSync(path.join(root, 'locked', 'sub', 'f.txt'), 'x');
+  fs.writeFileSync(path.join(root, 'notes.txt'), 'x');
   pinTimes(root);
 }
 
@@ -144,6 +145,7 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
       ['files-mkdir/created_nested_git', { method: 'POST', url: '/api/v1/files/mkdir', key: 'admin', body: { path: 'site/docs', git_init: true } }, 'FilesMkdirResponse'],
       ['files-mkdir/already_exists', { method: 'POST', url: '/api/v1/files/mkdir', key: 'admin', body: { path: 'APP' } }, 'Error'],
       ['files-mkdir/not_found', { method: 'POST', url: '/api/v1/files/mkdir', key: 'admin', body: { path: 'nope/new' } }, 'Error'],
+      ['files-mkdir/symlink_in_path', { method: 'POST', url: '/api/v1/files/mkdir', key: 'admin', body: { path: 'alias/new' } }, 'Error'],
       ['files-mkdir/forbidden_key', { method: 'POST', url: '/api/v1/files/mkdir', key: 'reader', body: { path: 'demo2' } }, 'Error'],
       ['files-delete/confirm_mismatch', { method: 'DELETE', url: '/api/v1/files', key: 'admin', body: { path: 'site/web', confirm: 'site/web' } }, 'Error'],
       ['files-delete/invalid_path_root', { method: 'DELETE', url: '/api/v1/files', key: 'admin', body: { path: '', confirm: '' } }, 'Error'],
@@ -157,9 +159,11 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
       ['files-busy/report', { method: 'POST', url: '/api/v1/files/busy', key: 'admin', body: { paths: ['busy', 'app', 'nope'] } }, 'FilesBusyResponse'],
       ['files-busy/invalid_mark', { method: 'POST', url: '/api/v1/files/busy', key: 'admin', body: { paths: [] } }, 'Error'],
       ['files-marks/created', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'app', purpose: 'cleaning', ttlSec: 60 } }, 'FilesMarksResponse'],
+      ['files-mkdir/marked', { method: 'POST', url: '/api/v1/files/mkdir', key: 'admin', body: { path: 'app/new' } }, 'Error'],
       ['files-marks/marked', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'app', purpose: 'starting', ttlSec: 300 } }, 'Error'],
       ['files-marks/in_use', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'busy', purpose: 'cleaning', ttlSec: 60 } }, 'Error'],
       ['files-marks/invalid_mark', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'site', purpose: 'cleaning', ttlSec: 30 } }, 'Error'],
+      ['files-marks/not_a_directory', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'notes.txt', purpose: 'cleaning', ttlSec: 60 } }, 'Error'],
       ['files-marks/forbidden_key', { method: 'POST', url: '/api/v1/files/marks', key: 'reader', body: { path: 'site', purpose: 'cleaning', ttlSec: 60 } }, 'Error'],
       ['files-delete/marked', { method: 'DELETE', url: '/api/v1/files', key: 'admin', body: { path: 'app', confirm: 'app' } }, 'Error'],
     ];
