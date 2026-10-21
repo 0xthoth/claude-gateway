@@ -93,21 +93,25 @@ curl -H "X-Api-Key: my-secret-key-123" \
 }
 ```
 
-Every session response carries `project`, `trusted` and `projectState`: here, on create, in the
+Every session response carries `cwd`, `trusted`, `cwdState` and `active`: here, on create, in the
 [info](#get-apiv1agentsagentidsessionssessionidinfo) response and on the admin
-list `GET /v1/agents/sessions`. `project` is the project name the session was
-created with, or `null`. `trusted` is `true` only when the session has a
-project, its folder is `available`, and the operator trusts it (see below); it is `false` otherwise.
-`projectState` is `null` when `project` is `null`. Otherwise it says whether the folder still
-resolves when the response is built:
+list `GET /v1/agents/sessions`. List entries carry no `project` field.
 
-| `projectState` | Meaning |
-|----------------|---------|
+| Field | Meaning |
+|-------|---------|
+| `cwd` | The absolute path the session stores as its working folder, or `null` when the session has none. |
+| `trusted` | `true` only when the session has a `cwd`, its folder is `available`, and the operator trusts it (see below). `false` otherwise. |
+| `cwdState` | `null` when the session has no `cwd`. Otherwise it says whether the folder still resolves when the response is built. |
+| `active` | `true` while a turn runs or is queued, a session process is spawning, or an orchestrated task on this session has not finished. |
+
+| `cwdState` | Meaning |
+|------------|---------|
 | `available` | The folder exists under the files root. |
-| `missing` | No folder with that name exists, for example after it was deleted or renamed. |
-| `unavailable` | The folder exists but cannot be used, for example a symlink that leaves the root or a file in place of a folder. |
+| `missing` | No folder exists at that path, for example after it was deleted or renamed. |
+| `unavailable` | The folder exists but cannot be used, for example a symlink that leaves the root, a file in place of a folder, or a folder held by a delete or a [mark](/api/files#marks). |
 
-A session whose `projectState` is `missing` or `unavailable` cannot run, and a message to it fails with `409 PROJECT_UNAVAILABLE`.
+A session whose `cwdState` is `missing` or `unavailable` cannot run. A message to it fails with `409 CWD_UNAVAILABLE`,
+or `409 PATH_MARKED` while a mark holds the folder.
 
 ---
 
@@ -126,7 +130,7 @@ the only way a session comes into existence.
 | `chat_id` | Yes | Caller identity |
 | `prompt` | No | Initial user intent — used to auto-generate a session name |
 | `name` | No | Explicit session name (overrides auto-generated name) |
-| `project` | No | Name of a folder directly under the [files root](/api/files) `gateway.files.root`. Binds the session to that project for its whole life. `null` is the same as omitting it |
+| `cwd` | No | A folder under the [files root](/api/files) `gateway.files.root`, as an absolute path or a path relative to the root. Binds the session to that folder for its whole life. `null` is the same as omitting it |
 
 ```bash
 curl -X POST \
@@ -140,94 +144,121 @@ curl -X POST \
 {
   "sessionId": "da19d84a-6a36-4f57-b419-d322d82c4db8",
   "sessionName": "Q3 Deployment Plan",
-  "createdAt": 1775737709000
+  "createdAt": 1775737709000,
+  "cwd": null,
+  "trusted": false,
+  "cwdState": null,
+  "active": false
 }
 ```
 
-**Project-bound sessions.** With `project`, the agent runs in the project
-folder instead of its workspace. Its persona still loads, and it gets a short
-note naming the project, the folder and the git state: the branch when its name
-is plain (`[\w./-]`, at most 100 characters), the change count and the remote
-host, never a remote URL. The response then includes `"project": "<name>"`,
-`"trusted"` and `"projectState"`. You cannot change the project later.
+**Folder-bound sessions.** With `cwd`, the agent runs in that folder instead
+of its workspace. Its persona still loads, and it gets a short note naming the
+folder and the git state: the branch when its name is plain (`[\w./-]`, at most
+100 characters), the change count and the remote host, never a remote URL. You
+cannot change the folder later.
 
-The project runs untrusted unless the operator lists its name in
-[`gateway.files.trusted`](/api/files#configuration) and `<root>/<name>` is
-a real directory, not a symlink. The root itself may be a symlink. Untrusted means one thing: the repo's own
+`cwd` names any folder under the root, not only a folder directly under it. The root itself is refused. A relative
+`cwd` such as `site/web` follows the files [path rules](/api/files#paths), so each segment must pass the entry-name
+rule. An absolute `cwd` must be a normalized path under the root, with no `.` or `..` segment and no `//`. The part below
+the root follows the same rules. The root may be spelled as configured or as its real path. The session stores the absolute path `join(<real root>, <relative path>)`,
+where `<real root>` is the root resolved through symlinks. The gateway resolves the stored path again at every spawn
+and every turn.
+
+The folder runs untrusted unless the operator lists its path in
+[`gateway.files.trusted`](/api/files#configuration). Each entry is a path relative to the root, and nested paths such
+as `site/web` are allowed. A session is trusted only when the real path of its folder is exactly `<real root>/<entry>`
+and its `cwd` does not reach the folder through a symlink. A subfolder of a trusted folder is not trusted. The root
+itself may be a symlink. Untrusted means one thing: the repo's own
 hooks, MCP servers (`.mcp.json`), settings and `CLAUDE.md` do not load. It does
 not restrict anything else. The agent still runs with the gateway's normal
 permissions and tools in that folder, so it can read and change the files and
 run commands there, and the repo's content (files, READMEs, commit messages)
-can still prompt-inject it. Treat an untrusted project as a folder the agent
+can still prompt-inject it. Treat an untrusted folder as a folder the agent
 works in, not as a sandbox.
 
-Trust is decided by name. Anything that can write under the files root,
-including an agent chatting in another project, can put files into a trusted
-folder, and the next trusted chat loads them. Trusting a project means trusting
+Trust is decided by path. Anything that can write under the files root,
+including an agent chatting in another folder, can put files into a trusted
+folder, and the next trusted chat loads them. Trusting a folder means trusting
 everyone who can write to the root.
 
-An agent with `isolateMemory: true` can chat in a project like any other host agent, and the project is not split per
-conversation. Every chat bound to the project works in the same folder, so what one conversation writes there reaches
-the others. A trusted project also loads its own settings, hooks and `.mcp.json`, so its MCP servers reach the session
+An agent with `isolateMemory: true` can chat in a folder like any other host agent, and the folder is not split per
+conversation. Every chat bound to the folder works in the same place, so what one conversation writes there reaches
+the others. A trusted folder also loads its own settings, hooks and `.mcp.json`, so its MCP servers reach the session
 although isolated memory mode gives a session none of the operator's. Bind a chat of an isolated agent only to a
-project its conversations may share, and leave that project out of `gateway.files.trusted`. App agents cannot chat in
-a project (`409 project_unsupported_agent`, reason `container`).
+folder its conversations may share, and leave that folder out of `gateway.files.trusted`. App agents cannot chat in
+a folder (`409 cwd_unsupported_agent`, reason `container`).
 
-Check that `capabilities.projects` includes `"chat"` (see [`GET /capabilities`](/api/system))
-before you send `project`. A gateway with orchestration off, or with the files API disabled,
-does not advertise it. With the files API disabled, the create call answers `409 projects_disabled`.
+Check that `capabilities.sessions` includes `"cwd"` (see [`GET /capabilities`](/api/system))
+before you send `cwd`. A gateway with orchestration off, or with the files API disabled,
+does not advertise it. With the files API disabled, the create call answers `409 files_disabled`.
 With orchestration off, the gateway still creates the session (`201`) and a message sent with
-[`POST /messages`](/api/messages) still runs in the project folder, but
+[`POST /messages`](/api/messages) still runs in the folder, but
 [`POST /messages/accept`](/api/messages), which the web uses, answers `409 NOT_SUPPORTED`.
 Do not rely on the first behaviour; it is not advertised.
 
+A `cwd` needs write permission on the agent. The create call answers these errors for `cwd`. No session is created
+on any of them.
+
 | Status | `code` | When |
 |--------|--------|------|
-| `400` | `invalid_name` | `project` is not a valid project name |
+| `400` | `invalid_cwd` | `cwd` is not a string, is empty, is an absolute path that is not normalized, or has a segment that fails the entry-name rule |
 | `403` | | `Write permission required`: the key cannot write to this agent (it has no `write` and is not an admin key). `API key has no access to agent '<id>'`: the key does not list this agent. Binding a chat needs the same write access as any other change to the agent |
-| `404` | `project_not_found` | No folder with that name exists under the files root |
-| `409` | `projects_disabled` | The files API is disabled on this gateway (`gateway.files.enabled` is `false`). No session is created |
-| `409` | `project_unavailable` | The folder exists but cannot be used, for example a symlink that leaves the root. `reason` holds the projects error code |
-| `409` | `project_unsupported_agent` | The agent cannot run in a project folder. `reason` is `container` for container (app) agents, `workspace_mode` when an orchestrated agent's `tasks.workspaceMode` is not `host`, or `codex` when its workers would run on the Codex harness |
+| `403` | `cwd_outside_root` | `cwd` resolves outside the files root, through symlinks included, or is the root itself, including through a link such as `all -> .` |
+| `404` | `cwd_not_found` | No folder exists at `cwd` |
+| `409` | `files_disabled` | The files API is disabled on this gateway (`gateway.files.enabled` is `false`) |
+| `409` | `path_marked` | A [mark](/api/files#marks) holds the folder, a folder inside it, or a folder holding it |
+| `409` | `cwd_unavailable` | The folder exists but cannot be used. `reason` is `not_a_directory`, `permission_denied`, `deleting` (a `DELETE` is removing an overlapping folder) or `internal` |
+| `409` | `cwd_unsupported_agent` | The agent cannot run in a folder. `reason` is `container` for container (app) agents, `workspace_mode` when an orchestrated agent's `tasks.workspaceMode` is not `host`, or `codex` when its workers would run on the Codex harness |
 
-Each check runs again when the session starts its process. If the folder has
-gone, been renamed or moved out of the root, the message fails with code
-`PROJECT_UNAVAILABLE` (uppercase) and the gateway does not fall back to the
-workspace. A synchronous [`POST /messages`](/api/messages) answers `409`. A
-streaming request gets an SSE `error` frame with that code.
+Each check runs again when the session starts its process and at every turn. If
+the folder has gone, been renamed, moved out of the root, or is held by a delete,
+the message fails with code `CWD_UNAVAILABLE` (uppercase), and the gateway does
+not fall back to the workspace. The response carries no `reason` field. While a mark holds the folder the
+message fails with `PATH_MARKED`. A synchronous [`POST /messages`](/api/messages)
+answers `409`. A streaming request gets an SSE `error` frame with that code.
 
-**Who can use a project chat.** A project chat belongs to its agent. Every route answers a key for a project chat
-exactly as it does for a plain chat of the same agent: an admin key reaches every agent; any other key reaches the
-agents it lists (or every agent with `agents: "*"`), and needs `write: true` wherever a plain chat needs it. A key
-that does not list the agent gets `403` with `API key has no access to agent '<id>'`. Lists, history, search,
-streams, media, attachments, shares and catalogs show project chats to every key that reaches the agent, with
-their `project`, `trusted` and `projectState` fields. Only binding a chat to a project adds a check: the key must be
-able to write to the agent (see the table above). On start the gateway removes binding files whose session no
-longer exists and logs the count.
+**A session id belongs to one chat.** Each session id belongs to one `chat_id` of an agent. A request that would
+register the id under another `chat_id` answers `409 SESSION_ID_IN_USE` and writes nothing. That covers
+[`POST /messages`](/api/messages), [`POST /messages/accept`](/api/messages), rename (`PATCH`), `clear`, `compact`,
+`stop` and `restart`.
+
+**Who can use a folder-bound chat.** A folder-bound chat belongs to its agent. Every route answers a key for a
+folder-bound chat exactly as it does for a plain chat of the same agent: an admin key reaches every agent; any other key
+reaches the agents it lists (or every agent with `agents: "*"`), and needs `write: true` wherever a plain chat needs it.
+A key that does not list the agent gets `403` with `API key has no access to agent '<id>'`. Lists, history, search,
+streams, media, attachments, shares and catalogs show folder-bound chats to every key that reaches the agent, with
+their `cwd`, `trusted`, `cwdState` and `active` fields. Only binding a chat to a folder adds a check: the key must be
+able to write to the agent (see the table above).
+
+**Sessions from development builds.** Earlier development builds stored a project name instead of a `cwd`. The gateway
+reads such a session as `<root>/<name>`. A session whose folder no longer resolves fails closed, like any other
+session whose folder is gone. Nothing is rewritten on disk.
 
 **Session ids.** A session id in the path of any route under `/api/v1/agents/:agentId/sessions/:sessionId`, the voice
 and browser-binding routes included, and in `POST /chats/:chatId/sessions/:sessionId/messages`, must be 1 to 64 of `[A-Za-z0-9_-]`. Any other id answers `400` with
 `code: "INVALID_INPUT"` before authentication, so for every key and for no key.
 
-**The agent of a project chat.** The attachment tool (`api_reply`), `share_file` and the image tools call the share,
+**The agent of a folder-bound chat.** The attachment tool (`api_reply`), `share_file` and the image tools call the share,
 catalog, artifact and attachment routes with the API key the gateway hands the agent: the first key in `gateway.api.keys`
-that reaches it. The orchestration workers of that agent use the same key. Those routes treat a project chat like a
+that reaches it. The orchestration workers of that agent use the same key. Those routes treat a folder-bound chat like a
 plain chat, so a key scoped to the agent is enough. A share URL is not private: anyone who holds it can open it.
 
-**When the chat is deleted.** Deleting a project chat removes its whole media folder (`media/api-<sessionId>/`), not only
-the files its messages name, once its last turn has ended. When the delete comes while a turn is still running, the
-gateway removes the media folder and what the turn wrote to history after the turn ends, the next time it lists that
-agent's sessions or checks whether a project is in use.
+**When the chat is deleted.** Deleting a folder-bound chat removes its whole media folder (`media/api-<sessionId>/`),
+not only the files its messages name, once its last turn has ended. When the delete comes while a turn is still
+running, the gateway removes the media folder and what the turn wrote to history after the turn ends, the next time it
+lists that agent's sessions or checks whether a folder is in use.
 
 On an orchestrated agent the deciding agent stays in its workspace and is told
-which project the chat is in. Every task it starts runs in the project folder,
+which folder the chat is in. Every task it starts runs in that folder,
 or in a `working_directory` inside it. Task failures use uppercase codes:
 
 | Task `failure.code` or `task_spawn` error | When |
 |--------|------|
-| `PROJECT_UNAVAILABLE` | The project folder is gone, renamed or moved when the task is queued or its worker starts |
-| `WORKING_DIRECTORY_OUTSIDE_PROJECT` | `working_directory` does not resolve, through symlinks, to an existing folder inside the project. It may be absolute or relative to the project folder |
-| `PROJECT_UNSUPPORTED_AGENT` | Workers do not run in `host` workspace mode, or the task would run on the Codex worker harness |
+| `CWD_UNAVAILABLE` | The folder is gone, renamed or moved when the task is queued or its worker starts |
+| `PATH_MARKED` | A [mark](/api/files#marks) holds the folder when the task is queued or its worker starts |
+| `WORKING_DIRECTORY_OUTSIDE_CWD` | `working_directory` does not resolve, through symlinks, to an existing folder inside the chat's folder. It may be absolute or relative to that folder |
+| `CWD_UNSUPPORTED_AGENT` | Workers do not run in `host` workspace mode, or the task would run on the Codex worker harness |
 
 ---
 
