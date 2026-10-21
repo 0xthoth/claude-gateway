@@ -1,0 +1,35 @@
+{
+  "request": {
+    "method": "GET",
+    "url": "/api/v1/capabilities",
+    "key": "admin"
+  },
+  "status": 200,
+  "schema": "Capabilities",
+  "body": {
+    "version": "0.0.0",
+    "capabilities": {
+      "cross_channel_message": [
+        "telegram",
+        "discord",
+        "line",
+        "slack",
+        "whatsapp",
+        "whatsapp_cloud",
+        "wechat"
+      ],
+      "files": [
+        "list",
+        "create",
+        "delete"
+      ],
+      "git": [
+        "status",
+        "summary"
+      ],
+      "projects": [
+        "chat"
+      ]
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-gateway.dev/contracts/files-git/capabilities.schema.json",
+  "title": "Capabilities",
+  "description": "200 body of GET /v1/capabilities, the keys the files and git API add. Other capability keys may appear.",
+  "type": "object",
+  "required": [
+    "version",
+    "capabilities"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "filesUnavailable": {
+      "const": "disabled"
+    },
+    "capabilities": {
+      "type": "object",
+      "required": [
+        "files",
+        "git",
+        "projects"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "list",
+              "create",
+              "delete"
+            ]
+          }
+        },
+        "git": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "status",
+              "summary"
+            ]
+          }
+        },
+        "projects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "chat"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
