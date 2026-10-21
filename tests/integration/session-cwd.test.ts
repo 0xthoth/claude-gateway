@@ -118,6 +118,17 @@ describe('session cwd', () => {
     expect(fs.existsSync(indexFile(h, 'web'))).toBe(false);
   });
 
+  it('1b. the removed project field answers 400 project_replaced_by_cwd and creates no session, alone or beside cwd', async () => {
+    h = harness();
+    for (const body of [{ project: 'site' }, { project: 'site', cwd: 'site' }, { project: '' }]) {
+      const res = await create(h, body);
+      expect([body, res.status, res.body.code]).toEqual([body, 400, 'project_replaced_by_cwd']);
+      expect(res.body.error).toMatch(/cwd/);
+    }
+    expect(fs.existsSync(indexFile(h, 'web'))).toBe(false);
+    expect((await create(h, { project: null })).status).toBe(201);
+  });
+
   it('2. the root itself is refused 403 cwd_outside_root, by absolute path or by a link to it', async () => {
     h = harness();
     fs.symlinkSync('.', path.join(h.root, 'all'));

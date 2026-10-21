@@ -130,10 +130,12 @@ export function isValidAgentId(v: unknown): v is string {
  * session and checks as anything typed).
  */
 /**
- * Every error POST /v1/agents/:agentId/sessions answers for its `cwd`. website/api/sessions.md publishes this table.
+ * Every error POST /v1/agents/:agentId/sessions answers for its `cwd` or the removed `project` field. website/api/sessions.md
+ * publishes this table.
  * A turn on a session whose folder stopped resolving answers the uppercase send-time codes instead.
  */
 export const SESSION_CWD_ERRORS = {
+  project_replaced_by_cwd: { status: 400, message: 'project was removed: send cwd, the folder path under the files root' },
   invalid_cwd: { status: 400, message: 'cwd must be an absolute path under the files root, or a path relative to it' },
   cwd_outside_root: { status: 403, message: 'cwd resolves outside the files root, or is the root itself' },
   cwd_not_found: { status: 404, message: 'cwd does not exist' },
@@ -4545,7 +4547,11 @@ export function createApiRouter(
     const ctx = resolveApiSession(req, res);
     if (!ctx) return;
     const { runner, agentId, chatId } = ctx;
-    const body = req.body as { prompt?: unknown; name?: unknown; cwd?: unknown };
+    const body = req.body as { prompt?: unknown; name?: unknown; cwd?: unknown; project?: unknown };
+    if (body.project !== undefined && body.project !== null) {
+      const { status, message: error } = SESSION_CWD_ERRORS.project_replaced_by_cwd;
+      res.status(status).json({ error, code: 'project_replaced_by_cwd' }); return;
+    }
     const promptText = typeof body.prompt === 'string' ? body.prompt.trim() : undefined;
     const explicitName = typeof body.name === 'string' ? body.name.trim() : undefined;
     let cwd: Awaited<ReturnType<AgentRunner['parseApiCwd']>> | undefined;

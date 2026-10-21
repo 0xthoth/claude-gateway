@@ -166,6 +166,7 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
     const sessionSteps: Step[] = [
       ['sessions-create/created', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'site' } }, 'SessionCreateResponse'],
       ['sessions-create/created_trusted', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: `${SHOWN_ROOT}/site/web` } }, 'SessionCreateResponse'],
+      ['sessions-create/project_replaced_by_cwd', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { project: 'site' } }, 'SessionError'],
       ['sessions-create/invalid_cwd', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: '../x' } }, 'SessionError'],
       ['sessions-create/cwd_outside_root', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'escape' } }, 'SessionError'],
       ['sessions-create/cwd_not_found', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'nope' } }, 'SessionError'],

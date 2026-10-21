@@ -202,6 +202,7 @@ on any of them.
 
 | Status | `code` | When |
 |--------|--------|------|
+| `400` | `project_replaced_by_cwd` | The body has a `project` field. `cwd` replaced it: send the folder path under the files root as `cwd`. A `null` `project` is ignored |
 | `400` | `invalid_cwd` | `cwd` is not a string, is empty, is an absolute path that is not normalized, or has a segment that fails the entry-name rule |
 | `403` | | `Write permission required`: the key cannot write to this agent (it has no `write` and is not an admin key). `API key has no access to agent '<id>'`: the key does not list this agent. Binding a chat needs the same write access as any other change to the agent |
 | `403` | `cwd_outside_root` | `cwd` resolves outside the files root, through symlinks included, or is the root itself, including through a link such as `all -> .` |
