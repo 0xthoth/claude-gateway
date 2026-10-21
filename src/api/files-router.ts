@@ -7,12 +7,12 @@ import { listDir, makeDir } from '../files/fs';
 import { DeleteErrorCode, deleteEntry } from '../files/delete';
 import { FilesErrorCode, parseRelPath, pathSegments, RelPath } from '../files/paths';
 import { getStatus, getSummaries, GitError, GitErrorCode } from '../git/read';
-import { busyPaths, FolderWork, MARK_PURPOSES, MARK_TTL_SEC, MarkError, MarkPurpose, releaseMark, takeMark } from '../files/marks';
+import { busyPaths, FolderWork, MARK_PURPOSES, MARK_TTL_SEC, MarkError, MAX_LIVE_MARKS, MarkPurpose, releaseMark, takeMark } from '../files/marks';
 import { Result } from '../utils/result';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
-export type FilesApiErrorCode = FilesErrorCode | GitErrorCode | DeleteErrorCode | 'confirm_mismatch' | 'invalid_mark';
+export type FilesApiErrorCode = FilesErrorCode | GitErrorCode | DeleteErrorCode | 'confirm_mismatch' | 'invalid_mark' | 'too_many_marks';
 
 /** The most paths one `POST /v1/files/busy` checks. */
 const MAX_BUSY_PATHS = 200;
@@ -37,6 +37,7 @@ export const FILES_ERRORS: Record<FilesApiErrorCode, { status: number; message: 
   not_a_git_repo: { status: 409, message: 'The folder is not a git repository' },
   git_unsafe_owner: { status: 409, message: "Git refuses this repository because another user owns it. Run `git config --global --add safe.directory <path>` as the gateway's user, or fix the owner." },
   git_unreadable: { status: 409, message: 'This is a git repository the gateway cannot read safely: check its permissions, its config, and any filter drivers it defines' },
+  too_many_marks: { status: 429, message: `The gateway already holds ${MAX_LIVE_MARKS} marks; release one or wait for one to expire` },
   internal: { status: 500, message: 'Internal error' },
   git_failed: { status: 500, message: 'Git failed' },
   git_unavailable: { status: 503, message: 'Git is not installed on this machine, or is not on the gateway\'s PATH' },

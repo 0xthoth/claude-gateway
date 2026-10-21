@@ -33,6 +33,16 @@ export function findHold(dir: string, now = Date.now()): Hold | undefined {
   return undefined;
 }
 
+/** How many unexpired holds of `kind` exist; drops the expired ones it passes, as {@link findHold} does. */
+export function countHolds(kind: HoldKind, now = Date.now()): number {
+  let count = 0;
+  for (const hold of holds.values()) {
+    if (expired(hold, now)) holds.delete(hold.id);
+    else if (hold.kind === kind) count++;
+  }
+  return count;
+}
+
 /** Adds a hold without checking for an overlapping one; call {@link findHold} first in the same synchronous step. */
 export function addHold(hold: Omit<Hold, 'id'>): Hold {
   const added = { ...hold, id: randomUUID() };

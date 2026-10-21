@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { findHold, releaseHold } from '../../src/files/holds';
-import { busyPaths, FolderWork, releaseMark, takeMark } from '../../src/files/marks';
+import { busyPaths, FolderWork, MAX_LIVE_MARKS, releaseMark, takeMark } from '../../src/files/marks';
 import { RelPath } from '../../src/files/paths';
 import type { WorkReason } from '../../src/session/cwd';
 
@@ -39,6 +39,27 @@ describe('takeMark', () => {
     const mark = await takeMark(root, 'app' as RelPath, 'cleaning', 60, work);
     expect(mark).toEqual({ ok: false, error: { code: 'in_use', reasons: ['task'] } });
     expect(findHold(path.join(root, 'app'))).toBeUndefined();
+  });
+
+  it(`holds at most ${MAX_LIVE_MARKS} live marks, refusing the next with too_many_marks until one is released or expires`, async () => {
+    const idle: FolderWork = { prepare: async () => {}, reasons: () => new Set() };
+    const take = async (i: number, now = Date.now) => {
+      fs.mkdirSync(path.join(root, `d${i}`), { recursive: true });
+      return takeMark(root, `d${i}` as RelPath, 'cleaning', 60, idle, now);
+    };
+    for (let i = 0; i < MAX_LIVE_MARKS; i++) {
+      const mark = await take(i);
+      if (!mark.ok) throw new Error(`mark ${i} refused: ${mark.error.code}`);
+      held.push(mark.value.markId);
+    }
+    expect(await take(MAX_LIVE_MARKS)).toEqual({ ok: false, error: { code: 'too_many_marks' } });
+    expect(findHold(path.join(root, `d${MAX_LIVE_MARKS}`))).toBeUndefined();
+    releaseMark(held.pop()!);
+    const freed = await take(MAX_LIVE_MARKS);
+    expect(freed.ok).toBe(true);
+    if (freed.ok) held.push(freed.value.markId);
+    const later = Date.now() + 61_000;
+    expect((await take(MAX_LIVE_MARKS + 1, () => later)).ok).toBe(true);
   });
 
   it('releases a mark so the folder reads idle again', async () => {

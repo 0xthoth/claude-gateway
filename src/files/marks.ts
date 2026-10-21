@@ -1,6 +1,6 @@
 import type { WorkReason } from '../session/cwd';
 import { resolveDir } from './fs';
-import { addHold, findHold, Hold, releaseHold } from './holds';
+import { addHold, countHolds, findHold, Hold, releaseHold } from './holds';
 import { FilesErrorCode, RelPath } from './paths';
 import { err, ok, Result } from '../utils/result';
 
@@ -18,6 +18,8 @@ export interface FolderWork {
 export const MARK_PURPOSES = ['cleaning', 'starting'] as const;
 export type MarkPurpose = (typeof MARK_PURPOSES)[number];
 export const MARK_TTL_SEC = { min: 60, max: 300 } as const;
+/** Live marks the gateway keeps at once, so the in-memory table stays bounded. */
+export const MAX_LIVE_MARKS = 512;
 
 /** Every reason but an idle session makes a folder busy. */
 export function blocking(reasons: Iterable<BusyReason>): BusyReason[] {
@@ -60,7 +62,7 @@ export interface Mark {
 
 export type MarkError =
   | { code: FilesErrorCode }
-  | { code: 'marked' | 'deleting' }
+  | { code: 'marked' | 'deleting' | 'too_many_marks' }
   | { code: 'in_use'; reasons: BusyReason[] };
 
 /**
@@ -77,6 +79,7 @@ export async function takeMark(root: string, rel: RelPath, purpose: MarkPurpose,
   if (held) return err({ code: held.kind === 'deleting' ? 'deleting' : 'marked' });
   const reasons = blocking(work.reasons(dir.value));
   if (reasons.length) return err({ code: 'in_use', reasons });
+  if (countHolds('mark', now()) >= MAX_LIVE_MARKS) return err({ code: 'too_many_marks' });
   const expiresAt = now() + ttlSec * 1000;
   const hold = addHold({ kind: 'mark', dir: dir.value, purpose, expiresAt });
   return ok({ markId: hold.id, path: rel, abs: dir.value, purpose, expiresAt: new Date(expiresAt).toISOString() });

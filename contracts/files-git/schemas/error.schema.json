@@ -31,6 +31,7 @@
         "not_a_git_repo",
         "git_unsafe_owner",
         "git_unreadable",
+        "too_many_marks",
         "internal",
         "git_failed",
         "git_unavailable",

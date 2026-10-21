@@ -115,6 +115,7 @@ gets the gateway's usual `401` or `403` before it reaches these routes.
 | 409 | `not_a_git_repo` | Git status of a folder that is not a repository. |
 | 409 | `git_unsafe_owner` | The repository belongs to another user and git refuses it. |
 | 409 | `git_unreadable` | The folder has a `.git` that git cannot read safely. |
+| 429 | `too_many_marks` | `POST /files/marks` when the gateway already holds 512 unexpired marks. |
 | 500 | `git_failed` | Any other git failure. Git's output is not returned. |
 | 500 | `internal` | Any other filesystem error, or an unexpected failure inside the gateway. The body is `{ "error": "Internal error", "code": "internal" }` and the gateway logs only the error's class and errno code. |
 | 503 | `git_unavailable` | Git is not installed, or is not on the gateway's `PATH`. |
@@ -319,6 +320,7 @@ with these codes:
 | `409` | `in_use` | A turn, spawn or task works in the folder, in a folder inside it, or in a folder holding it. `reasons` lists them, as in the [busy check](#post-files-busy). An idle session process does not block a mark. |
 | `409` | `marked` | Another mark holds the folder, a folder inside it, or a folder holding it. |
 | `409` | `deleting` | A `DELETE` is removing the folder, a folder inside it, or a folder holding it. |
+| `429` | `too_many_marks` | The gateway already holds 512 unexpired marks. Release one, or wait for one to expire. |
 
 While a mark is held, these requests fail for the marked folder, for any folder inside it, and for any folder that
 holds it:
