@@ -4,8 +4,10 @@ import * as path from 'path';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
 import { SessionStore } from '../../src/session/store';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const KEYS = {
   admin: { key: 'k-admin', agents: '*', admin: true },
@@ -21,7 +23,7 @@ let bound: string;
 const bindingFile = () => path.join(base, 'agents', 'alfred', 'project-bindings', `${bound}.json`);
 
 beforeEach(async () => {
-  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'binding-paths-')));
+  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-binding-paths-')));
   fs.mkdirSync(path.join(base, 'projects', 'site'), { recursive: true });
   const workspace = path.join(base, 'agents', 'alfred', 'workspace');
   fs.mkdirSync(workspace, { recursive: true });
@@ -30,9 +32,11 @@ beforeEach(async () => {
     gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, files: { root: path.join(base, 'projects') } },
     agents: [cfg],
   };
-  runner = new AgentRunner(cfg, gateway);
+  bound = (await new SessionStore(path.join(base, 'agents')).createTelegramSession('alfred', 'web', 'old', 'api')).id;
+  fs.mkdirSync(path.dirname(bindingFile()), { recursive: true });
+  fs.writeFileSync(bindingFile(), '{"project":"site"}\n');
+  runner = new AgentRunner(cfg, gateway, undefined, createCwdResolver(gateway, silentLogger));
   gw = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gateway).getApp();
-  bound = (await request(gw).post(`${A}/sessions`).query({ chat_id: 'web' }).set('Authorization', 'Bearer k-admin').send({ project: 'site' })).body.sessionId;
 });
 afterEach(async () => {
   await runner.stop().catch(() => {});
@@ -44,7 +48,7 @@ const ESCAPES = (id: string) => [
   `..%2F${id}`, `.%2F${id}`, `${id}%00`, `${id}%2F`, `${id}.json`, `%2F${id}`,
 ];
 
-describe('a path-shaped session id never reaches a binding file', () => {
+describe('a path-shaped session id never reaches a dev-data binding file', () => {
   it.each(Object.values(KEYS))('$key cannot remove a binding file by DELETE with an escaped id', async (key) => {
     for (const bad of ESCAPES(bound)) {
       await request(gw).delete(`${A}/sessions/${bad}?chat_id=web`).set('Authorization', `Bearer ${key.key}`);
@@ -52,15 +56,18 @@ describe('a path-shaped session id never reaches a binding file', () => {
     }
   });
 
-  it('the store refuses to read, write or delete a binding for an id outside the strict pattern', async () => {
+  it('the store refuses to read a binding for an id outside the strict pattern', async () => {
     const store = new SessionStore(path.join(base, 'agents'));
     const victim = bound;
     for (const bad of ['x/../' + victim, '../' + victim, victim + '/', '..', '.', '', 'a\0b', victim + '.json', 'x\\..\\' + victim, 'a'.repeat(65)]) {
-      await expect(store.deleteProjectBinding('alfred', bad)).rejects.toThrow();
-      expect(fs.existsSync(bindingFile())).toBe(true);
-      expect((await store.loadProjectBinding('alfred', bad)).kind).toBe('unbound');
+      expect([bad, await store.readLegacyBinding('alfred', bad)]).toEqual([bad, 'none']);
     }
-    await expect(store.deleteProjectBinding('alfred', victim)).resolves.toBeUndefined();
-    expect(fs.existsSync(bindingFile())).toBe(false);
+    expect(await store.readLegacyBinding('alfred', victim)).toEqual({ project: 'site' });
+    expect(fs.existsSync(bindingFile())).toBe(true);
+  });
+
+  it('the session still binds through its dev-data file after every escaped delete', async () => {
+    for (const bad of ESCAPES(bound)) await request(gw).delete(`${A}/sessions/${bad}?chat_id=web`).set('Authorization', 'Bearer k-admin');
+    expect((await runner.sessionCwdView(bound)).cwd).toBe(path.join(base, 'projects', 'site'));
   });
 });

@@ -6,12 +6,12 @@ import { randomUUID } from 'crypto';
 import { AgentOrchestrationRuntime } from '../../../src/orchestration/runtime';
 import { SessionStore } from '../../../src/session/store';
 import { HistoryDB } from '../../../src/history/db';
-import type { EntryName } from '../../../src/files/paths';
+import { NO_CWD_RESOLVER } from '../../../src/session/cwd';
 import type { SessionProcess } from '../../../src/session/process';
 import type { AgentConfig, GatewayConfig } from '../../../src/types';
 
-test('the deciding agent of a project chat is told its project in the stable system overlay, and keeps its workspace', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'project-decision-')), dir = join(root, 'a'), workspace = join(dir, 'workspace');
+test('the deciding agent of a folder-bound chat is told its folder in the stable system overlay, and keeps its workspace', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'session-cwd-decision-')), dir = join(root, 'a'), workspace = join(dir, 'workspace');
   mkdirSync(workspace, { recursive: true }); writeFileSync(join(workspace, 'CLAUDE.md'), 'Identity');
   const agent = { id: 'a', description: 'fixture', env: '', workspace, claude: { model: 'fixture', extraFlags: [] } } as AgentConfig;
   const gateway = { gateway: { orchestration: true, headless: true }, agents: [agent] } as GatewayConfig;
@@ -20,7 +20,8 @@ test('the deciding agent of a project chat is told its project in the stable sys
   const overlays = new Map<string, string[]>(), prompts: string[] = [];
   const runtime = await AgentOrchestrationRuntime.open(agent, gateway, dir, sessions, history, {
     skills: () => ({ skills: new Map(), cliSkills: [] } as any),
-    sessionProject: async scope => scope.agentSessionId === bound ? { ok: true, value: { name: 'demo' as EntryName, dir: '/srv/projects/demo', trusted: false, identity: '1:1' } } : undefined,
+    sessionCwd: async scope => scope.agentSessionId === bound ? { ok: true, value: { path: '/srv/projects/demo', dir: '/srv/projects/demo', trusted: false, identity: '1:1', location: 'You are working in the folder demo at /srv/projects/demo.' } } : undefined,
+    cwdResolver: NO_CWD_RESOLVER,
     createAgentSession: async (id, profile) => Object.assign(new EventEmitter(), {
       start: async () => {}, stop: async () => {},
       sendMessage: function (this: EventEmitter, prompt: string) {
@@ -34,9 +35,9 @@ test('the deciding agent of a project chat is told its project in the stable sys
     for (const text of ['Fix the footer', 'And the header']) await runtime.send({ scope: scope(bound), text }, { execute: true, writeMemory: false }, { timeoutMs: 2000 });
     await runtime.send({ scope: scope(unbound), text: 'Hello' }, { execute: true, writeMemory: false }, { timeoutMs: 2000 });
     const [first, second] = overlays.get(bound)!;
-    expect(first).toContain('You are working in project demo at /srv/projects/demo.');
+    expect(first).toContain('You are working in the folder demo at /srv/projects/demo.');
     expect(second).toBe(first);
     expect(prompts.join('\n')).not.toContain('/srv/projects/demo');
-    expect(overlays.get(unbound)![0]).not.toContain('You are working in project');
+    expect(overlays.get(unbound)![0]).not.toContain('You are working in the folder');
   } finally { await runtime.close(); (history as never as { db: { close(): void } }).db.close(); HistoryDB.evict(root, 'a'); rmSync(root, { recursive: true, force: true }); }
 });

@@ -37,7 +37,7 @@ import {
   truncateDetail,
 } from '../utils/tool-labels';
 import { resolveEnabledConnectors } from '../connectors/resolve';
-import { projectContext, projectUnavailableError, type ProjectChatError, type ProjectCwd } from '../projects/chat';
+import { cwdError, type CwdFailure, type SessionCwd } from './cwd';
 import type { Result } from '../utils/result';
 import { isReservedConnectorId } from '../connectors/custom';
 
@@ -268,12 +268,12 @@ export class SessionProcess extends EventEmitter {
   /** Backend used to run the subprocess. Set during start(); 'headless' until then. */
   backend: 'pty-shell' | 'headless' = 'headless';
   modelOverride?: string; // per-session model override (set by runner from SessionMeta)
-  /** Set by the runner for a project-bound API session. Run again at every spawn,
-   *  crash restarts included, so a missing or escaped folder fails the turn
+  /** Set by the runner for a folder-bound API session. Resolved again at every spawn,
+   *  crash restarts included, so a missing, escaped or held folder fails the turn
    *  instead of running in the agent workspace. */
-  projectResolver?: () => Promise<Result<ProjectCwd, ProjectChatError>>;
-  private projectCwd?: ProjectCwd;
-  private projectContext?: string;
+  cwdSource?: { resolve(): Promise<Result<SessionCwd, CwdFailure>>; note(cwd: SessionCwd): Promise<string> };
+  private boundCwd?: SessionCwd;
+  private cwdNote?: string;
   // Per-spawn cap on how many history messages buildInitialPrompt re-injects.
   // Defaults to MAX_HISTORY_MESSAGES; the runner lowers it (set before start())
   // when recovering from a repeated request_too_large (32MB) so each retry
@@ -750,11 +750,16 @@ export class SessionProcess extends EventEmitter {
   /** `.sessions/<id>`, once a spawn without a runtime profile has written its mcp-config.json there. */
   private sessionDirPath?: string;
 
-  /** True when the bound project no longer resolves to the directory this process runs in, including one recreated at the same path, or when its trust changed (setting sources are fixed at spawn). */
-  async projectMoved(): Promise<boolean> {
-    if (!this.projectResolver || !this.projectCwd) return false;
-    const project = await this.projectResolver();
-    return !project.ok || project.value.dir !== this.projectCwd.dir || project.value.identity !== this.projectCwd.identity || project.value.trusted !== this.projectCwd.trusted;
+  /** True when the bound folder no longer resolves to the directory this process runs in, including one recreated at the same path, or when its trust changed (setting sources are fixed at spawn). */
+  async cwdMoved(): Promise<boolean> {
+    if (!this.cwdSource || !this.boundCwd) return false;
+    const cwd = await this.cwdSource.resolve();
+    return !cwd.ok || cwd.value.dir !== this.boundCwd.dir || cwd.value.identity !== this.boundCwd.identity || cwd.value.trusted !== this.boundCwd.trusted;
+  }
+
+  /** The real folder a folder-bound process was spawned in; undefined for one that runs in the agent workspace. */
+  get cwdDir(): string | undefined {
+    return this.boundCwd?.dir;
   }
 
   /** The appended system prompt never travels on the command line: Windows caps a
@@ -824,14 +829,14 @@ export class SessionProcess extends EventEmitter {
   private writeChatMemoryFile(): string | undefined {
     if (this.runtimeProfile || !this.agentConfig.isolateMemory) return undefined;
     const file = path.join(this.ensureSessionDir(), 'chat-memory.md');
-    const persona = this.projectPersonaPath();
+    const persona = this.cwdPersonaPath();
     fs.writeFileSync(file, (persona ? fs.readFileSync(persona, 'utf8') + '\n\n' : '') + this.chatMemory(), { mode: 0o600 });
     return file;
   }
 
-  /** A project session runs in the project folder, so the workspace CLAUDE.md is appended instead of discovered. */
-  private projectPersonaPath(): string | undefined {
-    if (!this.projectCwd) return undefined;
+  /** A folder-bound session runs in its folder, so the workspace CLAUDE.md is appended instead of discovered. */
+  private cwdPersonaPath(): string | undefined {
+    if (!this.boundCwd) return undefined;
     const persona = path.join(this.agentConfig.workspace, 'CLAUDE.md');
     return fs.existsSync(persona) ? persona : undefined;
   }
@@ -1144,14 +1149,14 @@ export class SessionProcess extends EventEmitter {
     // (The old claude.dangerouslySkipPermissions config is gone.)
     args.push('--dangerously-skip-permissions');
 
-    if (this.projectCwd) {
+    if (this.boundCwd) {
       // Skipped permissions would otherwise run an untrusted repo's hooks and .mcp.json.
-      if (!this.projectCwd.trusted) args.push('--setting-sources', 'user');
-      // The persona CLAUDE.md is only discovered from cwd, which is now the project.
+      if (!this.boundCwd.trusted) args.push('--setting-sources', 'user');
+      // The persona CLAUDE.md is only discovered from cwd, which is now the bound folder.
       // Claude Code keeps only the last --append-system-prompt-file, so in isolate mode it rides in the chat memory file.
-      const persona = this.projectPersonaPath();
+      const persona = this.cwdPersonaPath();
       if (persona && !this.chatMemoryPath) args.push('--append-system-prompt-file', persona);
-      if (this.projectContext) args.push('--append-system-prompt', this.projectContext);
+      if (this.cwdNote) args.push('--append-system-prompt', this.cwdNote);
     }
 
     // Isolated memory mode (#601): Claude Code loads the conversation-neutral
@@ -1203,12 +1208,12 @@ export class SessionProcess extends EventEmitter {
     const { historyPrompt, loadedAtSpawn, archivedCount, messageCountAtSpawn } = await this.buildInitialPrompt();
     if (epoch !== this.spawnEpoch) return false;
     this.spawnContext = { loadedAtSpawn, archivedCount, messageCountAtSpawn };
-    if (this.projectResolver) {
-      const project = await this.projectResolver();
+    if (this.cwdSource) {
+      const cwd = await this.cwdSource.resolve();
       if (epoch !== this.spawnEpoch) return false;
-      if (!project.ok) throw projectUnavailableError(project.error);
-      this.projectCwd = project.value;
-      this.projectContext = await projectContext(this.gatewayConfig, project.value, this.logger);
+      if (!cwd.ok) throw cwdError(cwd.error);
+      this.boundCwd = cwd.value;
+      this.cwdNote = await this.cwdSource.note(cwd.value);
       if (epoch !== this.spawnEpoch) return false;
     }
 
@@ -1399,7 +1404,7 @@ export class SessionProcess extends EventEmitter {
     // minimal PATH that predates the native-installer migration.
     const hardenedPath = pathWithNativeBin();
 
-    if (this.projectCwd && !fs.existsSync(this.projectCwd.dir)) throw projectUnavailableError({ code: 'project_not_found' });
+    if (this.boundCwd && !fs.existsSync(this.boundCwd.dir)) throw cwdError({ code: 'unavailable', reason: 'not_found' });
     const capacityEnabled = Boolean(this.runtimeProfile || this.gatewayConfig.gateway.processLimits || this.gatewayConfig.agents?.some(agent => agent.orchestration?.enabled));
     const releaseCapacity = this.runtimeProfile?.capacityReserved ? () => {} : gatewayCapacity(this.gatewayConfig).acquire(this.runtimeProfile?.role ?? 'legacy', capacityEnabled);
     if (!releaseCapacity) throw Object.assign(new Error('Gateway process capacity exceeded'), { code: 'CAPACITY_EXCEEDED' });
@@ -1430,7 +1435,7 @@ export class SessionProcess extends EventEmitter {
         ...(ptyHeartbeatPath ? { PTY_SHELL_HEARTBEAT_PATH: ptyHeartbeatPath } : {}),
         ...(ptyStreamSocketPath ? { PTY_SHELL_STREAM_SOCKET: ptyStreamSocketPath } : {}),
       }, this.gatewayConfig.gateway.jev),
-      cwd: this.projectCwd?.dir ?? this.agentConfig.workspace,
+      cwd: this.boundCwd?.dir ?? this.agentConfig.workspace,
       ...(this.runtimeProfile?.role === 'worker' && processSupervisorSupported() && workerSpawnDetached() ? { detached: true } : {}),
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -1853,10 +1858,10 @@ export class SessionProcess extends EventEmitter {
       // hint. This is the exact failure the binary-resolution work targets.
       this.lastStderrLine = err.message;
       this.logger.error('session subprocess error', { error: err.message });
-      if (!this.runtimeProfile && !proc.pid && this.projectCwd && (err as NodeJS.ErrnoException).code === 'ENOENT' && !fs.existsSync(this.projectCwd.dir)) {
+      if (!this.runtimeProfile && !proc.pid && this.boundCwd && (err as NodeJS.ErrnoException).code === 'ENOENT' && !fs.existsSync(this.boundCwd.dir)) {
         // The folder vanished after the pre-spawn check; no 'exit' follows a failed spawn, so the waiting turn would hang to its timeout.
         if (this.process === proc) { this.process = null; this._exited = true; }
-        this.emit('startup-error', projectUnavailableError({ code: 'project_not_found' }));
+        this.emit('startup-error', cwdError({ code: 'unavailable', reason: 'not_found' }));
         return;
       }
       if (!proc.pid) {

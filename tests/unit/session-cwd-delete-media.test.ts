@@ -4,7 +4,9 @@ import * as path from 'path';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const KEYS = {
   admin: { key: 'k-admin', agents: '*', admin: true },
@@ -19,7 +21,7 @@ let gw: ReturnType<GatewayRouter['getApp']>;
 let bound: string;
 let plain: string;
 const mediaDir = (id: string) => path.join(base, 'agents', 'alfred', 'media', `api-${id}`);
-const bindingFile = (id: string) => path.join(base, 'agents', 'alfred', 'project-bindings', `${id}.json`);
+const boundCwd = async (id: string) => (await runner.sessionCwdView(id)).cwd;
 const as = (key: ApiKey, method: 'get' | 'post' | 'delete', url: string, body?: object) =>
   request(gw)[method](url).set('Authorization', `Bearer ${key.key}`).send(body ?? {});
 const share = (sid: string, ref: string) => ({ agent_id: 'alfred', session_id: sid, refs: [{ path: ref }] });
@@ -40,10 +42,10 @@ beforeEach(async () => {
     gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, files: { root: path.join(base, 'projects') } },
     agents: [cfg],
   };
-  runner = new AgentRunner(cfg, gateway);
+  runner = new AgentRunner(cfg, gateway, undefined, createCwdResolver(gateway, silentLogger));
   gw = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gateway, undefined, path.join(base, 'config.json')).getApp();
   const open = async (body: object) => (await as(KEYS.admin, 'post', `${A}/sessions?chat_id=web`, body)).body.sessionId as string;
-  bound = await open({ project: 'site' });
+  bound = await open({ cwd: 'site' });
   plain = await open({});
   for (const id of [bound, plain]) {
     fs.mkdirSync(mediaDir(id), { recursive: true });
@@ -55,7 +57,7 @@ afterEach(async () => {
   fs.rmSync(base, { recursive: true, force: true });
 });
 
-describe('the media of a deleted project chat', () => {
+describe('the media of a deleted folder-bound chat', () => {
   it('is removed with the chat', async () => {
     expect(await readerReaches(bound)).toEqual({ get: 200, share: 201 });
     expect((await as(KEYS.admin, 'delete', `${A}/sessions/${bound}?chat_id=web`)).status).toBe(204);
@@ -71,13 +73,13 @@ describe('the media of a deleted project chat', () => {
     live.delete(bound);
     expect((await as(KEYS.podRead, 'get', `${A}/sessions?chat_id=web`)).status).toBe(200);
     expect(fs.existsSync(mediaDir(bound))).toBe(false);
-    expect(fs.existsSync(bindingFile(bound))).toBe(false);
+    expect(await boundCwd(bound)).toBeNull();
   });
 
   it('is kept for a delete that names a chat not holding the session', async () => {
     expect((await as(KEYS.admin, 'delete', `${A}/sessions/${bound}?chat_id=other`)).status).toBe(204);
     expect(fs.existsSync(mediaDir(bound))).toBe(true);
-    expect(fs.existsSync(bindingFile(bound))).toBe(true);
+    expect(await boundCwd(bound)).toBe(path.join(base, 'projects', 'site'));
   });
 
   it('is not removed for an unbound session', async () => {

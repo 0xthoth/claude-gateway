@@ -26,6 +26,7 @@ import { watchSkills } from './skills';
 import { syncSharedSkills, syncModuleSkills } from './skills/sync';
 import { createWatcher } from './watch/factory';
 import { AgentRunner } from './agent/runner';
+import { createCwdResolver } from './files/session-cwd';
 import { SkillLearningManager } from './agent/skill-learning';
 import { DreamingManager } from './agent/dreaming';
 import { makeRouteOut } from './agent/dreaming/migrate';
@@ -266,7 +267,7 @@ async function startAgent(
   // Create runner
   let runner: AgentRunner;
   try {
-    runner = new AgentRunner(agentConfig, gatewayConfig, logger);
+    runner = new AgentRunner(agentConfig, gatewayConfig, logger, createCwdResolver(gatewayConfig, logger));
     if (workspace.skillRegistry) {
       runner.setSkillRegistry(workspace.skillRegistry);
     }

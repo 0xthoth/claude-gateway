@@ -6,6 +6,7 @@ import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
 import { createFilesRouter } from '../../src/api/files-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
 import { getRegisteredRoutes } from '../../src/api/route-registry';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
 import { silentLogger } from '../helpers/silent-logger';
@@ -22,6 +23,8 @@ const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR
 const ADMIN_ONLY_ROUTES = [
   'POST /v1/files/mkdir', 'DELETE /v1/files',
 ];
+/** Admin-only too; tests/integration/files-marks.test.ts checks each refuses a non-admin key. */
+const MARKS_ROUTES = ['POST /v1/files/busy', 'POST /v1/files/marks', 'DELETE /v1/files/marks/:markId'];
 const READ_ROUTES = [
   'GET /v1/files', 'GET /v1/git/summary', 'GET /v1/git/status',
 ];
@@ -54,10 +57,10 @@ describe('the /v1/files and /v1/git routes', () => {
     return (key ? req.set('Authorization', `Bearer ${key.key}`) : req).send(body);
   };
 
-  it('registers the five routes, and marks exactly mkdir and delete as admin', () => {
+  it('registers the eight routes, and marks exactly mkdir, delete and the marks routes as admin', () => {
     const all = routes().map((r) => `${r.method} ${r.path}`);
-    expect(all.sort()).toEqual([...ADMIN_ONLY_ROUTES, ...READ_ROUTES].sort());
-    expect(routes().filter((r) => r.auth === 'admin').map((r) => `${r.method} ${r.path}`).sort()).toEqual([...ADMIN_ONLY_ROUTES].sort());
+    expect(all.sort()).toEqual([...ADMIN_ONLY_ROUTES, ...MARKS_ROUTES, ...READ_ROUTES].sort());
+    expect(routes().filter((r) => r.auth === 'admin').map((r) => `${r.method} ${r.path}`).sort()).toEqual([...ADMIN_ONLY_ROUTES, ...MARKS_ROUTES].sort());
   });
 
   it.each(NON_ADMIN)('lets $key read every read route', async (key) => {
@@ -87,7 +90,7 @@ describe('the /v1/files and /v1/git routes', () => {
   });
 });
 
-describe('a project-bound chat', () => {
+describe('a folder-bound chat', () => {
   let base: string;
   let runners: AgentRunner[];
   let gw: ReturnType<GatewayRouter['getApp']>;
@@ -99,7 +102,7 @@ describe('a project-bound chat', () => {
     (await as(KEYS.admin, 'post', `/api/v1/agents/${agent}/sessions?chat_id=web`, body)).body.sessionId as string;
 
   beforeEach(async () => {
-    base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-perm-gw-')));
+    base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'session-cwd-perm-gw-')));
     process.env.HOME = base;
     fs.mkdirSync(path.join(base, 'projects', 'site'), { recursive: true });
     const configs: AgentConfig[] = ['alfred', 'bruce'].map((id) => {
@@ -111,11 +114,11 @@ describe('a project-bound chat', () => {
       gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, files: { root: path.join(base, 'projects') } },
       agents: configs,
     };
-    runners = configs.map((c) => new AgentRunner(c, gateway));
+    runners = configs.map((c) => new AgentRunner(c, gateway, undefined, createCwdResolver(gateway, silentLogger)));
     gw = new GatewayRouter(new Map(runners.map((r, i) => [configs[i]!.id, r])), new Map(configs.map((c) => [c.id, c])), undefined, gateway, undefined, path.join(base, 'config.json')).getApp();
-    chats.bound = await open('alfred', { project: 'site', name: 'site chat' });
+    chats.bound = await open('alfred', { cwd: 'site', name: 'site chat' });
     chats.plain = await open('alfred', { name: 'plain chat' });
-    chats.theirs = await open('bruce', { project: 'site', name: 'bruce site chat' });
+    chats.theirs = await open('bruce', { cwd: 'site', name: 'bruce site chat' });
     for (const [name, agent] of [['bound', 'alfred'], ['plain', 'alfred'], ['theirs', 'bruce']] as const) {
       const id = chats[name]!;
       const dir = path.join(base, 'agents', agent, 'media', `api-${id}`);
@@ -163,11 +166,11 @@ describe('a project-bound chat', () => {
     expect(bound.find(([label]) => label === 'share')).toEqual(['share', 201]);
   });
 
-  it.each(Object.values(KEYS))('shows $key the bound session, its project and its transcript in every list', async (key) => {
+  it.each(Object.values(KEYS))('shows $key the bound session, its cwd and its transcript in every list', async (key) => {
     const sessions = await as(key, 'get', '/api/v1/agents/alfred/sessions?chat_id=web');
-    expect(sessions.body.sessions.find((s: { id: string }) => s.id === chats.bound)).toMatchObject({ project: 'site', trusted: false });
+    expect(sessions.body.sessions.find((s: { id: string }) => s.id === chats.bound)).toMatchObject({ cwd: path.join(base, 'projects', 'site'), trusted: false });
     const info = await as(key, 'get', `/api/v1/agents/alfred/sessions/${chats.bound}/info?chat_id=web`);
-    expect(info.body).toMatchObject({ project: 'site', trusted: false });
+    expect(info.body).toMatchObject({ cwd: path.join(base, 'projects', 'site'), trusted: false });
     const chatList = await as(key, 'get', '/api/v1/agents/alfred/chats');
     expect(chatList.body.chats.find((c: { chatId: string }) => c.chatId === 'api-web').messageCount).toBe(2);
     expect(JSON.stringify((await as(key, 'get', '/api/v1/agents/alfred/chats/api-web/messages')).body)).toContain('WORDS-OF-bound');
@@ -177,7 +180,7 @@ describe('a project-bound chat', () => {
     expect(JSON.stringify(command.body)).toContain(chats.bound!);
   });
 
-  it("refuses an agent-scoped key on every route of another agent's project chat, and on its lists", async () => {
+  it("refuses an agent-scoped key on every route of another agent's folder-bound chat, and on its lists", async () => {
     for (const [label, status] of await answers(KEYS.alfredOnly, 'bruce', chats.theirs!)) expect([label, status]).toEqual([label, 403]);
     for (const url of ['/api/v1/agents/bruce/sessions?chat_id=web', '/api/v1/agents/bruce/chats', '/api/v1/agents/bruce/chats/api-web/messages']) {
       const res = await as(KEYS.alfredOnly, 'get', url);
@@ -188,16 +191,16 @@ describe('a project-bound chat', () => {
   });
 
   it('lets a key that can write to the agent bind a chat, and only to its own agent', async () => {
-    const bind = (key: ApiKey, agent: string, project = 'site') => as(key, 'post', `/api/v1/agents/${agent}/sessions?chat_id=web`, { project });
+    const bind = (key: ApiKey, agent: string, cwd = 'site') => as(key, 'post', `/api/v1/agents/${agent}/sessions?chat_id=web`, { cwd });
     for (const key of [KEYS.admin, KEYS.podWrite, KEYS.alfredOnly]) {
       const res = await bind(key, 'alfred');
-      expect([key.key, res.status, res.body.project]).toEqual([key.key, 201, 'site']);
+      expect([key.key, res.status, res.body.cwd]).toEqual([key.key, 201, path.join(base, 'projects', 'site')]);
     }
     expect((await bind(KEYS.podWrite, 'bruce')).status).toBe(201);
     expect([(await bind(KEYS.alfredOnly, 'bruce')).status, (await bind(KEYS.alfredOnly, 'bruce')).body.error]).toEqual([403, "API key has no access to agent 'bruce'"]);
     const reader = await bind(KEYS.podRead, 'alfred');
     expect([reader.status, reader.body.error]).toEqual([403, 'Write permission required']);
-    expect((await bind(KEYS.podWrite, 'alfred', 'missing')).body.code).toBe('project_not_found');
+    expect((await bind(KEYS.podWrite, 'alfred', 'missing')).body.code).toBe('cwd_not_found');
   });
 
   it.each(Object.values(KEYS))('answers $key 404 on the removed project routes of the full gateway', async (key) => {

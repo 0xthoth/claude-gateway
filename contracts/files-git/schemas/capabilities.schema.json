@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://claude-gateway.dev/contracts/files-git/capabilities.schema.json",
   "title": "Capabilities",
-  "description": "200 body of GET /v1/capabilities, the keys the files and git API add. Other capability keys may appear.",
+  "description": "200 body of GET /v1/capabilities, the keys the files, git and session cwd API add. Other capability keys may appear.",
   "type": "object",
   "required": [
     "version",
@@ -21,7 +21,7 @@
       "required": [
         "files",
         "git",
-        "projects"
+        "sessions"
       ],
       "properties": {
         "files": {
@@ -31,7 +31,8 @@
             "enum": [
               "list",
               "create",
-              "delete"
+              "delete",
+              "marks"
             ]
           }
         },
@@ -45,12 +46,12 @@
             ]
           }
         },
-        "projects": {
+        "sessions": {
           "type": "array",
           "uniqueItems": true,
           "items": {
             "enum": [
-              "chat"
+              "cwd"
             ]
           }
         }

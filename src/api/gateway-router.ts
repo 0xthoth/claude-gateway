@@ -51,6 +51,7 @@ import { GATEWAY_VERSION } from './gateway-version';
 import { createWorkspaceRouter } from './workspace-router';
 import { createFilesRouter } from './files-router';
 import { filesEnabled, resolveFilesRoot } from '../files/config';
+import { blocking, FolderWork } from '../files/marks';
 import { createSkillsRouter } from './skills-router';
 import { createPackagesRouter } from './packages';
 import { createWebhooksRouter } from './webhooks-router';
@@ -751,9 +752,14 @@ export class GatewayRouter {
 
     // Mount the pod-wide files and git API (gateway.files.root, default ~/projects)
     if (this.gatewayConfig?.gateway?.api?.keys && filesEnabled(this.gatewayConfig)) {
+      const work: FolderWork = {
+        prepare: async () => { await Promise.all([...this.agents.values()].map((runner) => runner.prepareWorkCheck())); },
+        reasons: (dir) => new Set([...this.agents.values()].flatMap((runner) => [...runner.workIn(dir)])),
+      };
       this.app.use('/api', createFilesRouter(this.gatewayConfig.gateway.api.keys, resolveFilesRoot(this.gatewayConfig), {
         logger: this.logger,
-        inUse: async (dir) => (await Promise.all([...this.agents.values()].map((runner) => runner.hasActiveWorkIn(dir)))).some(Boolean),
+        inUse: async (dir) => { await work.prepare(); return blocking(work.reasons(dir)).length > 0; },
+        work,
       }));
     }
 

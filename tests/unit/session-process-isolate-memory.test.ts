@@ -44,7 +44,6 @@ import { SessionProcess } from '../../src/session/process';
 import { sandboxContainerName } from '../../src/apps/conversation-sandbox';
 import { SessionStore } from '../../src/session/store';
 import { chatMemoryDir } from '../../src/agent/workspace-loader';
-import type { EntryName } from '../../src/files/paths';
 import { ok } from '../../src/utils/result';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 
@@ -275,7 +274,7 @@ describe('API sessions', () => {
     expect(appendedPrompt((await start(sp)).args)).toContain('WEB-CHAT-MEMORY');
   });
 
-  it('a project session keeps its persona and its memory in the one --append-system-prompt-file Claude Code reads', async () => {
+  it('a folder-bound session keeps its persona and its memory in the one --append-system-prompt-file Claude Code reads', async () => {
     const dir = chatMemoryDir(workspace, 'api', 'web-chat');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'MEMORY.md'), 'WEB-CHAT-MEMORY');
@@ -283,7 +282,10 @@ describe('API sessions', () => {
     fs.mkdirSync(folder, { recursive: true });
     const bound = (isolate: boolean): SessionProcess => {
       const sp = new SessionProcess(`sess-${isolate}`, 'api', agent(isolate), gateway, store, undefined, undefined, 'web-chat');
-      sp.projectResolver = async () => ok({ name: 'site' as EntryName, dir: folder, trusted: false, identity: '1:1' });
+      sp.cwdSource = {
+        resolve: async () => ok({ path: folder, dir: folder, trusted: false, identity: '1:1', location: `You are working in the folder site at ${folder}.` }),
+        note: async (cwd) => cwd.location,
+      };
       return sp;
     };
     const isolated = (await start(bound(true))).args;

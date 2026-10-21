@@ -14,10 +14,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
+import { AgentRunner } from '../src/agent/runner';
 import { createCapabilitiesRouter } from '../src/api/capabilities';
 import { createFilesRouter } from '../src/api/files-router';
+import { GatewayRouter } from '../src/api/gateway-router';
+import { releaseHold } from '../src/files/holds';
+import { FolderWork } from '../src/files/marks';
 import { overlaps } from '../src/files/paths';
-import type { ApiKey, GatewayConfig, Logger } from '../src/types';
+import { createCwdResolver } from '../src/files/session-cwd';
+import type { WorkReason } from '../src/session/cwd';
+import type { AgentConfig, ApiKey, GatewayConfig, Logger } from '../src/types';
 
 export const CONTRACTS_DIR = path.join(__dirname, '..', 'contracts', 'files-git');
 export const FIXTURES_DIR = path.join(CONTRACTS_DIR, 'fixtures');
@@ -26,7 +32,8 @@ export const FIXTURES_DIR = path.join(CONTRACTS_DIR, 'fixtures');
 const SHOWN_ROOT = '/home/user/projects';
 const FIXED_TIME = new Date('2026-01-02T03:04:05.000Z');
 
-export type SchemaName = 'FilesList' | 'FilesMkdirResponse' | 'FilesDeleteResponse' | 'GitStatus' | 'GitSummary' | 'Capabilities' | 'Error';
+export type SchemaName = 'FilesList' | 'FilesMkdirResponse' | 'FilesDeleteResponse' | 'GitStatus' | 'GitSummary' | 'Capabilities' | 'Error'
+  | 'FilesBusyResponse' | 'FilesMarksResponse' | 'SessionCreateResponse' | 'SessionList' | 'SessionError';
 
 export interface Fixture {
   request: { method: 'GET' | 'POST' | 'DELETE'; url: string; key: 'admin' | 'reader'; body?: unknown };
@@ -85,6 +92,15 @@ function seed(root: string, outside: string): void {
 
 type Step = [name: string, req: Fixture['request'], schema: SchemaName, prepare?: () => void];
 
+const runners: AgentRunner[] = [];
+
+/** Times a session or a mark carries change every run. */
+function fixedTimes(value: unknown): unknown {
+  return JSON.parse(JSON.stringify(value)
+    .replace(/"(createdAt|lastActive)":\d+/g, `"$1":${FIXED_TIME.getTime()}`)
+    .replace(/"expiresAt":"[^"]+"/g, `"expiresAt":"${FIXED_TIME.toISOString()}"`));
+}
+
 /** Runs every step against fresh routers and returns the fixtures keyed by their path under FIXTURES_DIR. */
 export async function recordFixtures(): Promise<Record<string, Fixture>> {
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'contracts-')));
@@ -100,7 +116,15 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
     const app = express();
     app.use(express.json());
     app.use('/api', createCapabilitiesRouter(Object.values(KEYS), config));
-    app.use('/api', createFilesRouter(Object.values(KEYS), root, { logger: quiet, inUse: (dir) => overlaps(path.join(root, 'busy'), dir) }));
+    const work: FolderWork = { prepare: async () => {}, reasons: (dir) => new Set<WorkReason>(overlaps(path.join(root, 'busy'), dir) ? ['turn'] : []) };
+    app.use('/api', createFilesRouter(Object.values(KEYS), root, { logger: quiet, inUse: (dir) => overlaps(path.join(root, 'busy'), dir), work }));
+    const workspace = path.join(base, 'agents', 'alfred', 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    const agent: AgentConfig = { id: 'alfred', description: 'alfred', workspace, env: '', claude: { model: 'claude-test', dangerouslySkipPermissions: true, extraFlags: [] } };
+    const gateway: GatewayConfig = { gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', orchestration: false, api: { keys: Object.values(KEYS) }, files: { root, trusted: ['site/web'] } }, agents: [agent] };
+    const runner = new AgentRunner(agent, gateway, quiet, createCwdResolver(gateway, quiet));
+    runners.push(runner);
+    const sessions = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', agent]]), undefined, gateway).getApp();
     const thrower = express();
     thrower.use(express.json());
     thrower.use('/api', createFilesRouter(Object.values(KEYS), root, { logger: quiet, inUse: () => { throw new Error('boom'); } }));
@@ -130,6 +154,23 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
       ['git-status/repo', { method: 'GET', url: '/api/v1/git/status?path=app', key: 'reader' }, 'GitStatus'],
       ['git-status/not_a_git_repo', { method: 'GET', url: '/api/v1/git/status?path=site/web', key: 'reader' }, 'Error'],
       ['git-summary/nested', { method: 'GET', url: '/api/v1/git/summary?path=site', key: 'reader' }, 'GitSummary'],
+      ['files-busy/report', { method: 'POST', url: '/api/v1/files/busy', key: 'admin', body: { paths: ['busy', 'app', 'nope'] } }, 'FilesBusyResponse'],
+      ['files-busy/invalid_mark', { method: 'POST', url: '/api/v1/files/busy', key: 'admin', body: { paths: [] } }, 'Error'],
+      ['files-marks/created', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'app', purpose: 'cleaning', ttlSec: 60 } }, 'FilesMarksResponse'],
+      ['files-marks/marked', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'app', purpose: 'starting', ttlSec: 300 } }, 'Error'],
+      ['files-marks/in_use', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'busy', purpose: 'cleaning', ttlSec: 60 } }, 'Error'],
+      ['files-marks/invalid_mark', { method: 'POST', url: '/api/v1/files/marks', key: 'admin', body: { path: 'site', purpose: 'cleaning', ttlSec: 30 } }, 'Error'],
+      ['files-marks/forbidden_key', { method: 'POST', url: '/api/v1/files/marks', key: 'reader', body: { path: 'site', purpose: 'cleaning', ttlSec: 60 } }, 'Error'],
+      ['files-delete/marked', { method: 'DELETE', url: '/api/v1/files', key: 'admin', body: { path: 'app', confirm: 'app' } }, 'Error'],
+    ];
+    const sessionSteps: Step[] = [
+      ['sessions-create/created', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'site' } }, 'SessionCreateResponse'],
+      ['sessions-create/created_trusted', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: `${SHOWN_ROOT}/site/web` } }, 'SessionCreateResponse'],
+      ['sessions-create/invalid_cwd', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: '../x' } }, 'SessionError'],
+      ['sessions-create/cwd_outside_root', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'escape' } }, 'SessionError'],
+      ['sessions-create/cwd_not_found', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'nope' } }, 'SessionError'],
+      ['sessions-create/path_marked', { method: 'POST', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin', body: { cwd: 'app' } }, 'SessionError'],
+      ['sessions-list/web', { method: 'GET', url: '/api/v1/agents/alfred/sessions?chat_id=web', key: 'admin' }, 'SessionList'],
     ];
 
     const out: Record<string, Fixture> = {};
@@ -137,12 +178,14 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
       .split(root).join(SHOWN_ROOT)
       .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '00000000-0000-0000-0000-000000000000'));
     const record = async (name: string, target: express.Express, req: Fixture['request'], schema: SchemaName) => {
+      // The shown root stands in for the real one in a request too.
+      const body = req.body === undefined ? undefined : JSON.parse(JSON.stringify(req.body).split(SHOWN_ROOT).join(root));
       let call = request(target)[req.method === 'GET' ? 'get' : req.method === 'POST' ? 'post' : 'delete'](req.url).set('Authorization', `Bearer ${KEYS[req.key].key}`);
-      if (req.body !== undefined) call = call.send(req.body as object);
+      if (body !== undefined) call = call.send(body as object);
       const res = await call;
-      const body = shown(res.body) as { version?: string };
-      if (schema === 'Capabilities') body.version = '0.0.0';
-      out[`${name}.json`] = { request: req, status: res.status, schema, body };
+      const shownBody = fixedTimes(shown(res.body)) as { version?: string };
+      if (schema === 'Capabilities') shownBody.version = '0.0.0';
+      out[`${name}.json`] = { request: req, status: res.status, schema, body: shownBody };
     };
     for (const [name, req, schema, prepare] of steps) {
       prepare?.();
@@ -152,10 +195,16 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
       if (body.entry) body.entry.modified_at = FIXED_TIME.toISOString();
       pinTimes(root);
     }
+    for (const [name, req, schema] of sessionSteps) await record(name, sessions as unknown as express.Express, req, schema);
+    for (const f of Object.values(out)) {
+      const markId = (f.body as { markId?: string } | null)?.markId;
+      if (markId) releaseHold(markId);
+    }
     await record('capabilities/disabled', disabled, { method: 'GET', url: '/api/v1/capabilities', key: 'admin' }, 'Capabilities');
     await record('errors/internal', thrower, { method: 'DELETE', url: '/api/v1/files', key: 'admin', body: { path: 'busy', confirm: 'busy' } }, 'Error');
     return out;
   } finally {
+    await Promise.all(runners.splice(0).map((r) => r.stop().catch(() => {})));
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

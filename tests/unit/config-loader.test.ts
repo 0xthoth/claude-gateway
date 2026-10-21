@@ -835,18 +835,18 @@ describe('config-loader', () => {
       return loadConfig(configPath);
     };
 
-    it('accepts a list of folder names', () => {
-      expect(loadTrusted(['site', 'api.v2']).gateway.files?.trusted).toEqual(['site', 'api.v2']);
+    it('accepts a list of root-relative folder paths, nested ones included', () => {
+      expect(loadTrusted(['site', 'api.v2', 'site/web', 'a/b/c']).gateway.files?.trusted).toEqual(['site', 'api.v2', 'site/web', 'a/b/c']);
       expect(loadTrusted([]).gateway.files?.trusted).toEqual([]);
     });
 
     it('rejects anything but an array of strings', () => {
-      expect(() => loadTrusted('site')).toThrow(/gateway\.files\.trusted must be an array of folder names directly under gateway\.files\.root/);
-      expect(() => loadTrusted([1])).toThrow(/gateway\.files\.trusted must be an array of folder names directly under gateway\.files\.root/);
+      expect(() => loadTrusted('site')).toThrow(/gateway\.files\.trusted must be an array of folder paths relative to gateway\.files\.root/);
+      expect(() => loadTrusted([1])).toThrow(/gateway\.files\.trusted must be an array of folder paths relative to gateway\.files\.root/);
     });
 
-    it.each(['../etc', '', '/srv/site', 'site/', 'site/web', '.hidden', 'site/../x'])('rejects the entry %j, which no folder under the root can match', (bad) => {
-      expect(() => loadTrusted(['ok', bad])).toThrow(`gateway.files.trusted contains an invalid folder name "${bad}"`);
+    it.each(['../etc', '../x', '', '/srv/site', '/abs', 'site/', 'a//b', '.hidden', 'site/../x', 'site/./web'])('rejects the entry %j, which no folder under the root can match', (bad) => {
+      expect(() => loadTrusted(['ok', bad])).toThrow(`gateway.files.trusted contains an invalid folder path "${bad}"`);
     });
   });
 

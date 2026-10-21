@@ -9,13 +9,14 @@ Every path in a request is **relative to the root**. A path is a list of folder 
 carries `abs`, its absolute path on the pod, so a client never has to join paths itself.
 
 **Auth.** The folders belong to the pod, not to an agent, so any valid API key can list them. Creating and deleting a
-folder change the pod and need an admin API key (`admin: true`). Any other key, a pod-wide write key included, gets
-`403 forbidden_key` on those two routes.
+folder change the pod and need an admin API key (`admin: true`). The [marks](#marks) routes need one too. Any other
+key, a pod-wide write key included, gets `403 forbidden_key` on those routes.
 
-**Feature detection.** `GET /api/v1/capabilities` lists `"files": ["list", "create", "delete"]` and
+**Feature detection.** `GET /api/v1/capabilities` lists `"files": ["list", "create", "delete", "marks"]` and
 `"git": ["status", "summary"]` for an admin key. A key that is not an admin key gets `"files": ["list"]`. Show a
 listing only when `files` includes `"list"`, folder create only when it includes `"create"`, and the Delete action
-only when it includes `"delete"`. When the files API is off, `files`, `git` and `projects` are empty and
+only when it includes `"delete"`. Call the [busy and marks routes](#marks) only when it includes `"marks"`. When the
+files API is off, `files`, `git` and `sessions` are empty and
 `filesUnavailable` is `"disabled"`. See [Capabilities](/api/system#get-apiv1capabilities).
 
 **On by default.** The routes are on for every install, with the root `~/projects`, and need no configuration. To
@@ -48,7 +49,7 @@ an agent as able to change every folder under the root.
 | Key | Meaning |
 |-----|---------|
 | `root` | An absolute path or a path starting with `~/`. Default `~/projects`. |
-| `trusted` | Names of folders directly under the root whose own `.claude/` settings, hooks, `.mcp.json` and `CLAUDE.md` load in a chat bound to that folder. Default empty. See [Sessions](/api/sessions#post-apiv1agentsagentidsessions). |
+| `trusted` | Paths of folders relative to the root, such as `site` or `site/web`, whose own `.claude/` settings, hooks, `.mcp.json` and `CLAUDE.md` load in a chat bound to exactly that folder. A subfolder of a trusted folder is not trusted. Each entry must pass the [path rules](#paths), and an invalid entry stops the config from loading. Default empty. See [Sessions](/api/sessions#post-apiv1agentsagentidsessions). |
 | `enabled` | `false` leaves the files and git routes unmounted and refuses folder-bound chats. Default `true`. |
 
 Changing any of them takes effect after a gateway restart. Other keys inside `gateway.files` are ignored, and the
@@ -75,7 +76,7 @@ gateway writes these files:
 
 | Path | Holds |
 | ---- | ----- |
-| `<agent dir>/project-bindings/<sessionId>.json` | Which folder a chat is bound to. Written only for folder-bound chats and deleted with the session |
+| `<agent dir>/sessions/api-<chatId>/index.json` | The session index. A folder-bound chat's entry holds its folder as `cwd` |
 | `<parent>/.deleting-<name>-<id>` | What a `DELETE` could not remove. Safe to delete by hand |
 
 ## Paths {#paths}
@@ -96,19 +97,21 @@ gets the gateway's usual `401` or `403` before it reaches these routes.
 
 | Status | `code` | When |
 |--------|--------|------|
-| 400 | `invalid_path` | `path` is not a string, is absolute, has an empty segment, has more than 32 segments, or names the root where a folder is required (mkdir, delete, git status). |
+| 400 | `invalid_path` | `path` is not a string, is absolute, has an empty segment, has more than 32 segments, or names the root where a folder is required (mkdir, delete, git status, busy, marks). |
 | 400 | `invalid_name` | A segment of `path` fails the [name rule](#paths). |
 | 400 | `not_a_directory` | The path names a file, a link to a file, or the root exists but is not a directory. |
 | 400 | `confirm_mismatch` | `DELETE` did not send `confirm` equal to the last segment of `path`. |
+| 400 | `invalid_mark` | `POST /files/busy` did not send 1 to 200 `paths`, or `POST /files/marks` did not send `purpose` `cleaning` or `starting` and an integer `ttlSec` from 60 to 300. |
 | 403 | `path_escape` | The real path (after symlinks) leaves the root, or is the root itself. |
 | 403 | `permission_denied` | The gateway's user cannot read or change it. |
-| 403 | `forbidden_key` | mkdir or delete with a key that is not an admin key. |
+| 403 | `forbidden_key` | mkdir, delete, busy or marks with a key that is not an admin key. |
 | 404 | `not_found` | The folder, or the parent of a new folder, does not exist. |
 | 409 | `already_exists` | mkdir named a folder, file or symlink that already exists, compared case-insensitively (`Site` collides with `site`). |
 | 409 | `symlink_in_path` | `DELETE` of a nested path whose parent folders include a symbolic link. |
 | 409 | `cross_device` | `DELETE` of a folder on another filesystem than its parent, or one that holds a mount point. |
-| 409 | `in_use` | `DELETE` found a chat or task working in the folder, in a folder inside it, or in a folder holding it. |
+| 409 | `in_use` | `DELETE` or `POST /files/marks` found a chat or task working in the folder, in a folder inside it, or in a folder holding it. A mark answer adds `reasons`. |
 | 409 | `deleting` | The folder, a folder inside it, or a folder holding it is being deleted by another request. |
+| 409 | `marked` | A [mark](#marks) holds the folder, a folder inside it, or a folder holding it. `DELETE` and `POST /files/marks` answer it. |
 | 409 | `not_a_git_repo` | Git status of a folder that is not a repository. |
 | 409 | `git_unsafe_owner` | The repository belongs to another user and git refuses it. |
 | 409 | `git_unreadable` | The folder has a `.git` that git cannot read safely. |
@@ -220,8 +223,9 @@ curl -X DELETE -H "Authorization: Bearer $KEY" -H "Content-Type: application/jso
   an orchestrated task has not finished, and a folder that holds or sits inside such a folder (`409 in_use`). Deleting
   the chat session does not release it while its turn, message or task is still live.
 - A folder that is, holds or sits inside one another `DELETE` is removing (`409 deleting`). While a delete runs, a
-  message or task in a chat bound to a folder that overlaps it the same way fails with `409 PROJECT_UNAVAILABLE`
-  (`reason` `project_deleting`).
+  message or task in a chat bound to a folder that overlaps it the same way fails with `409 CWD_UNAVAILABLE`, and a new
+  session with that `cwd` fails with `409 cwd_unavailable` (`reason` `deleting`).
+- A folder that is, holds or sits inside one a [mark](#marks) holds (`409 marked`).
 
 The gateway does not check for other processes, such as a dev server, that run inside the folder: stop them before
 you delete.
@@ -233,3 +237,106 @@ example a subfolder without write permission, the response is still `200` and ad
 remove by hand (`rm -rf <parent>/.deleting-<name>-<id>`). The folder is also listed in `leftovers` of
 [the list](#get-files) of its parent. A folder is never left listed with part of its files gone. Chats bound to a
 deleted folder are kept, and their folder no longer resolves.
+
+## Busy checks and marks {#marks}
+
+A cleaner, such as a job that removes a folder or the build output inside it, must not work in a folder while a chat
+or task runs there. The marks routes let it check which folders are in use and then hold one while it works. All three
+routes need an admin key, and `capabilities.files` lists `"marks"` when the gateway serves them. Paths follow the
+[path rules](#paths), and the root itself is refused with `400 invalid_path`.
+
+### POST /api/v1/files/busy {#post-files-busy}
+
+Report what is working in each folder right now. The answer is advisory. Work can start the moment it is sent. To act
+on a folder, take a mark instead.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `paths` | Yes | An array of 1 to 200 paths, none of them the root. Any other count is `400 invalid_mark`. A path that fails the path rules fails the whole request with `400 invalid_path` or `400 invalid_name`. |
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"paths":["site","gone"]}' http://localhost:10850/api/v1/files/busy
+```
+
+```json
+{
+  "results": [
+    { "path": "site", "abs": "/home/user/projects/site", "busy": true, "reasons": ["turn"] },
+    { "path": "gone", "abs": null, "busy": false, "reasons": [], "error": "not_found" }
+  ]
+}
+```
+
+The response is `200` with one result per path, in request order. `abs` is the folder's real path. `reasons` lists
+what works in the folder, in a folder inside it, or in a folder holding it:
+
+| Reason | Meaning |
+|--------|---------|
+| `turn` | A chat turn runs or is queued. |
+| `spawn` | A session process is starting. |
+| `task` | An orchestrated task has not finished. |
+| `session` | An idle session process still runs in the folder. It is reported, but it does not make `busy` true. |
+| `marked` | A mark holds the folder. |
+| `deleting` | A `DELETE` is removing the folder. |
+
+`busy` is `true` when `reasons` holds anything other than `session`. A path that does not resolve has `abs: null`,
+`busy: false`, `reasons: []`, and `error` set to its [error code](#errors), such as `not_found` or `path_escape`.
+
+### POST /api/v1/files/marks {#post-files-marks}
+
+Hold a folder while a cleaner works in it. Returns `201` with the mark.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `path` | Yes | The folder to hold. The root is refused with `400 invalid_path`. |
+| `purpose` | Yes | `cleaning` or `starting`. |
+| `ttlSec` | Yes | An integer from 60 to 300. The mark expires on its own after this many seconds. |
+
+```bash
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"path":"site/web","purpose":"cleaning","ttlSec":120}' http://localhost:10850/api/v1/files/marks
+```
+
+```json
+{ "markId": "3f6c2a8e-5d0b-4c47-9a71-2b8e4f1d6c90", "path": "site/web", "abs": "/home/user/projects/site/web", "purpose": "cleaning", "expiresAt": "2026-10-21T08:02:00.000Z" }
+```
+
+The gateway checks for other holds, checks for work in the folder, and adds the mark in one synchronous step in the
+gateway process. No chat turn, spawn or task can start in the folder between the check and the mark. The request fails
+with these codes:
+
+| Status | `code` | When |
+|--------|--------|------|
+| `400` | `invalid_mark` | `purpose` or `ttlSec` is missing or out of range. |
+| `400` | `invalid_path`, `invalid_name` | `path` fails the [path rules](#paths) or names the root. |
+| `403` | `path_escape` | The real path leaves the root, or is the root itself. |
+| `403` | `forbidden_key` | The key is not an admin key. |
+| `404` | `not_found` | The folder does not exist. |
+| `409` | `in_use` | A turn, spawn or task works in the folder, in a folder inside it, or in a folder holding it. `reasons` lists them, as in the [busy check](#post-files-busy). An idle session process does not block a mark. |
+| `409` | `marked` | Another mark holds the folder, a folder inside it, or a folder holding it. |
+| `409` | `deleting` | A `DELETE` is removing the folder, a folder inside it, or a folder holding it. |
+
+While a mark is held, these requests fail for the marked folder, for any folder inside it, and for any folder that
+holds it:
+
+- [Session create](/api/sessions#post-apiv1agentsagentidsessions) with that `cwd` answers `409 path_marked`.
+- A chat turn or a session spawn in such a folder fails with `409 PATH_MARKED`.
+- An orchestrated task fails to queue or start with `PATH_MARKED`.
+- [`DELETE /files`](#delete-files) answers `409 marked`.
+- Another `POST /files/marks` answers `409 marked`.
+
+The mark is kept on the folder's real path, so a symlink that leads to the folder is held too.
+
+### DELETE /api/v1/files/marks/:markId {#delete-files-marks}
+
+Release a mark. Always returns `204`. An unknown, released or expired `markId` is not an error, so a retry is safe.
+
+A mark also expires on its own at `expiresAt`. A cleaner that crashes frees the folder when its mark expires.
+
+### Clean a folder safely
+
+1. Take a mark on the folder with `POST /files/marks`. On `409`, stop and try again later.
+2. Remove what you need to remove, directly on disk. Finish before `expiresAt`. `DELETE /files` refuses a folder
+   that any mark holds, your own mark included.
+3. Release the mark with `DELETE /files/marks/:markId` in a `finally` block, so it is released when step 2 fails.

@@ -2,13 +2,13 @@ import { randomUUID } from 'crypto';
 import { promises as fsp } from 'fs';
 import * as path from 'path';
 import { resolveDir } from './fs';
-import { isDeleting, markDeleting } from './deleting';
+import { addHold, findHold, Hold, releaseHold } from './holds';
 import { errnoToCode, FilesErrorCode, pathSegments, RelPath } from './paths';
 import { pathWithin } from '../utils/paths';
 import { err, ok, Result } from '../utils/result';
 import type { Logger } from '../types';
 
-export type DeleteErrorCode = 'in_use' | 'deleting';
+export type DeleteErrorCode = 'in_use' | 'deleting' | 'marked';
 
 export interface Removed {
   path: RelPath;
@@ -64,18 +64,28 @@ export async function deleteEntry(root: string, rel: RelPath, deps: DeleteDeps):
   }
   const dir = await resolveDir(root, rel);
   if (!dir.ok) return dir;
-  if (isDeleting(dir.value)) return err('deleting');
+  const held = (): DeleteErrorCode | undefined => {
+    const hold = findHold(dir.value);
+    return hold ? heldCode(hold) : undefined;
+  };
+  const before = held();
+  if (before) return err(before);
   const busy = async () => Boolean(await deps.inUse(dir.value));
-  // Checked before the mark, so a turn that began earlier is seen here and never refused by the mark.
+  // Checked before the hold, so a turn that began earlier is seen here and never refused by the hold.
   if (await busy()) return err('in_use');
-  const release = markDeleting(dir.value);
-  if (!release) return err('deleting');
+  const now = held();
+  if (now) return err(now);
+  const hold = addHold({ kind: 'deleting', dir: dir.value });
   try {
     if (await busy()) return err('in_use');
     return await remove(parent, rel, name, deps.logger);
   } finally {
-    release();
+    releaseHold(hold.id);
   }
+}
+
+function heldCode(hold: Hold): DeleteErrorCode {
+  return hold.kind === 'deleting' ? 'deleting' : 'marked';
 }
 
 async function remove(parent: string, rel: RelPath, name: string, logger: Logger): Promise<DeleteResult> {

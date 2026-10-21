@@ -7,7 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { GatewayConfig, Logger } from '../types';
 import { expandHome, pathWithin } from '../utils/paths';
-import { DEFAULT_FILES_ROOT, parseEntryName } from '../files/paths';
+import { DEFAULT_FILES_ROOT, parseRelPath } from '../files/paths';
 import { resolveGatewayPublicUrl } from './public-url';
 import { upgradeAgentWhatsAppAccounts } from './whatsapp-accounts';
 import { resolveOrchestrationConfig, OrchestrationConfig } from '../orchestration/config';
@@ -253,14 +253,14 @@ function exposedByFilesRoot(root: string, configPath: string): string | null {
   return guards.find((guarded) => pathWithin(resolved, real(guarded))) ?? null;
 }
 
-/** Trust is operator config only, so a name the API could never resolve is a typo worth failing on. */
-function validateTrustedNames(raw: unknown): void {
+/** Trust is operator config only, so a path the API could never resolve is a typo worth failing on. */
+function validateTrustedPaths(raw: unknown): void {
   if (!Array.isArray(raw) || raw.some((n) => typeof n !== 'string')) {
-    throw new ConfigValidationError('gateway.files.trusted must be an array of folder names directly under gateway.files.root');
+    throw new ConfigValidationError('gateway.files.trusted must be an array of folder paths relative to gateway.files.root');
   }
-  const bad = raw.find((n) => !parseEntryName(n).ok);
+  const bad = raw.find((n) => n === '' || !parseRelPath(n).ok);
   if (bad !== undefined) {
-    throw new ConfigValidationError(`gateway.files.trusted contains an invalid folder name "${bad}"`);
+    throw new ConfigValidationError(`gateway.files.trusted contains an invalid folder path "${bad}"`);
   }
 }
 
@@ -491,7 +491,7 @@ export function loadConfig(configPath: string, options?: LoadConfigOptions): Gat
       delete filesConfig.enabled;
     }
     const trusted = (files as Record<string, unknown>).trusted;
-    if (trusted !== undefined) validateTrustedNames(trusted);
+    if (trusted !== undefined) validateTrustedPaths(trusted);
     const unknown = Object.keys(files).filter((key) => !FILES_KEYS.includes(key));
     if (unknown.length > 0) {
       warnFiles(`[gateway] Ignoring unknown gateway.files keys: ${unknown.join(', ')}. Known keys: ${FILES_KEYS.join(', ')}.`);

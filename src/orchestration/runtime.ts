@@ -83,8 +83,8 @@ import { RuntimeProfile } from '../session/runtime-profile';
 import { OrchestrationStore, AcceptInput, INTAKE_RECOVERY_PREFIX, channelVoiceKey, payloadHash } from './store';
 import { contextScaledTimeouts, resolveOrchestrationConfig } from './config';
 import { resolveWorkerHarness } from './worker-harness';
-import { SessionProject, mergeContextRefs, TaskService, taskIndexEntry } from './tasks/service';
-import { projectLocation } from '../projects/chat';
+import { SessionCwdLookup, mergeContextRefs, TaskService, taskIndexEntry } from './tasks/service';
+import type { CwdResolver } from '../session/cwd';
 import { DecisionService, DecisionReceipt } from './decisions';
 import { TaskBridge } from './bridge';
 import { TaskWorkspaces } from './tasks/workspace';
@@ -139,7 +139,8 @@ export interface AgentOrchestrationHost {
   transcribeNote?: typeof transcribeVoiceNote;
   createAgentSession(sessionId: string, profile: RuntimeProfile, model?: string, scope?: ConversationScope): Promise<SessionProcess>;
   releaseAgentSession(sessionId: string, process: SessionProcess): Promise<void>;
-  sessionProject?: SessionProject;
+  sessionCwd?: SessionCwdLookup;
+  cwdResolver?: CwdResolver;
 }
 export class AgentOrchestrationRuntime {
   private providerAdmission!: ProviderAdmissionStore;
@@ -269,7 +270,7 @@ export class AgentOrchestrationRuntime {
         if (agent.claude.extraFlags?.length) throw new OrchestrationError('PROFILE_FLAGS_CONFLICT');
       }
     } catch (error) { store.close(); releaseLock(); throw error; }
-    const tasks = new TaskService(store, agent.orchestration, agent.workspace, host.sessionProject,
+    const tasks = new TaskService(store, agent.orchestration, agent.workspace, host.sessionCwd && host.cwdResolver ? { forSession: host.sessionCwd, resolver: host.cwdResolver } : undefined,
       model => resolveWorkerHarness(agent, gateway, model ?? agent.claude.model).harness);
     const files = new TaskFiles(store, join(agent.workspace, '../..'), agent.type === 'app-agent' ? join(root, 'container-files') : undefined, agent.workspace);
     const safemodeAllowed = () => agent.type !== 'app-agent' && Boolean(gateway.safemode?.allowedAgentIds?.includes(agent.id));
@@ -1295,7 +1296,7 @@ export class AgentOrchestrationRuntime {
       if (!semantic && input.skill && input.modality !== 'live_voice' && !channelSpeech && !visualInput.images.length && !visualInput.unavailable.length) {
         const skillContext = { ...capabilities, ...receipt, ...decision, principalId: input.scope.principalId,
           model: options.model ?? this.agent.claude.model, actionId: `skill:${receipt.inputId}` };
-        const task = this.tasks.spawn(skillContext, { project: await this.tasks.projectPin(skillContext),
+        const task = this.tasks.spawn(skillContext, { cwd: await this.tasks.cwdPin(skillContext),
           title: `/${input.skill.name}`, targetProfile: 'skill-worker', skill: input.skill,
           instructions: `Invoke the installed Skill tool named ${input.skill.name} with args ${JSON.stringify(input.skill.args)}. Follow its instructions within the worker capabilities. Report results and stage output files.`,
         });
@@ -1453,9 +1454,9 @@ export class AgentOrchestrationRuntime {
       ticket.profile.overlay += '\n' + WORKER_RESULT_FIDELITY;
       ticket.profile.connectorsAllowed = false; // Connector execution belongs to workers, never the user-facing decision.
       if (input.scope.source === 'telegram') ticket.profile.overlay += '\nTelegram response layout: use short paragraphs and numbered or bulleted lists for summaries, task status and comparisons. Avoid Markdown tables unless the user explicitly requests a table; wide tables are difficult to read on a phone. Keep command names inline and preserve their literal characters. Rewrite worker reports into this layout rather than copying their tables.';
-      // Git state changes every turn, so only the project's location belongs in this cached prefix.
-      const project = await this.host.sessionProject?.(input.scope);
-      if (project?.ok) ticket.profile.overlay += `\n${projectLocation(project.value)} Every task you start runs in that folder; working_directory may only name an existing folder inside it, absolute or relative to it.`;
+      // Git state changes every turn, so only the folder's location belongs in this cached prefix.
+      const cwd = await this.host.sessionCwd?.(input.scope);
+      if (cwd?.ok) ticket.profile.overlay += `\n${cwd.value.location} Every task you start runs in that folder; working_directory may only name an existing folder inside it, absolute or relative to it.`;
       if (this.agent.type === 'app-agent') ticket.profile.overlay += '\nContainer execution is mandatory. Workers run only inside this app container. No host tools or host services are available. Use default-worker for app execution. Gateway media/browser/memory tools are unavailable in this container profile.';
       // Stable metadata belongs in the system prefix, not in every resumed user message.
       // A changed catalog intentionally invalidates that prefix so new skills stay visible.
@@ -1965,10 +1966,10 @@ export class AgentOrchestrationRuntime {
       OR EXISTS (SELECT 1 FROM tasks t WHERE t.conversation_id=c.id AND t.state NOT IN ('completed','failed','cancelled')))`)) ids.add(String(row.id));
     return ids;
   }
-  /** Project names that unfinished tasks are pinned to, whatever became of the session that queued them. */
-  activeTaskProjects(): string[] {
-    return this.store.all("SELECT DISTINCT json_extract(snapshot_json,'$.project') AS project FROM tasks WHERE state NOT IN ('completed','failed','cancelled') AND json_extract(snapshot_json,'$.project') IS NOT NULL")
-      .map(row => String(row.project));
+  /** The folders unfinished tasks are pinned to, whatever became of the session that queued them. Dev-data rows name a project. */
+  activeTaskCwds(): { cwd?: string; project?: string }[] {
+    return this.store.all("SELECT DISTINCT json_extract(snapshot_json,'$.cwd') AS cwd, json_extract(snapshot_json,'$.project') AS project FROM tasks WHERE state NOT IN ('completed','failed','cancelled') AND (json_extract(snapshot_json,'$.cwd') IS NOT NULL OR json_extract(snapshot_json,'$.project') IS NOT NULL)")
+      .map(row => ({ ...(row.cwd != null ? { cwd: String(row.cwd) } : {}), ...(row.project != null ? { project: String(row.project) } : {}) }));
   }
   hasPendingWork(): boolean {
     return !!(this.active.size || this.pending.size || this.store.get("SELECT id FROM conversation_inputs WHERE status IN ('accepted','assigned') LIMIT 1") || this.store.get("SELECT id FROM tasks WHERE state NOT IN ('completed','failed','cancelled') LIMIT 1"));

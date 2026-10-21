@@ -110,8 +110,8 @@ class MockAgentRunner extends EventEmitter {
     return this.getAllSessionMetaImpl();
   }
 
-  sessionProjectView(project?: string): Promise<{ project: string | null; trusted: boolean }> {
-    return Promise.resolve({ project: project ?? null, trusted: false });
+  sessionCwdView(_sessionId: string): Promise<{ cwd: string | null; trusted: boolean; cwdState: null; active: boolean }> {
+    return Promise.resolve({ cwd: null, trusted: false, cwdState: null, active: false });
   }
 }
 

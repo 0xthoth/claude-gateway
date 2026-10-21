@@ -18,8 +18,7 @@ import { agentsDirForConfig } from '../config/agent-env';
 import { withConfigWriteLock, writeConfigAtomic } from '../config/config-write-lock';
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { guardAsyncRoutes } from './async-guard';
-import { PROJECT_CHAT_ERRORS } from '../projects/chat';
-import { parseEntryName, EntryName } from '../files/paths';
+import { CWD_SEND_ERRORS, CwdFailure } from '../session/cwd';
 import { MediaStore } from '../history/media-store';
 import { SESSION_ID_RE } from '../session/store';
 import { isInsideAnyDir, sessionMediaDirs } from '../share/share-store';
@@ -130,6 +129,37 @@ export function isValidAgentId(v: unknown): v is string {
  * `command` is sent back as the next message, so it runs with the same key,
  * session and checks as anything typed).
  */
+/**
+ * Every error POST /v1/agents/:agentId/sessions answers for its `cwd`. website/api/sessions.md publishes this table.
+ * A turn on a session whose folder stopped resolving answers the uppercase send-time codes instead.
+ */
+export const SESSION_CWD_ERRORS = {
+  invalid_cwd: { status: 400, message: 'cwd must be an absolute path under the files root, or a path relative to it' },
+  cwd_outside_root: { status: 403, message: 'cwd resolves outside the files root, or is the root itself' },
+  cwd_not_found: { status: 404, message: 'cwd does not exist' },
+  files_disabled: { status: 409, message: 'The files API is disabled on this gateway' },
+  path_marked: { status: 409, message: 'cwd is held by a cleaning mark' },
+  cwd_unavailable: { status: 409, message: 'cwd is not a folder the session can run in' },
+  cwd_unsupported_agent: { status: 409, message: 'This agent cannot run a chat in a folder' },
+} as const;
+
+export type SessionCwdErrorCode = keyof typeof SESSION_CWD_ERRORS;
+
+function sessionCwdError(failure: CwdFailure | 'invalid'): { status: number; error: string; code: SessionCwdErrorCode; reason?: string } {
+  const code: SessionCwdErrorCode = failure === 'invalid' ? 'invalid_cwd'
+    : failure.code === 'unsupported_agent' ? 'cwd_unsupported_agent'
+      : ({ disabled: 'files_disabled', outside_root: 'cwd_outside_root', not_found: 'cwd_not_found', marked: 'path_marked' } as Partial<Record<string, SessionCwdErrorCode>>)[failure.reason] ?? 'cwd_unavailable';
+  const reason = failure !== 'invalid' && (code === 'cwd_unavailable' || code === 'cwd_unsupported_agent') ? failure.reason : undefined;
+  return { status: SESSION_CWD_ERRORS[code].status, error: SESSION_CWD_ERRORS[code].message, code, ...(reason ? { reason } : {}) };
+}
+
+/** A session route failed: 409 when the session id belongs to another chat, else 500. */
+function sessionRouteError(res: Response, err: unknown): void {
+  const code = errorCode(err);
+  if (code === 'SESSION_ID_IN_USE') res.status(409).json({ error: (err as Error).message, code });
+  else res.status(500).json({ error: (err as Error).message });
+}
+
 function commandReplyFields(message: string, reply: { result: Record<string, unknown>; actions?: CommandAction[] }): Record<string, unknown> {
   return { command: message.trim().split(/\s+/)[0], result: reply.result, actions: reply.actions ?? [] };
 }
@@ -877,7 +907,7 @@ export function createApiRouter(
         res.status(202).json({ status: 'accepted', input_id: inputId, session_id: sessionId, client_message_id: clientMessageId });
       } catch (error) {
         const code = (error as { code?: string }).code;
-        res.status(code === 'NOT_SUPPORTED' || code === 'IDEMPOTENCY_CONFLICT' || code === 'PROJECT_UNAVAILABLE' ? 409 : code === 'QUEUE_FULL' ? 429 : code === 'ACCESS_DENIED' ? 403 : 503).json({ error: (error as Error).message, code });
+        res.status(code === 'NOT_SUPPORTED' || code === 'IDEMPOTENCY_CONFLICT' || CWD_SEND_ERRORS.has(code ?? '') ? 409 : code === 'QUEUE_FULL' ? 429 : code === 'ACCESS_DENIED' ? 403 : 503).json({ error: (error as Error).message, code });
       }
       return;
     }
@@ -933,7 +963,7 @@ export function createApiRouter(
           if (code === 'CONFLICT') {
             res.status(409).json({ error: 'Session already has a pending request' });
           } else {
-            res.status(code === 'PROVIDER_CAPACITY' || code === 'PROVIDER_UNAVAILABLE' ? 503 : code === 'PROJECT_UNAVAILABLE' ? 409 : 500).json({ error: responseFailureMessage(err), ...(errorCode(err) ? { code: errorCode(err) } : {}) });
+            res.status(code === 'PROVIDER_CAPACITY' || code === 'PROVIDER_UNAVAILABLE' ? 503 : CWD_SEND_ERRORS.has(code ?? '') ? 409 : 500).json({ error: responseFailureMessage(err), ...(errorCode(err) ? { code: errorCode(err) } : {}) });
           }
         } else {
           try {
@@ -991,7 +1021,7 @@ export function createApiRouter(
         } else if (code === 'CONFLICT') {
           res.status(409).json({ error: 'Session already has a pending request' });
         } else {
-          res.status(code === 'PROVIDER_CAPACITY' || code === 'PROVIDER_UNAVAILABLE' ? 503 : code === 'PROJECT_UNAVAILABLE' ? 409 : 500).json({ error: responseFailureMessage(err), ...(errorCode(err) ? { code: errorCode(err) } : {}) });
+          res.status(code === 'PROVIDER_CAPACITY' || code === 'PROVIDER_UNAVAILABLE' ? 503 : CWD_SEND_ERRORS.has(code ?? '') ? 409 : 500).json({ error: responseFailureMessage(err), ...(errorCode(err) ? { code: errorCode(err) } : {}) });
         }
       }
     }
@@ -1137,7 +1167,7 @@ export function createApiRouter(
           description: cfg?.description ?? '',
           sessions: await Promise.all(sessions.map(async (s) => {
             const meta = metaMap.get(s.sessionId);
-            return { ...s, sessionName: meta?.name ?? null, imageConfig: meta?.imageConfig ?? null, videoConfig: meta?.videoConfig ?? null, model: meta?.model ?? null, ...await runner.sessionProjectView(meta?.project) };
+            return { ...s, sessionName: meta?.name ?? null, imageConfig: meta?.imageConfig ?? null, videoConfig: meta?.videoConfig ?? null, model: meta?.model ?? null, ...await runner.sessionCwdView(s.sessionId) };
           })),
         };
       }),
@@ -4496,7 +4526,8 @@ export function createApiRouter(
         ...index,
         sessions: await Promise.all(index.sessions.map(async (s) => {
           const lastMessageRole = roleMap.get(s.id) ?? undefined;
-          const view = { ...s, ...await runner.sessionProjectView(s.project) };
+          const { project: _legacy, ...entry } = s;
+          const view = { ...entry, ...await runner.sessionCwdView(s.id) };
           return lastMessageRole !== undefined ? { ...view, lastMessageRole } : view;
         })),
       };
@@ -4514,25 +4545,22 @@ export function createApiRouter(
     const ctx = resolveApiSession(req, res);
     if (!ctx) return;
     const { runner, agentId, chatId } = ctx;
-    const body = req.body as { prompt?: unknown; name?: unknown; project?: unknown };
+    const body = req.body as { prompt?: unknown; name?: unknown; cwd?: unknown };
     const promptText = typeof body.prompt === 'string' ? body.prompt.trim() : undefined;
     const explicitName = typeof body.name === 'string' ? body.name.trim() : undefined;
-    let project: EntryName | undefined;
+    let cwd: Awaited<ReturnType<AgentRunner['parseApiCwd']>> | undefined;
     // Clients serialize an unset optional field as null.
-    if (body.project !== undefined && body.project !== null) {
+    if (body.cwd !== undefined && body.cwd !== null) {
       if (!canWriteAgent((req as AuthedRequest).apiKey, agentId)) { res.status(403).json({ error: 'Write permission required' }); return; }
-      const name = parseEntryName(body.project);
-      if (!name.ok) { res.status(400).json({ error: 'Invalid project name', code: name.error }); return; }
-      const bound = await runner.resolveApiProject(name.value);
-      if (!bound.ok) {
-        const { status, message } = PROJECT_CHAT_ERRORS[bound.error.code];
-        res.status(status).json({ error: message, ...bound.error }); return;
+      cwd = await runner.parseApiCwd(body.cwd);
+      if (!cwd.ok) {
+        const { status, error, code, reason } = sessionCwdError(cwd.error);
+        res.status(status).json({ error, code, ...(reason ? { reason } : {}) }); return;
       }
-      project = name.value;
     }
     try {
-      const meta = await runner.createApiSession(chatId, promptText, explicitName, project);
-      res.status(201).json({ sessionId: meta.id, sessionName: meta.name, createdAt: meta.createdAt, ...await runner.sessionProjectView(meta.project) });
+      const meta = await runner.createApiSession(chatId, promptText, explicitName, cwd?.ok ? cwd.value : undefined);
+      res.status(201).json({ sessionId: meta.id, sessionName: meta.name, createdAt: meta.createdAt, ...await runner.sessionCwdView(meta.id) });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
@@ -4573,7 +4601,7 @@ export function createApiRouter(
       const result = await runner.updateApiSession(chatId, sessionId, { sessionName });
       res.json(result);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      sessionRouteError(res, err);
     }
   });
 
@@ -4589,7 +4617,7 @@ export function createApiRouter(
       await runner.deleteApiSession(chatId, sessionId);
       res.status(204).send();
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      sessionRouteError(res, err);
     }
   });
 
@@ -4605,7 +4633,7 @@ export function createApiRouter(
       const { result } = await runner.executeApiCommand(sessionId, chatId, '/clear confirm', { skipPersist: true });
       res.json(result);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      sessionRouteError(res, err);
     }
   });
 
@@ -4621,7 +4649,7 @@ export function createApiRouter(
       const { result } = await runner.executeApiCommand(sessionId, chatId, '/compact confirm', { skipPersist: true });
       res.json(result);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      sessionRouteError(res, err);
     }
   });
 
@@ -4637,7 +4665,7 @@ export function createApiRouter(
       const { result } = await runner.executeApiCommand(sessionId, chatId, '/stop', { skipPersist: true, principalId: apiPrincipal((req as AuthedRequest).apiKey) });
       res.json(result);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      sessionRouteError(res, err);
     }
   });
 
@@ -4653,7 +4681,7 @@ export function createApiRouter(
       const { result } = await runner.executeApiCommand(sessionId, chatId, '/restart confirm', { skipPersist: true });
       res.json(result);
     } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      sessionRouteError(res, err);
     }
   });
 
@@ -5008,8 +5036,8 @@ export function createApiRouter(
     }
 
     // Decided before the unlink: a greeting must not be consumed by a turn that cannot run.
-    try { await runner.assertApiProjectAvailable(sessionId); } catch (err) {
-      res.status(409).json({ error: responseFailureMessage(err), code: 'PROJECT_UNAVAILABLE' });
+    try { await runner.assertApiCwdAvailable(sessionId); } catch (err) {
+      res.status(409).json({ error: responseFailureMessage(err), code: errorCode(err) });
       return;
     }
 
@@ -5045,7 +5073,7 @@ export function createApiRouter(
         if (code === 'CONFLICT') {
           res.status(409).json({ error: 'Session already has a pending request' });
         } else {
-          res.status(code === 'PROJECT_UNAVAILABLE' ? 409 : 500).json({ error: responseFailureMessage(err), ...(errorCode(err) ? { code: errorCode(err) } : {}) });
+          res.status(CWD_SEND_ERRORS.has(code ?? '') ? 409 : 500).json({ error: responseFailureMessage(err), ...(errorCode(err) ? { code: errorCode(err) } : {}) });
         }
       } else {
         try {

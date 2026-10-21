@@ -95,7 +95,9 @@ export interface TaskSnapshot {
   subagentType?: string;
   readonly?: boolean;
   resourceProfile?: { projectRoot: string; mode: 'isolated-worktree' | 'shared-lock' | 'host' | 'container' };
-  /** The project a project-bound chat pinned this task to; resourceProfile.projectRoot is inside it. */
+  /** The stored folder of the folder-bound chat that queued this task; resourceProfile.projectRoot is inside it. */
+  cwd?: string;
+  /** Dev data only: the project name tasks stored before `cwd`. Read through TaskService.taskCwd, never written. */
   project?: string;
   taskId: string;
   conversationId: string;

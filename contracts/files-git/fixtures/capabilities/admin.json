@@ -21,14 +21,15 @@
       "files": [
         "list",
         "create",
-        "delete"
+        "delete",
+        "marks"
       ],
       "git": [
         "status",
         "summary"
       ],
-      "projects": [
-        "chat"
+      "sessions": [
+        "cwd"
       ]
     }
   }

@@ -42,25 +42,27 @@ export const CROSS_CHANNEL_MESSAGE_CHANNELS: readonly ChatChannel[] = [...CHAT_C
 
 /**
  * Folder operations served by files-router.ts under the one files root. Clients gate listing on `includes('list')`,
- * `POST /v1/files/mkdir` on `includes('create')` and `DELETE /v1/files` on `includes('delete')`. The gateway serves no
- * file contents; they are viewed in code-server.
+ * `POST /v1/files/mkdir` on `includes('create')`, `DELETE /v1/files` on `includes('delete')`, and
+ * `POST /v1/files/busy` with `POST|DELETE /v1/files/marks` on `includes('marks')`. The gateway serves no file
+ * contents; they are viewed in code-server.
  */
-export const FILES_CAPABILITIES = ['list', 'create', 'delete'] as const;
+export const FILES_CAPABILITIES = ['list', 'create', 'delete', 'marks'] as const;
 export type FilesCapability = (typeof FILES_CAPABILITIES)[number];
 
 /** The operations files-router.ts serves only to an admin key; every other token is open to any key. */
-export const FILES_ADMIN_CAPABILITIES: ReadonlySet<FilesCapability> = new Set(['create', 'delete']);
+export const FILES_ADMIN_CAPABILITIES: ReadonlySet<FilesCapability> = new Set(['create', 'delete', 'marks']);
 
 /** Read-only git routes served by files-router.ts: `GET /v1/git/status` and `GET /v1/git/summary`. */
 export const GIT_CAPABILITIES = ['status', 'summary'] as const;
 export type GitCapability = (typeof GIT_CAPABILITIES)[number];
 
 /**
- * `chat`: `POST /v1/agents/:agentId/sessions` accepts `project`, the name of a folder directly under the files root,
- * and runs the chat there. It is accepted through the queued-admission path, which needs orchestration.
+ * `cwd`: `POST /v1/agents/:agentId/sessions` accepts `cwd`, a folder under the files root, and runs the chat there.
+ * It is accepted through the queued-admission path, which needs orchestration, so a gateway without it does not
+ * advertise the token and a client never sends a cwd it would not honour.
  */
-export const PROJECTS_CAPABILITIES = ['chat'] as const;
-export type ProjectsCapability = (typeof PROJECTS_CAPABILITIES)[number];
+export const SESSIONS_CAPABILITIES = ['cwd'] as const;
+export type SessionsCapability = (typeof SESSIONS_CAPABILITIES)[number];
 
 export interface CapabilitiesResponse {
   /** Gateway version from package.json. Informational — clients should key off `capabilities`, not parse this. */
@@ -69,29 +71,29 @@ export interface CapabilitiesResponse {
     cross_channel_message: ChatChannel[];
     files: FilesCapability[];
     git: GitCapability[];
-    projects: ProjectsCapability[];
+    sessions: SessionsCapability[];
   };
-  /** Why `files`, `git` and `projects` are empty; absent when the files API is usable. */
+  /** Why `files`, `git` and `sessions` are empty; absent when the files API is usable. */
   filesUnavailable?: FilesUnavailable;
 }
 
 /** `disabled`: the gateway serves no files or git API. */
 export type FilesUnavailable = 'disabled';
 
-type FilesAvailability = Pick<CapabilitiesResponse['capabilities'], 'files' | 'git' | 'projects'> & { filesUnavailable?: FilesUnavailable };
+type FilesAvailability = Pick<CapabilitiesResponse['capabilities'], 'files' | 'git' | 'sessions'> & { filesUnavailable?: FilesUnavailable };
 
 /**
  * The tokens `apiKey` may use. A non-admin key gets every token but the admin-only ones. A gateway with orchestration
- * off does not advertise `chat`. Without a config or a key (tests) the gateway-wide answer is given.
+ * off does not advertise `sessions: ['cwd']`. Without a config or a key (tests) the gateway-wide answer is given.
  */
 export function filesAvailability(config?: GatewayConfig, apiKey?: ApiKey): FilesAvailability {
-  if (config && !filesEnabled(config)) return { files: [], git: [], projects: [], filesUnavailable: 'disabled' };
+  if (config && !filesEnabled(config)) return { files: [], git: [], sessions: [], filesUnavailable: 'disabled' };
   const orchestrated = !config || gatewayOrchestrationEnabled(config.gateway.orchestration);
   const admin = !apiKey || isAdmin(apiKey);
   return {
     files: FILES_CAPABILITIES.filter((c) => admin || !FILES_ADMIN_CAPABILITIES.has(c)),
     git: [...GIT_CAPABILITIES],
-    projects: orchestrated ? [...PROJECTS_CAPABILITIES] : [],
+    sessions: orchestrated ? [...SESSIONS_CAPABILITIES] : [],
   };
 }
 

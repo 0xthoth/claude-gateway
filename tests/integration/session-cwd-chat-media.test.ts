@@ -1,6 +1,6 @@
 /**
  * The real MCP server (api_reply, share_file) calls the gateway with the API key the agent was handed: the first key
- * that reaches the agent. In a project chat, as in a plain one, any such key works, an agent-scoped key included; that
+ * that reaches the agent. In a folder-bound chat, as in a plain one, any such key works, an agent-scoped key included; that
  * key still reaches no other agent's chat.
  */
 import * as fs from 'fs';
@@ -10,6 +10,8 @@ import { AddressInfo } from 'net';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
+import { silentLogger } from '../helpers/silent-logger';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
 
 const MOCK = path.resolve(__dirname, '../helpers/mock-claude-api-mcp.js');
@@ -30,7 +32,7 @@ beforeAll(() => { process.env.CLAUDE_BIN = `node ${MOCK}`; });
 afterAll(() => { delete process.env.CLAUDE_BIN; });
 
 async function start(keys: ApiKey[]): Promise<void> {
-  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'project-chat-media-')));
+  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'session-cwd-chat-media-')));
   process.env.HOME = base;
   log = path.join(base, 'mcp.jsonl');
   process.env.MOCK_MCP_LOG = log;
@@ -46,8 +48,8 @@ async function start(keys: ApiKey[]): Promise<void> {
     gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', orchestration: false, publicUrl: 'https://gw.example', api: { keys }, files: { root: path.join(base, 'projects') } },
     agents: [cfg, bruce],
   };
-  runner = new AgentRunner(cfg, gateway);
-  bruceRunner = new AgentRunner(bruce, gateway);
+  runner = new AgentRunner(cfg, gateway, undefined, createCwdResolver(gateway, silentLogger));
+  bruceRunner = new AgentRunner(bruce, gateway, undefined, createCwdResolver(gateway, silentLogger));
   const app = new GatewayRouter(new Map([['alfred', runner], ['bruce', bruceRunner]]), new Map([['alfred', cfg], ['bruce', bruce]]), undefined, gateway, undefined, path.join(base, 'config.json')).getApp();
   server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
@@ -66,6 +68,7 @@ afterEach(async () => {
 
 async function openChat(body: object, agent = 'alfred'): Promise<string> {
   const res = await request(server).post(`/api/v1/agents/${agent}/sessions`).query({ chat_id: 'web' }).set('Authorization', 'Bearer sk-admin').send(body);
+  expect(res.status).toBe(201);
   const id = res.body.sessionId as string;
   fs.mkdirSync(path.join(base, 'agents', agent, 'media', `api-${id}`), { recursive: true });
   fs.writeFileSync(path.join(base, 'agents', agent, 'media', `api-${id}`, 'f.png'), PNG);
@@ -86,7 +89,7 @@ async function attachAndShare(id: string): Promise<Array<[string, boolean]>> {
 
 describe('an agent handed an admin key', () => {
   beforeEach(() => start([ADMIN, WRITER]));
-  it.each([['a project chat', { project: 'site' }], ['a plain chat', {}]])('attaches media and creates a share in %s', async (_n, body) => {
+  it.each([['a folder-bound chat', { cwd: 'site' }], ['a plain chat', {}]])('attaches media and creates a share in %s', async (_n, body) => {
     const id = await openChat(body);
     expect(await attachAndShare(id)).toEqual([['api_reply', true], ['share_file', true]]);
     expect(toolLog()[1].result.content[0].text).toMatch(/"url": "https:\/\/gw\.example\/shared\//);
@@ -95,15 +98,15 @@ describe('an agent handed an admin key', () => {
 
 describe.each([['a pod-wide write key', WRITER], ['a key scoped to that agent', ALFRED_ONLY]])('an agent handed %s, not an admin key', (_n, key) => {
   beforeEach(() => start([key, ADMIN]));
-  it.each([['a project chat', { project: 'site' }], ['a plain chat', {}]])('attaches media and creates a share in %s', async (_c, body) => {
+  it.each([['a folder-bound chat', { cwd: 'site' }], ['a plain chat', {}]])('attaches media and creates a share in %s', async (_c, body) => {
     expect(await attachAndShare(await openChat(body))).toEqual([['api_reply', true], ['share_file', true]]);
   }, 60_000);
 });
 
-describe("an agent-scoped key against another agent's project chat", () => {
+describe("an agent-scoped key against another agent's folder-bound chat", () => {
   beforeEach(() => start([ALFRED_ONLY, ADMIN]));
   it('is refused with the usual agent message', async () => {
-    const theirs = await openChat({ project: 'site' }, 'bruce');
+    const theirs = await openChat({ cwd: 'site' }, 'bruce');
     const file = path.join(base, 'agents', 'bruce', 'media', `api-${theirs}`, 'f.png');
     const as = (r: request.Test) => r.set('Authorization', `Bearer ${ALFRED_ONLY.key}`);
     for (const res of [

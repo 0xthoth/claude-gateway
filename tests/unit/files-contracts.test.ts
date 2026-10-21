@@ -2,13 +2,19 @@ import Ajv2020 from 'ajv/dist/2020';
 import * as fs from 'fs';
 import * as path from 'path';
 import { FILES_ERRORS } from '../../src/api/files-router';
+import { SESSION_CWD_ERRORS } from '../../src/api/router';
 import { CONTRACTS_DIR, Fixture, FIXTURES_DIR, recordFixtures, SchemaName } from '../../scripts/contracts-fixtures';
 
 const SCHEMA_FILES: Record<SchemaName, string> = {
   FilesList: 'files-list', FilesMkdirResponse: 'files-mkdir-response', FilesDeleteResponse: 'files-delete-response',
   GitStatus: 'git-status', GitSummary: 'git-summary', Capabilities: 'capabilities', Error: 'error',
+  FilesBusyResponse: 'files-busy-response', FilesMarksResponse: 'files-marks-response',
+  SessionCreateResponse: 'session-create-response', SessionList: 'session-list', SessionError: 'session-error',
 };
-const REQUEST_SCHEMAS: Record<string, string> = { 'POST /api/v1/files/mkdir': 'files-mkdir-request', 'DELETE /api/v1/files': 'files-delete-request' };
+const REQUEST_SCHEMAS: Record<string, string> = {
+  'POST /api/v1/files/mkdir': 'files-mkdir-request', 'DELETE /api/v1/files': 'files-delete-request',
+  'POST /api/v1/files/busy': 'files-busy-request', 'POST /api/v1/files/marks': 'files-marks-request',
+};
 
 const readJson = (file: string): unknown => JSON.parse(fs.readFileSync(file, 'utf8'));
 
@@ -42,8 +48,8 @@ describe('files and git contracts', () => {
 
   it('records an error fixture for the success and the failure side of every route', () => {
     const routes = new Set(Object.keys(fixtures).map((f) => f.split('/')[0]));
-    expect([...routes].sort()).toEqual(['capabilities', 'errors', 'files-delete', 'files-list', 'files-mkdir', 'git-status', 'git-summary']);
-    for (const route of ['files-delete', 'files-list', 'files-mkdir', 'git-status']) {
+    expect([...routes].sort()).toEqual(['capabilities', 'errors', 'files-busy', 'files-delete', 'files-list', 'files-marks', 'files-mkdir', 'git-status', 'git-summary', 'sessions-create', 'sessions-list']);
+    for (const route of ['files-busy', 'files-delete', 'files-list', 'files-marks', 'files-mkdir', 'git-status', 'sessions-create']) {
       const statuses = Object.entries(fixtures).filter(([f]) => f.startsWith(`${route}/`)).map(([, x]) => x.status);
       expect([route, statuses.some((s) => s < 300), statuses.some((s) => s >= 400)]).toEqual([route, true, true]);
     }
@@ -64,6 +70,14 @@ describe('files and git contracts', () => {
     expect([...schema.properties.code.enum].sort()).toEqual(Object.keys(FILES_ERRORS).sort());
     for (const [name, f] of Object.entries(fixtures)) {
       if (f.schema === 'Error') expect([name, f.status]).toEqual([name, FILES_ERRORS[(f.body as { code: keyof typeof FILES_ERRORS }).code].status]);
+    }
+  });
+
+  it('lists exactly the session cwd error codes the sessions route answers, with their statuses', () => {
+    const schema = readJson(path.join(CONTRACTS_DIR, 'schemas', 'session-error.schema.json')) as { properties: { code: { enum: string[] } } };
+    expect([...schema.properties.code.enum].sort()).toEqual(Object.keys(SESSION_CWD_ERRORS).sort());
+    for (const [name, f] of Object.entries(fixtures)) {
+      if (f.schema === 'SessionError') expect([name, f.status]).toEqual([name, SESSION_CWD_ERRORS[(f.body as { code: keyof typeof SESSION_CWD_ERRORS }).code].status]);
     }
   });
 

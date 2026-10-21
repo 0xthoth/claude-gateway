@@ -515,9 +515,10 @@ export interface GatewayConfig {
       /** false leaves the files and git API unmounted; loadConfig sets it when the default root would expose HOME or the config dir. */
       enabled?: boolean;
       /**
-       * Names of folders directly under the root whose own `.claude/` settings,
-       * hooks, `.mcp.json` and CLAUDE.md load in chats bound to that folder.
-       * Every other folder runs with `--setting-sources user`.
+       * Root-relative paths of folders whose own `.claude/` settings, hooks,
+       * `.mcp.json` and CLAUDE.md load in chats whose cwd is exactly that
+       * folder. Subfolders do not inherit it, and a symlink alias is never
+       * trusted. Every other folder runs with `--setting-sources user`.
        */
       trusted?: string[];
     };
@@ -835,8 +836,10 @@ export interface SessionMeta {
   videoConfig?: VideoParams;
   /** Real model from Claude stream, updated per turn (e.g. "claude-opus-4-8"). */
   model?: string;
-  /** Projects folder name this API session is bound to, fixed at creation. The
-   *  directory is re-resolved from the name at every spawn. */
+  /** Absolute working folder under gateway.files.root this API session is bound to, fixed at creation. It is
+   *  re-resolved at every spawn and turn. */
+  cwd?: string;
+  /** Dev data only: a folder name under the root, written before sessions stored `cwd`. Read, never written. */
   project?: string;
 }
 

@@ -1,5 +1,5 @@
 /**
- * Project-scoped API chat: a session bound to one folder under gateway.files.root.
+ * Folder-bound API chat: a session whose cwd is one folder under gateway.files.root.
  * Real AgentRunner, real filesystem, real HTTP through GatewayRouter.
  */
 import { execFileSync } from 'child_process';
@@ -8,10 +8,13 @@ import * as os from 'os';
 import * as path from 'path';
 import supertest from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
-import * as chat from '../../src/projects/chat';
 import { GatewayRouter } from '../../src/api/gateway-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
+import type { CwdResolver } from '../../src/session/cwd';
+import { SessionStore } from '../../src/session/store';
 import { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
 import { waitForCondition } from '../helpers/wait-for';
+import { silentLogger } from '../helpers/silent-logger';
 
 const MOCK_CLAUDE = path.resolve(__dirname, '../helpers/mock-claude-argv.js');
 
@@ -29,6 +32,7 @@ interface Harness {
   root: string;
   app: ReturnType<GatewayRouter['getApp']>;
   runners: AgentRunner[];
+  resolvers: CwdResolver[];
   router: GatewayRouter;
 }
 
@@ -47,7 +51,7 @@ function agentConfig(base: string, id: string, extra: Partial<AgentConfig> = {})
 }
 
 async function harness(opts: { trusted?: string[]; orchestration?: boolean; enabled?: false; extra?: Record<string, Partial<AgentConfig>> } = {}): Promise<Harness> {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'project-chat-')));
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'session-cwd-chat-')));
   const root = path.join(base, 'projects');
   fs.mkdirSync(path.join(root, 'site'), { recursive: true });
   const gateway: GatewayConfig = {
@@ -67,7 +71,8 @@ async function harness(opts: { trusted?: string[]; orchestration?: boolean; enab
     ...Object.entries(opts.extra ?? {}).map(([id, extra]) => agentConfig(base, id, extra)),
   ];
   gateway.agents = configs;
-  const runners = configs.map((c) => new AgentRunner(c, gateway));
+  const resolvers = configs.map(() => createCwdResolver(gateway, silentLogger));
+  const runners = configs.map((c, i) => new AgentRunner(c, gateway, undefined, resolvers[i]));
   const router = new GatewayRouter(
     new Map(runners.map((r, i) => [configs[i]!.id, r])),
     new Map(configs.map((c) => [c.id, c])),
@@ -76,7 +81,7 @@ async function harness(opts: { trusted?: string[]; orchestration?: boolean; enab
   );
   const argvLog = path.join(base, 'argv.jsonl');
   process.env.MOCK_CLAUDE_ARGV_LOG = argvLog;
-  return { base, argvLog, root, app: router.getApp(), runners, router };
+  return { base, argvLog, root, app: router.getApp(), runners, resolvers, router };
 }
 
 interface Spawn { pid: number; cwd: string; argv: string[] }
@@ -98,8 +103,8 @@ function send(h: Harness, sessionId: string, message: string, key: ApiKey = KEYS
     .send({ message, chat_id: chatId, session_id: sessionId });
 }
 
-async function projectSession(h: Harness): Promise<string> {
-  const res = await create(h, 'alfred', KEYS.admin!, { project: 'site' });
+async function cwdSession(h: Harness): Promise<string> {
+  const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'site' });
   expect(res.status).toBe(201);
   return res.body.sessionId as string;
 }
@@ -117,123 +122,133 @@ function create(h: Harness, agent: string, key: ApiKey, body: Record<string, unk
     .send(body);
 }
 
-describe('POST /v1/agents/:id/sessions with project', () => {
+describe('POST /v1/agents/:id/sessions with cwd', () => {
   let h: Harness;
   beforeEach(async () => { h = await harness(); });
   afterEach(async () => { await teardown(h); });
+  const site = () => path.join(h.root, 'site');
 
-  it('binds the session to the project and exposes it on create, list and info', async () => {
-    const res = await create(h, 'alfred', KEYS.admin!, { project: 'site', name: 'Fix the footer' });
+  it('binds the session to the folder and exposes it on create, list and info', async () => {
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'site', name: 'Fix the footer' });
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({ sessionName: 'Fix the footer', project: 'site', trusted: false });
+    expect(res.body).toMatchObject({ sessionName: 'Fix the footer', cwd: site(), trusted: false, cwdState: 'available', active: false });
 
     const list = await supertest(h.app).get('/api/v1/agents/alfred/sessions')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
-    expect(list.body.sessions.find((s: { id: string }) => s.id === res.body.sessionId)).toMatchObject({ project: 'site', trusted: false });
+    const row = list.body.sessions.find((s: { id: string }) => s.id === res.body.sessionId);
+    expect(row).toMatchObject({ cwd: site(), trusted: false, cwdState: 'available', active: false });
+    expect(row).not.toHaveProperty('project');
 
     const info = await supertest(h.app).get(`/api/v1/agents/alfred/sessions/${res.body.sessionId}/info`)
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
-    expect(info.body).toMatchObject({ sessionId: res.body.sessionId, project: 'site', trusted: false });
+    expect(info.body).toMatchObject({ sessionId: res.body.sessionId, cwd: site(), trusted: false, cwdState: 'available', active: false });
   });
 
-  it('reports a session without a project as project null, untrusted', async () => {
+  it('reports a session without a cwd as cwd null, untrusted', async () => {
     const res = await create(h, 'alfred', KEYS.podReader!, { name: 'plain' });
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({ project: null, trusted: false });
+    expect(res.body).toMatchObject({ cwd: null, trusted: false, cwdState: null, active: false });
     const list = await supertest(h.app).get('/api/v1/agents/alfred/sessions')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
-    expect(list.body.sessions[0]).toMatchObject({ project: null, trusted: false });
+    expect(list.body.sessions[0]).toMatchObject({ cwd: null, trusted: false, cwdState: null });
   });
 
-  it.each([['podReader'], ['scopedWriter'], ['admin']])('treats project: null from %s as no project', async (key) => {
-    const res = await create(h, 'alfred', KEYS[key]!, { project: null });
+  it.each([['podReader'], ['scopedWriter'], ['admin']])('treats cwd: null from %s as no cwd', async (key) => {
+    const res = await create(h, 'alfred', KEYS[key]!, { cwd: null });
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({ project: null, trusted: false, projectState: null });
+    expect(res.body).toMatchObject({ cwd: null, trusted: false, cwdState: null });
   });
 
-  it('marks a trusted project trusted on create, list and info', async () => {
+  it('marks a trusted folder trusted on create, list and info', async () => {
     await teardown(h);
     h = await harness({ trusted: ['site'] });
-    const res = await create(h, 'alfred', KEYS.admin!, { project: 'site' });
-    expect(res.body).toMatchObject({ project: 'site', trusted: true });
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'site' });
+    expect(res.body).toMatchObject({ cwd: site(), trusted: true });
     const info = await supertest(h.app).get(`/api/v1/agents/alfred/sessions/${res.body.sessionId}/info`)
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
-    expect(info.body).toMatchObject({ project: 'site', trusted: true });
+    expect(info.body).toMatchObject({ cwd: site(), trusted: true });
   });
 
-  it('does not trust a trusted name whose folder is a symlink', async () => {
+  it('does not trust a trusted path whose folder is a symlink', async () => {
     await teardown(h);
     h = await harness({ trusted: ['alias'] });
     fs.symlinkSync(path.join(h.root, 'site'), path.join(h.root, 'alias'));
-    const res = await create(h, 'alfred', KEYS.admin!, { project: 'alias' });
-    expect(res.body).toMatchObject({ project: 'alias', trusted: false });
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'alias' });
+    expect(res.body).toMatchObject({ cwd: path.join(h.root, 'alias'), trusted: false });
   });
 
-  it.each([['..'], [''], ['a/b'], [42], ['.hidden']])('rejects project name %p with 400 invalid_name', async (project) => {
-    const res = await create(h, 'alfred', KEYS.admin!, { project });
+  it.each([['..'], [''], [42], ['.hidden'], ['a//b'], ['site/'], ['./site'], ['/tmp/../etc'], ['si\0te']])('rejects cwd %p with 400 invalid_cwd', async (cwd) => {
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd });
     expect(res.status).toBe(400);
-    expect(res.body.code).toBe('invalid_name');
+    expect(res.body.code).toBe('invalid_cwd');
   });
 
-  it('answers 404 project_not_found for a folder that does not exist', async () => {
-    const res = await create(h, 'alfred', KEYS.admin!, { project: 'missing' });
+  it('answers 404 cwd_not_found for a folder that does not exist', async () => {
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'missing' });
     expect(res.status).toBe(404);
-    expect(res.body.code).toBe('project_not_found');
+    expect(res.body.code).toBe('cwd_not_found');
   });
 
-  it('refuses a project that is a symlink out of the root', async () => {
+  it('refuses a cwd that is a symlink out of the root with 403 cwd_outside_root', async () => {
     const outside = path.join(h.base, 'outside');
     fs.mkdirSync(outside);
     fs.symlinkSync(outside, path.join(h.root, 'escape'));
-    const res = await create(h, 'alfred', KEYS.admin!, { project: 'escape' });
-    expect(res.status).toBe(409);
-    expect(res.body).toMatchObject({ code: 'project_unavailable', reason: 'path_escape' });
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'escape' });
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('cwd_outside_root');
   });
 
   it.each([['podWriter'], ['scopedWriter']])('lets %s, a write key that is not an admin key, bind a chat', async (key) => {
-    const res = await create(h, 'alfred', KEYS[key]!, { project: 'site' });
+    const res = await create(h, 'alfred', KEYS[key]!, { cwd: 'site' });
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({ project: 'site', trusted: false });
+    expect(res.body).toMatchObject({ cwd: site(), trusted: false });
   });
 
-  it('forbids a read-only key, which cannot write to the agent', async () => {
-    const res = await create(h, 'alfred', KEYS.podReader!, { project: 'site' });
+  it('forbids a read-only key, which cannot write to the agent, and creates no session', async () => {
+    const res = await create(h, 'alfred', KEYS.podReader!, { cwd: 'site' });
     expect([res.status, res.body.error]).toEqual([403, 'Write permission required']);
-    expect(fs.readdirSync(path.join(h.base, 'agents', 'alfred')).includes('project-bindings')).toBe(false);
+    const list = await supertest(h.app).get('/api/v1/agents/alfred/sessions')
+      .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
+    expect((list.body.sessions as { cwd: string | null }[]).filter((row) => row.cwd !== null)).toEqual([]);
   });
 
-  it("forbids another agent's key before looking at the project", async () => {
-    const res = await create(h, 'alfred', KEYS.otherAgent!, { project: 'site' });
+  it("forbids another agent's key before looking at the cwd", async () => {
+    const res = await create(h, 'alfred', KEYS.otherAgent!, { cwd: 'site' });
     expect(res.status).toBe(403);
   });
 
-  it('rejects a container agent with 409 project_unsupported_agent', async () => {
-    const res = await create(h, 'boxed', KEYS.admin!, { project: 'site' });
+  it('rejects a container agent with 409 cwd_unsupported_agent', async () => {
+    const res = await create(h, 'boxed', KEYS.admin!, { cwd: 'site' });
     expect(res.status).toBe(409);
-    expect(res.body).toMatchObject({ code: 'project_unsupported_agent', reason: 'container' });
+    expect(res.body).toMatchObject({ code: 'cwd_unsupported_agent', reason: 'container' });
+  });
+
+  it('checks the cwd is valid before the agent can run in it', async () => {
+    const res = await create(h, 'boxed', KEYS.admin!, { cwd: '..' });
+    expect([res.status, res.body.code]).toEqual([400, 'invalid_cwd']);
   });
 });
 
-describe('a project-bound session answers each key as a plain chat does', () => {
+describe('a folder-bound session answers each key as a plain chat does', () => {
   let h: Harness;
   beforeAll(() => { process.env.CLAUDE_BIN = `node ${MOCK_CLAUDE}`; });
   afterEach(async () => { await teardown(h); });
   const bearer = (key: ApiKey) => ({ Authorization: `Bearer ${key.key}` });
   const base = '/api/v1/agents/alfred';
 
-  it.each(['podWriter', 'scopedWriter'] as const)('%s binds a chat and its turn runs in the project folder', async (name) => {
+  it.each(['podWriter', 'scopedWriter'] as const)('%s binds a chat and its turn runs in the folder', async (name) => {
     h = await harness();
     const key = KEYS[name]!;
-    const sid = (await create(h, 'alfred', key, { project: 'site' })).body.sessionId as string;
+    const sid = (await create(h, 'alfred', key, { cwd: 'site' })).body.sessionId as string;
     expect((await send(h, sid, 'hi', key)).status).toBe(200);
     expect(spawns(h).map((s) => s.cwd)).toEqual([path.join(h.root, 'site')]);
     const info = await supertest(h.app).get(`${base}/sessions/${sid}/info`).set(bearer(key)).query({ chat_id: 'web' });
-    expect([info.status, info.body.project]).toEqual([200, 'site']);
+    expect([info.status, info.body.cwd]).toEqual([200, path.join(h.root, 'site')]);
   });
 
   it.each(['podWriter', 'podReader', 'scopedWriter'] as const)('%s gets the same status on a bound and a plain session', async (name) => {
     h = await harness();
-    const bound = await projectSession(h);
+    const bound = await cwdSession(h);
     const plain = (await create(h, 'alfred', KEYS.admin!, {})).body.sessionId as string;
     const key = KEYS[name]!;
     const statuses = async (sid: string) => {
@@ -251,7 +266,7 @@ describe('a project-bound session answers each key as a plain chat does', () => 
 
   it("refuses a key scoped to another agent with the usual agent message", async () => {
     h = await harness();
-    const sid = await projectSession(h);
+    const sid = await cwdSession(h);
     const res = await send(h, sid, 'hi', KEYS.otherAgent!);
     expect(res.status).toBe(403);
     expect(res.body.error).toMatch(/no access to agent 'alfred'/);
@@ -259,26 +274,26 @@ describe('a project-bound session answers each key as a plain chat does', () => 
   });
 });
 
-describe('a project-bound legacy chat turn', () => {
+describe('a folder-bound legacy chat turn', () => {
   let h: Harness;
   beforeAll(() => { process.env.CLAUDE_BIN = `node ${MOCK_CLAUDE}`; });
   afterAll(() => { delete process.env.CLAUDE_BIN; delete process.env.MOCK_CLAUDE_ARGV_LOG; });
   afterEach(async () => { await teardown(h); });
 
-  it('runs in the project dir with the persona file and user-only settings when untrusted', async () => {
+  it('runs in the folder with the persona file and user-only settings when untrusted', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     const res = await send(h, sessionId, 'where am I');
     expect(res.status).toBe(200);
     const [spawn] = spawns(h);
     expect(spawn!.cwd).toBe(path.join(h.root, 'site'));
     expect(flagValue(spawn!.argv, '--setting-sources')).toBe('user');
-    // Both prompt flags on one spawn: the persona comes by file, the project note inline.
+    // Both prompt flags on one spawn: the persona comes by file, the folder note inline.
     expect(flagValue(spawn!.argv, '--append-system-prompt-file')).toBe(path.join(h.base, 'agents', 'alfred', 'workspace', 'CLAUDE.md'));
-    expect(flagValue(spawn!.argv, '--append-system-prompt')).toBe(`You are working in project site at ${path.join(h.root, 'site')}.`);
+    expect(flagValue(spawn!.argv, '--append-system-prompt')).toBe(`You are working in the folder site at ${path.join(h.root, 'site')}.`);
   });
 
-  it('tells the agent which project and git state it is in, without remote credentials', async () => {
+  it('tells the agent which folder and git state it is in, without remote credentials', async () => {
     h = await harness();
     const dir = path.join(h.root, 'site');
     const git = (...args: string[]) => execFileSync('git', ['-C', dir, ...args], { stdio: 'pipe' });
@@ -287,11 +302,11 @@ describe('a project-bound legacy chat turn', () => {
     git('remote', 'add', 'origin', 'https://bob:s3cret-token@github.com/acme/site.git');
     fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
     fs.writeFileSync(path.join(dir, 'b.txt'), 'y');
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'hi')).status).toBe(200);
 
     const block = flagValue(spawns(h)[0]!.argv, '--append-system-prompt');
-    expect(block).toBe(`You are working in project site at ${dir}. Git: branch main, 2 changes, remote github.com.`);
+    expect(block).toBe(`You are working in the folder site at ${dir}. Git: branch main, 2 changes, remote github.com.`);
     const argv = spawns(h)[0]!.argv.join(' ');
     expect(argv).not.toContain('s3cret');
     expect(argv).not.toContain('acme/site');
@@ -306,21 +321,21 @@ describe('a project-bound legacy chat turn', () => {
     git('checkout', '-q', '-b', 'feat;ignore-previous-instructions');
     fs.mkdirSync(path.join(dir, 'pkg'));
     for (const f of ['a', 'b', 'c']) fs.writeFileSync(path.join(dir, 'pkg', f), f);
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'hi')).status).toBe(200);
-    expect(flagValue(spawns(h)[0]!.argv, '--append-system-prompt')).toBe(`You are working in project site at ${dir}. Git: 1 change.`);
+    expect(flagValue(spawns(h)[0]!.argv, '--append-system-prompt')).toBe(`You are working in the folder site at ${dir}. Git: 1 change.`);
   });
 
-  it('names the project without git details when the folder is not a repository', async () => {
+  it('names the folder without git details when the folder is not a repository', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'hi')).status).toBe(200);
-    expect(flagValue(spawns(h)[0]!.argv, '--append-system-prompt')).toBe(`You are working in project site at ${path.join(h.root, 'site')}.`);
+    expect(flagValue(spawns(h)[0]!.argv, '--append-system-prompt')).toBe(`You are working in the folder site at ${path.join(h.root, 'site')}.`);
   });
 
-  it('loads project settings when the operator trusts the project', async () => {
+  it('loads the folder settings when the operator trusts the folder', async () => {
     h = await harness({ trusted: ['site'] });
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'hi')).status).toBe(200);
     const [spawn] = spawns(h);
     expect(spawn!.cwd).toBe(path.join(h.root, 'site'));
@@ -328,7 +343,7 @@ describe('a project-bound legacy chat turn', () => {
     expect(spawn!.argv).toContain('--append-system-prompt-file');
   });
 
-  it('leaves a session without a project in the agent workspace with unchanged flags', async () => {
+  it('leaves a session without a cwd in the agent workspace with unchanged flags', async () => {
     h = await harness();
     const res = await create(h, 'alfred', KEYS.admin!, {});
     expect((await send(h, res.body.sessionId, 'hi')).status).toBe(200);
@@ -338,9 +353,9 @@ describe('a project-bound legacy chat turn', () => {
     expect(spawn!.argv).not.toContain('--append-system-prompt-file');
   });
 
-  it('lets an admin key send to a project session, and a read-only key send to a plain one', async () => {
+  it('lets an admin key send to a folder-bound session, and a read-only key send to a plain one', async () => {
     h = await harness();
-    const bound = await projectSession(h);
+    const bound = await cwdSession(h);
     expect((await send(h, bound, 'hi', KEYS.admin!)).status).toBe(200);
     const plain = (await create(h, 'alfred', KEYS.podReader!, {})).body.sessionId as string;
     expect((await send(h, plain, 'hi', KEYS.podReader!)).status).toBe(200);
@@ -348,7 +363,7 @@ describe('a project-bound legacy chat turn', () => {
 
   it('keeps the binding when the send names another chat_id', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'hi', KEYS.podReader!, 'other')).status).toBe(404);
     expect((await send(h, sessionId, 'hi', KEYS.admin!, 'other')).status).toBe(404);
     expect((await send(h, sessionId, 'hi')).status).toBe(200);
@@ -361,7 +376,7 @@ describe('a project-bound legacy chat turn', () => {
 
   it('keeps the binding when the chat index is corrupt', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'hi')).status).toBe(200);
     fs.writeFileSync(path.join(h.base, 'agents', 'alfred', 'sessions', 'api-web', 'index.json'), '{not json');
     await supertest(h.app).post(`/api/v1/agents/alfred/sessions/${sessionId}/restart`)
@@ -370,20 +385,22 @@ describe('a project-bound legacy chat turn', () => {
     expect(spawns(h).filter((s) => s.cwd !== path.join(h.root, 'site'))).toEqual([]);
   });
 
-  it('fails closed with PROJECT_UNAVAILABLE when the binding cannot be read', async () => {
+  it('fails closed with CWD_UNAVAILABLE when a dev-data binding file cannot be read', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const store = new SessionStore(path.join(h.base, 'agents'));
+    const sessionId = (await store.createTelegramSession('alfred', 'web', 'old', 'api')).id;
+    fs.mkdirSync(path.join(h.base, 'agents', 'alfred', 'project-bindings'), { recursive: true });
     fs.writeFileSync(path.join(h.base, 'agents', 'alfred', 'project-bindings', `${sessionId}.json`), '{not json');
     const res = await send(h, sessionId, 'hi');
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(res.body.code).toBe('CWD_UNAVAILABLE');
     expect(spawns(h)).toEqual([]);
-    expect((await send(h, sessionId, 'hi', KEYS.podReader!)).body.code).toBe('PROJECT_UNAVAILABLE');
+    expect((await send(h, sessionId, 'hi', KEYS.podReader!)).body.code).toBe('CWD_UNAVAILABLE');
   });
 
-  it('carries project and trusted on the admin sidebar list', async () => {
+  it('carries cwd and trusted on the admin sidebar list', async () => {
     h = await harness({ trusted: ['site'] });
-    const bound = await projectSession(h);
+    const bound = await cwdSession(h);
     const plain = (await create(h, 'alfred', KEYS.admin!, {})).body.sessionId as string;
     expect((await send(h, bound, 'hi')).status).toBe(200);
     expect((await send(h, plain, 'hi')).status).toBe(200);
@@ -391,19 +408,19 @@ describe('a project-bound legacy chat turn', () => {
     const res = await supertest(h.app).get('/api/v1/agents/sessions').set('Authorization', `Bearer ${KEYS.admin!.key}`);
     expect(res.status).toBe(200);
     const sessions = res.body.agents.find((a: { agentId: string }) => a.agentId === 'alfred').sessions as { sessionId: string }[];
-    expect(sessions.find((s) => s.sessionId === bound)).toMatchObject({ project: 'site', trusted: true });
-    expect(sessions.find((s) => s.sessionId === plain)).toMatchObject({ project: null, trusted: false });
+    expect(sessions.find((s) => s.sessionId === bound)).toMatchObject({ cwd: path.join(h.root, 'site'), trusted: true, cwdState: 'available' });
+    expect(sessions.find((s) => s.sessionId === plain)).toMatchObject({ cwd: null, trusted: false, cwdState: null });
   });
 
-  it('fails the next turn with PROJECT_UNAVAILABLE after a rename and never falls back to the workspace', async () => {
+  it('fails the next turn with CWD_UNAVAILABLE after a rename and never falls back to the workspace', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'first')).status).toBe(200);
     fs.renameSync(path.join(h.root, 'site'), path.join(h.root, 'site-renamed'));
 
     const res = await send(h, sessionId, 'second');
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(res.body.code).toBe('CWD_UNAVAILABLE');
     expect(spawns(h).map((s) => s.cwd)).toEqual([path.join(h.root, 'site')]);
 
     fs.renameSync(path.join(h.root, 'site-renamed'), path.join(h.root, 'site'));
@@ -411,9 +428,9 @@ describe('a project-bound legacy chat turn', () => {
     expect(spawns(h).map((s) => s.cwd)).toEqual([path.join(h.root, 'site'), path.join(h.root, 'site')]);
   });
 
-  it('refuses a project swapped for a symlink out of the root between turns', async () => {
+  it('refuses a folder swapped for a symlink out of the root between turns', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'first')).status).toBe(200);
     const outside = path.join(h.base, 'outside');
     fs.mkdirSync(outside);
@@ -422,28 +439,28 @@ describe('a project-bound legacy chat turn', () => {
 
     const res = await send(h, sessionId, 'second');
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(res.body.code).toBe('CWD_UNAVAILABLE');
     expect(spawns(h).some((s) => s.cwd === outside)).toBe(false);
   });
 
-  it('streams PROJECT_UNAVAILABLE as an error frame', async () => {
+  it('streams CWD_UNAVAILABLE as an error frame', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     fs.rmSync(path.join(h.root, 'site'), { recursive: true });
     const res = await supertest(h.app)
       .post('/api/v1/agents/alfred/messages')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`)
       .send({ message: 'hi', chat_id: 'web', session_id: sessionId, stream: true });
-    expect(res.text).toMatch(/"type":"error"[^\n]*"code":"PROJECT_UNAVAILABLE"/);
+    expect(res.text).toMatch(/"type":"error"[^\n]*"code":"CWD_UNAVAILABLE"/);
     expect(spawns(h)).toEqual([]);
     expect(h.runners[0]!.hasActiveApiSession(sessionId)).toBe(false);
     fs.mkdirSync(path.join(h.root, 'site'));
     expect((await send(h, sessionId, 'after')).status).toBe(200);
   });
 
-  it('restarts in the new folder when the project is deleted and recreated under the same name', async () => {
+  it('restarts in the new folder when the folder is deleted and recreated under the same name', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'first')).status).toBe(200);
     fs.rmSync(path.join(h.root, 'site'), { recursive: true });
     fs.mkdirSync(path.join(h.root, 'site'));
@@ -455,26 +472,26 @@ describe('a project-bound legacy chat turn', () => {
     expect(all[1]!.cwd).toBe(path.join(h.root, 'site'));
   });
 
-  it('reports projectState on list and info: available, then missing once the folder is deleted', async () => {
+  it('reports cwdState on list and info: available, then missing once the folder is deleted', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     const plain = (await create(h, 'alfred', KEYS.admin!, {})).body.sessionId as string;
     const info = () => supertest(h.app).get(`/api/v1/agents/alfred/sessions/${sessionId}/info`)
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
     const list = () => supertest(h.app).get('/api/v1/agents/alfred/sessions')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
-    expect((await info()).body).toMatchObject({ project: 'site', trusted: false, projectState: 'available' });
+    expect((await info()).body).toMatchObject({ cwd: path.join(h.root, 'site'), trusted: false, cwdState: 'available' });
 
     fs.rmSync(path.join(h.root, 'site'), { recursive: true });
-    expect((await info()).body).toMatchObject({ project: 'site', trusted: false, projectState: 'missing' });
+    expect((await info()).body).toMatchObject({ cwd: path.join(h.root, 'site'), trusted: false, cwdState: 'missing' });
     const rows = (await list()).body.sessions as { id: string }[];
-    expect(rows.find((s) => s.id === sessionId)).toMatchObject({ project: 'site', projectState: 'missing' });
-    expect(rows.find((s) => s.id === plain)).toMatchObject({ project: null, trusted: false, projectState: null });
+    expect(rows.find((s) => s.id === sessionId)).toMatchObject({ cwd: path.join(h.root, 'site'), cwdState: 'missing' });
+    expect(rows.find((s) => s.id === plain)).toMatchObject({ cwd: null, trusted: false, cwdState: null });
   });
 
-  it('refuses to delete a project with 409 in_use while a chat turn runs in it', async () => {
+  it('refuses to delete the folder with 409 in_use while a chat turn runs in it', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     const held = send(h, sessionId, 'HOLD-TURN').then((r) => r, (e: unknown) => e);
     // Spawned, not only reserved: a restart or session delete before the spawn leaves the held turn running.
     await waitForCondition(() => spawns(h).length > 0, 10_000);
@@ -499,9 +516,9 @@ describe('a project-bound legacy chat turn', () => {
     expect(fs.existsSync(path.join(h.root, 'site'))).toBe(false);
   }, 30_000);
 
-  it('keeps refusing the project delete after the session record is deleted mid-turn', async () => {
+  it('keeps refusing the folder delete after the session record is deleted mid-turn', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     const held = send(h, sessionId, 'HOLD-TURN').then((r) => r, (e: unknown) => e);
     // Spawned, not only reserved: a restart or session delete before the spawn leaves the held turn running.
     await waitForCondition(() => spawns(h).length > 0, 10_000);
@@ -519,9 +536,9 @@ describe('a project-bound legacy chat turn', () => {
     await held;
   }, 30_000);
 
-  it('refuses the project delete while a turn is between spawn and send', async () => {
+  it('refuses the folder delete while a turn is between spawn and send', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     await send(h, sessionId, 'warm');
     const store = (h.runners[0] as unknown as { sessionStore: { appendMessage: (...a: unknown[]) => Promise<unknown> } }).sessionStore;
     const original = store.appendMessage.bind(store);
@@ -544,9 +561,9 @@ describe('a project-bound legacy chat turn', () => {
     expect(fs.existsSync(path.join(h.root, 'site'))).toBe(true);
   }, 30_000);
 
-  it('re-resolves the project on a crash restart', async () => {
+  it('re-resolves the folder on a crash restart', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'first')).status).toBe(200);
     process.kill(spawns(h)[0]!.pid, 'SIGKILL');
     await waitForCondition(() => spawns(h).length === 2, 15_000);
@@ -554,9 +571,9 @@ describe('a project-bound legacy chat turn', () => {
     expect(flagValue(spawns(h)[1]!.argv, '--setting-sources')).toBe('user');
   }, 30_000);
 
-  it('does not restart a crashed session in the workspace once its project is gone', async () => {
+  it('does not restart a crashed session in the workspace once its folder is gone', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await send(h, sessionId, 'first')).status).toBe(200);
     fs.renameSync(path.join(h.root, 'site'), path.join(h.root, 'gone'));
     process.kill(spawns(h)[0]!.pid, 'SIGKILL');
@@ -564,12 +581,12 @@ describe('a project-bound legacy chat turn', () => {
     expect(spawns(h)).toHaveLength(1);
     const res = await send(h, sessionId, 'second');
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(res.body.code).toBe('CWD_UNAVAILABLE');
     expect(spawns(h)).toHaveLength(1);
   }, 30_000);
 });
 
-describe('project chat on an orchestrated gateway', () => {
+describe('folder-bound chat on an orchestrated gateway', () => {
   let h: Harness;
   beforeEach(async () => {
     h = await harness({ orchestration: true, extra: {
@@ -579,39 +596,39 @@ describe('project chat on an orchestrated gateway', () => {
   });
   afterEach(async () => { await teardown(h); });
 
-  it('binds the session to the project, since its workers run there', async () => {
-    const res = await create(h, 'alfred', KEYS.admin!, { project: 'site' });
+  it('binds the session to the folder, since its workers run there', async () => {
+    const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'site' });
     expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({ project: 'site' });
+    expect(res.body).toMatchObject({ cwd: path.join(h.root, 'site') });
   });
 
-  it.each([['locked', 'workspace_mode'], ['codexy', 'codex']])('refuses %s at create with 409 project_unsupported_agent', async (agent, reason) => {
-    const res = await create(h, agent, KEYS.admin!, { project: 'site' });
+  it.each([['locked', 'workspace_mode'], ['codexy', 'codex']])('refuses %s at create with 409 cwd_unsupported_agent', async (agent, reason) => {
+    const res = await create(h, agent, KEYS.admin!, { cwd: 'site' });
     expect(res.status).toBe(409);
-    expect(res.body).toMatchObject({ code: 'project_unsupported_agent', reason });
+    expect(res.body).toMatchObject({ code: 'cwd_unsupported_agent', reason });
   });
 
-  it('answers messages/accept with 409 PROJECT_UNAVAILABLE once the project folder is gone', async () => {
-    const sessionId = await projectSession(h);
+  it('answers messages/accept with 409 CWD_UNAVAILABLE once the folder is gone', async () => {
+    const sessionId = await cwdSession(h);
     fs.rmSync(path.join(h.root, 'site'), { recursive: true });
     const res = await supertest(h.app)
       .post('/api/v1/agents/alfred/messages/accept')
       .set('Authorization', `Bearer ${KEYS.admin!.key}`)
       .send({ message: 'hi', chat_id: 'web', session_id: sessionId, client_message_id: '00000000-0000-4000-8000-000000000001' });
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(res.body.code).toBe('CWD_UNAVAILABLE');
   });
 
-  it('fails a send with 409 PROJECT_UNAVAILABLE once the project folder is gone', async () => {
-    const sessionId = await projectSession(h);
+  it('fails a send with 409 CWD_UNAVAILABLE once the folder is gone', async () => {
+    const sessionId = await cwdSession(h);
     fs.rmSync(path.join(h.root, 'site'), { recursive: true });
     const res = await send(h, sessionId, 'hi');
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(res.body.code).toBe('CWD_UNAVAILABLE');
   });
 });
 
-describe('projects disabled by the config loader', () => {
+describe('files disabled by the config loader', () => {
   it('does not mount the files API', async () => {
     const h = await harness({ enabled: false });
     try {
@@ -623,25 +640,24 @@ describe('projects disabled by the config loader', () => {
     }
   });
 
-  it('advertises no files, git or chat tokens', async () => {
+  it('advertises no files, git or sessions tokens', async () => {
     const h = await harness({ enabled: false });
     try {
       const res = await supertest(h.app).get('/api/v1/capabilities').set('Authorization', `Bearer ${KEYS.admin!.key}`);
-      expect(res.body.capabilities).toMatchObject({ files: [], git: [], projects: [] });
+      expect(res.body.capabilities).toMatchObject({ files: [], git: [], sessions: [] });
     } finally {
       await teardown(h);
     }
   });
 
-  it('refuses a project session with 409 projects_disabled and leaves no session or binding behind', async () => {
+  it('refuses a folder-bound session with 409 files_disabled and leaves no session behind', async () => {
     const h = await harness({ enabled: false });
     try {
-      const res = await create(h, 'alfred', KEYS.admin!, { project: 'site' });
+      const res = await create(h, 'alfred', KEYS.admin!, { cwd: 'site' });
       expect(res.status).toBe(409);
-      expect(res.body.code).toBe('projects_disabled');
+      expect(res.body.code).toBe('files_disabled');
       const list = await supertest(h.app).get('/api/v1/agents/alfred/sessions').set('Authorization', `Bearer ${KEYS.admin!.key}`).query({ chat_id: 'web' });
-      expect(JSON.stringify(list.body)).not.toContain('"site"');
-      expect(fs.existsSync(path.join(h.base, 'agents', 'alfred', 'project-bindings'))).toBe(false);
+      expect((list.body.sessions as { cwd: string | null }[]).filter((row) => row.cwd !== null)).toEqual([]);
     } finally {
       await teardown(h);
     }
@@ -649,19 +665,19 @@ describe('projects disabled by the config loader', () => {
 });
 
 describe('capabilities follow orchestration', () => {
-  it.each([[false, false], [true, true]])('orchestration=%s advertises chat=%s', async (orchestration, chat) => {
+  it.each([[false, false], [true, true]])('orchestration=%s advertises sessions cwd=%s', async (orchestration, cwd) => {
     const h = await harness({ orchestration });
     try {
       const res = await supertest(h.app).get('/api/v1/capabilities').set('Authorization', `Bearer ${KEYS.admin!.key}`);
-      expect(res.body.capabilities.projects).toEqual(chat ? ['chat'] : []);
-      expect(res.body.capabilities.files).toEqual(['list', 'create', 'delete']);
+      expect(res.body.capabilities.sessions).toEqual(cwd ? ['cwd'] : []);
+      expect(res.body.capabilities.files).toEqual(['list', 'create', 'delete', 'marks']);
     } finally {
       await teardown(h);
     }
   });
 });
 
-describe('project delete against accepted turns and the rename window', () => {
+describe('folder delete against accepted turns and the rename window', () => {
   let h: Harness;
   beforeAll(() => { process.env.CLAUDE_BIN = `node ${MOCK_CLAUDE}`; });
   afterAll(() => { delete process.env.CLAUDE_BIN; delete process.env.MOCK_CLAUDE_ARGV_LOG; });
@@ -677,7 +693,7 @@ describe('project delete against accepted turns and the rename window', () => {
 
   it('answers 409 in_use while an orchestrated accepted turn is live', async () => {
     h = await harness({ orchestration: true });
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     const accepted = await accept(sessionId, 'HOLD-TURN', '00000000-0000-4000-8000-000000000002');
     expect(accepted.status).toBe(202);
     expect(h.runners[0]!.hasActiveApiSession(sessionId)).toBe(false);
@@ -691,7 +707,7 @@ describe('project delete against accepted turns and the rename window', () => {
 
   it('refuses a turn that starts while the delete is mid-rename, then deletes', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     let reached!: () => void;
@@ -708,7 +724,7 @@ describe('project delete against accepted turns and the rename window', () => {
     await atRename;
     const turn = await send(h, sessionId, 'HOLD-TURN');
     expect(turn.status).toBe(409);
-    expect(turn.body.code).toBe('PROJECT_UNAVAILABLE');
+    expect(turn.body.code).toBe('CWD_UNAVAILABLE');
     expect(spawns(h)).toHaveLength(0);
     expect((await del()).status).toBe(409);
 
@@ -718,15 +734,15 @@ describe('project delete against accepted turns and the rename window', () => {
   }, 30_000);
 });
 
-describe('project delete after a failed spawn', () => {
+describe('folder delete after a failed spawn', () => {
   let h: Harness;
   beforeAll(() => { process.env.CLAUDE_BIN = path.join(os.tmpdir(), 'no-such-claude-binary'); });
   afterAll(() => { delete process.env.CLAUDE_BIN; });
   afterEach(async () => { await teardown(h); });
 
-  it.each(['send', 'stream'])('releases the project when the claude binary cannot start (%s)', async (mode) => {
+  it.each(['send', 'stream'])('releases the folder when the claude binary cannot start (%s)', async (mode) => {
     h = await harness();
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     if (mode === 'send') {
       const res = await send(h, sessionId, 'hello');
       expect(res.status).toBeGreaterThanOrEqual(400);
@@ -743,7 +759,7 @@ describe('project delete after a failed spawn', () => {
   }, 30_000);
 });
 
-describe('the project delete guard follows the folder and the work, not the session record', () => {
+describe('the folder delete guard follows the folder and the work, not the session record', () => {
   let h: Harness;
   beforeAll(() => { process.env.CLAUDE_BIN = `node ${MOCK_CLAUDE}`; });
   afterAll(() => { delete process.env.CLAUDE_BIN; delete process.env.MOCK_CLAUDE_ARGV_LOG; });
@@ -762,7 +778,7 @@ describe('the project delete guard follows the folder and the work, not the sess
 
   it('keeps refusing the delete after the session is deleted while an orchestrated turn is live', async () => {
     h = await harness({ orchestration: true });
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await accept(sessionId, 'HOLD-TURN', '00000000-0000-4000-8000-0000000000a1')).status).toBe(202);
     await waitForCondition(() => spawns(h).length > 0, 15_000);
     expect((await del()).status).toBe(409);
@@ -773,15 +789,15 @@ describe('the project delete guard follows the folder and the work, not the sess
     expect(fs.existsSync(path.join(h.root, 'site'))).toBe(true);
   }, 40_000);
 
-  it('keeps refusing the delete while a task pinned to the project is unfinished, with no session left', async () => {
+  it('keeps refusing the delete while a task pinned to the folder is unfinished, with no session left', async () => {
     h = await harness({ orchestration: true });
-    const sessionId = await projectSession(h);
+    const sessionId = await cwdSession(h);
     expect((await accept(sessionId, 'hello', '00000000-0000-4000-8000-0000000000b1')).status).toBe(202);
     await waitForCondition(() => !!runtime() && runtime().liveSessionIds().size === 0, 20_000);
     const conv = runtime().store.get('SELECT id FROM conversations WHERE agent_session_id=?', sessionId);
     const now = Date.now();
     runtime().store.run('INSERT INTO tasks(id,conversation_id,state,state_version,revision,active_attempt_id,snapshot_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
-      'task-pinned', conv.id, 'running', 1, 1, null, JSON.stringify({ project: 'site' }), now, now);
+      'task-pinned', conv.id, 'running', 1, 1, null, JSON.stringify({ cwd: path.join(h.root, 'site') }), now, now);
     expect((await deleteSession(sessionId)).status).toBe(204);
     for (const state of ['running', 'waiting_input', 'needs_reconciliation', 'recovering', 'queued']) {
       runtime().store.run('UPDATE tasks SET state=? WHERE id=?', state, 'task-pinned');
@@ -791,10 +807,10 @@ describe('the project delete guard follows the folder and the work, not the sess
     expect((await del()).status).toBe(200);
   }, 40_000);
 
-  it('sees a chat bound to a symlink alias of the project', async () => {
+  it('sees a chat bound to a symlink alias of the folder', async () => {
     h = await harness();
     fs.symlinkSync('site', path.join(h.root, 'alias'));
-    const created = await create(h, 'alfred', KEYS.admin!, { project: 'alias' });
+    const created = await create(h, 'alfred', KEYS.admin!, { cwd: 'alias' });
     expect(created.status).toBe(201);
     void send(h, created.body.sessionId as string, 'HOLD-TURN').then((r) => r, (e: unknown) => e);
     await waitForCondition(() => spawns(h).length > 0, 15_000);
@@ -805,26 +821,27 @@ describe('the project delete guard follows the folder and the work, not the sess
 
   it('does not refuse a turn that had already started when the delete began', async () => {
     h = await harness();
-    const sessionId = await projectSession(h);
-    const realResolve = chat.resolveProjectCwd;
+    const sessionId = await cwdSession(h);
+    const resolver = h.resolvers[0]!;
+    const realResolve = resolver.resolve.bind(resolver);
     let armed = false;
     let open!: () => void;
     const gate = new Promise<void>((resolve) => { open = resolve; });
-    jest.spyOn(chat, 'resolveProjectCwd').mockImplementation(async (...a) => {
+    jest.spyOn(resolver, 'resolve').mockImplementation(async (p) => {
       if (armed) await gate;
-      return realResolve(...a);
+      return realResolve(p);
     });
     armed = true;
     const held = send(h, sessionId, 'HOLD-TURN').then((r) => r, (e: unknown) => e);
     await waitForCondition(() => h.runners[0]!.hasActiveApiSession(sessionId), 10_000);
-    const original = h.runners[0]!.hasActiveWorkIn.bind(h.runners[0]!);
-    jest.spyOn(h.runners[0]!, 'hasActiveWorkIn').mockImplementation(async (dir) => {
+    const original = h.runners[0]!.prepareWorkCheck.bind(h.runners[0]!);
+    jest.spyOn(h.runners[0]!, 'prepareWorkCheck').mockImplementation(async () => {
       open();
       await Promise.race([
         waitForCondition(() => !h.runners[0]!.hasActiveApiSession(sessionId), 3_000).catch(() => undefined),
         new Promise((resolve) => setTimeout(resolve, 1_500)),
       ]);
-      return original(dir);
+      return original();
     });
     const res = await del();
     expect([res.status, res.body.code]).toEqual([409, 'in_use']);

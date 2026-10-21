@@ -34,8 +34,24 @@
         "internal",
         "git_failed",
         "git_unavailable",
-        "timeout"
+        "timeout",
+        "marked",
+        "invalid_mark"
       ]
+    },
+    "reasons": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "turn",
+          "spawn",
+          "task",
+          "session",
+          "marked",
+          "deleting"
+        ]
+      }
     }
   }
 }

@@ -4,7 +4,9 @@ import * as path from 'path';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const KEYS = {
   admin: { key: 'k-admin', agents: '*', admin: true },
@@ -12,7 +14,7 @@ const KEYS = {
 } satisfies Record<string, ApiKey>;
 const A = '/api/v1/agents/alfred';
 
-describe('a bindings folder that cannot be read', () => {
+describe('a dev-data bindings folder that cannot be read', () => {
   let base: string;
   let runner: AgentRunner;
   let gw: ReturnType<GatewayRouter['getApp']>;
@@ -27,7 +29,7 @@ describe('a bindings folder that cannot be read', () => {
       gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) } },
       agents: [cfg],
     };
-    runner = new AgentRunner(cfg, gateway);
+    runner = new AgentRunner(cfg, gateway, undefined, createCwdResolver(gateway, silentLogger));
     gw = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gateway).getApp();
   });
   afterEach(async () => {
