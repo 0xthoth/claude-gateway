@@ -6,7 +6,9 @@ import * as path from 'path';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
+import { createCwdResolver } from '../../src/files/session-cwd';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
+import { silentLogger } from '../helpers/silent-logger';
 
 const A = '/api/v1/agents/alfred';
 const UUID = '123e4567-e89b-12d3-a456-426614174000';
@@ -53,7 +55,7 @@ beforeEach(() => {
     agents: [cfg],
   };
   fs.writeFileSync(path.join(base, 'config.json'), JSON.stringify(gateway));
-  runner = new AgentRunner(cfg, gateway);
+  runner = new AgentRunner(cfg, gateway, undefined, createCwdResolver(gateway, silentLogger));
   gw = new GatewayRouter(new Map([['alfred', runner]]), new Map([['alfred', cfg]]), undefined, gateway, undefined, path.join(base, 'config.json')).getApp();
 });
 afterEach(async () => {
@@ -151,9 +153,9 @@ describe('a well-formed session id', () => {
     }
   });
 
-  it('a project chat and a plain chat answer alike on info, rename and delete', async () => {
+  it('a cwd-bound chat and a plain chat answer alike on info, rename and delete', async () => {
     const plain = await create();
-    const bound = await create({ project: 'site' });
+    const bound = await create({ cwd: 'site' });
     for (const key of [KEYS.ro, KEYS.writer]) {
       const answers = await Promise.all([plain, bound].map(async (id) => {
         const info = await as(request(gw).get(`${A}/sessions/${id}/info?chat_id=web`), key);

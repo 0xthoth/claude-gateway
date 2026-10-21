@@ -205,7 +205,7 @@ async function parentOf(root: string, parentRel: RelPath): Promise<FsResult<stri
   return realRootOf(root);
 }
 
-export type MakeDirError = FilesErrorCode | 'marked' | 'deleting';
+type MakeDirError = FilesErrorCode | 'marked' | 'deleting';
 
 async function makeOneDir(parent: string, dir: string, name: EntryName): Promise<Result<void, MakeDirError>> {
   // Case-folding filesystems already answer EEXIST; this makes Linux agree so a client never gets "Site" and "site"
