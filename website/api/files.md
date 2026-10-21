@@ -219,8 +219,9 @@ curl -X DELETE -H "Authorization: Bearer $KEY" -H "Content-Type: application/jso
 - A folder in which a chat turn is in flight, a session is still starting, an accepted message is not yet handled, or
   an orchestrated task has not finished, and a folder that holds or sits inside such a folder (`409 in_use`). Deleting
   the chat session does not release it while its turn, message or task is still live.
-- A folder that overlaps one another `DELETE` is removing (`409 deleting`). While a delete runs, a message or task in a
-  chat bound to that folder fails with `409 PROJECT_UNAVAILABLE` (`reason` `project_deleting`).
+- A folder that is, holds or sits inside one another `DELETE` is removing (`409 deleting`). While a delete runs, a
+  message or task in a chat bound to a folder that overlaps it the same way fails with `409 PROJECT_UNAVAILABLE`
+  (`reason` `project_deleting`).
 
 The gateway does not check for other processes, such as a dev server, that run inside the folder: stop them before
 you delete.
