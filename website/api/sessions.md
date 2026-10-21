@@ -103,7 +103,7 @@ resolves when the response is built:
 
 | `projectState` | Meaning |
 |----------------|---------|
-| `available` | The folder exists under the projects root. |
+| `available` | The folder exists under the files root. |
 | `missing` | No folder with that name exists, for example after it was deleted or renamed. |
 | `unavailable` | The folder exists but cannot be used, for example a symlink that leaves the root or a file in place of a folder. |
 
@@ -126,7 +126,7 @@ the only way a session comes into existence.
 | `chat_id` | Yes | Caller identity |
 | `prompt` | No | Initial user intent — used to auto-generate a session name |
 | `name` | No | Explicit session name (overrides auto-generated name) |
-| `project` | No | Name of a [project](/api/projects) under `gateway.projects.root`. Binds the session to that project for its whole life. `null` is the same as omitting it |
+| `project` | No | Name of a folder directly under the [files root](/api/files) `gateway.files.root`. Binds the session to that project for its whole life. `null` is the same as omitting it |
 
 ```bash
 curl -X POST \
@@ -152,7 +152,7 @@ host, never a remote URL. The response then includes `"project": "<name>"`,
 `"trusted"` and `"projectState"`. You cannot change the project later.
 
 The project runs untrusted unless the operator lists its name in
-[`gateway.projects.trusted`](/reference/configuration) and `<root>/<name>` is
+[`gateway.files.trusted`](/api/files#configuration) and `<root>/<name>` is
 a real directory, not a symlink. The root itself may be a symlink. Untrusted means one thing: the repo's own
 hooks, MCP servers (`.mcp.json`), settings and `CLAUDE.md` do not load. It does
 not restrict anything else. The agent still runs with the gateway's normal
@@ -161,14 +161,21 @@ run commands there, and the repo's content (files, READMEs, commit messages)
 can still prompt-inject it. Treat an untrusted project as a folder the agent
 works in, not as a sandbox.
 
-Trust is decided by name. Anything that can write under the projects root,
+Trust is decided by name. Anything that can write under the files root,
 including an agent chatting in another project, can put files into a trusted
 folder, and the next trusted chat loads them. Trusting a project means trusting
 everyone who can write to the root.
 
+An agent with `isolateMemory: true` can chat in a project like any other host agent, and the project is not split per
+conversation. Every chat bound to the project works in the same folder, so what one conversation writes there reaches
+the others. A trusted project also loads its own settings, hooks and `.mcp.json`, so its MCP servers reach the session
+although isolated memory mode gives a session none of the operator's. Bind a chat of an isolated agent only to a
+project its conversations may share, and leave that project out of `gateway.files.trusted`. App agents cannot chat in
+a project (`409 project_unsupported_agent`, reason `container`).
+
 Check that `capabilities.projects` includes `"chat"` (see [`GET /capabilities`](/api/system))
-before you send `project`. A gateway with orchestration off, or with the Projects API disabled,
-does not advertise it. With the Projects API disabled, the create call answers `409 projects_disabled`.
+before you send `project`. A gateway with orchestration off, or with the files API disabled,
+does not advertise it. With the files API disabled, the create call answers `409 projects_disabled`.
 With orchestration off, the gateway still creates the session (`201`) and a message sent with
 [`POST /messages`](/api/messages) still runs in the project folder, but
 [`POST /messages/accept`](/api/messages), which the web uses, answers `409 NOT_SUPPORTED`.
@@ -178,8 +185,8 @@ Do not rely on the first behaviour; it is not advertised.
 |--------|--------|------|
 | `400` | `invalid_name` | `project` is not a valid project name |
 | `403` | | `Write permission required`: the key cannot write to this agent (it has no `write` and is not an admin key). `API key has no access to agent '<id>'`: the key does not list this agent. Binding a chat needs the same write access as any other change to the agent |
-| `404` | `project_not_found` | No folder with that name exists under the projects root |
-| `409` | `projects_disabled` | The Projects API is disabled on this gateway (`gateway.projects.enabled` is `false`). No session is created |
+| `404` | `project_not_found` | No folder with that name exists under the files root |
+| `409` | `projects_disabled` | The files API is disabled on this gateway (`gateway.files.enabled` is `false`). No session is created |
 | `409` | `project_unavailable` | The folder exists but cannot be used, for example a symlink that leaves the root. `reason` holds the projects error code |
 | `409` | `project_unsupported_agent` | The agent cannot run in a project folder. `reason` is `container` for container (app) agents, `workspace_mode` when an orchestrated agent's `tasks.workspaceMode` is not `host`, or `codex` when its workers would run on the Codex harness |
 

@@ -83,15 +83,24 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | `GET` | `/api/v1/agents/:agentId/files/:filename` | Key | Read a workspace file |
 | `PUT` | `/api/v1/agents/:agentId/files/:filename` | Write | Write a workspace file |
 
-## Projects API {#projects-api}
+## Files API {#files-api}
+
+Paths are relative to `gateway.files.root` (default `~/projects`). See [Files](/api/files).
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/api/v1/projects` | Key | List projects under the projects root (default `~/projects`) |
-| `POST` | `/api/v1/projects` | Admin key | Create a project directory, optionally with `git init` |
-| `DELETE` | `/api/v1/projects/:name` | Admin key | Delete a project directory and everything in it |
-| `GET` | `/api/v1/projects/git-summary` | Key | Git sync summary of every project that is a repository |
-| `GET` | `/api/v1/projects/:name/git` | Key | Git status of one project |
+| `GET` | `/api/v1/files?path=` | Key | List the folders directly under a path of the root |
+| `POST` | `/api/v1/files/mkdir` | Admin key | Create one new folder, optionally with `git init` |
+| `DELETE` | `/api/v1/files` | Admin key | Delete a folder and everything in it (JSON body `path`, `confirm`) |
+
+## Git API {#git-api}
+
+Read-only. See [Git](/api/git).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/git/status?path=` | Key | Git status of one folder under the files root |
+| `GET` | `/api/v1/git/summary?path=` | Key | Git sync summary of every repository directly under a path of the root |
 
 ## Telegram Channel API {#telegram-channel-api}
 
