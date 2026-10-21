@@ -5,7 +5,7 @@ import * as path from 'path';
 import request from 'supertest';
 import { AgentRunner } from '../../src/agent/runner';
 import { GatewayRouter } from '../../src/api/gateway-router';
-import { createProjectsRouter } from '../../src/api/projects-router';
+import { createFilesRouter } from '../../src/api/files-router';
 import { getRegisteredRoutes } from '../../src/api/route-registry';
 import type { AgentConfig, ApiKey, GatewayConfig } from '../../src/types';
 import { silentLogger } from '../helpers/silent-logger';
@@ -20,58 +20,58 @@ const NON_ADMIN = [KEYS.podWrite, KEYS.podRead, KEYS.alfredOnly];
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
 
 const ADMIN_ONLY_ROUTES = [
-  'POST /v1/projects', 'DELETE /v1/projects/:name',
+  'POST /v1/files/mkdir', 'DELETE /v1/files',
 ];
 const READ_ROUTES = [
-  'GET /v1/projects', 'GET /v1/projects/git-summary', 'GET /v1/projects/:name/git',
+  'GET /v1/files', 'GET /v1/git/summary', 'GET /v1/git/status',
 ];
 
-describe('the /v1/projects routes', () => {
+describe('the /v1/files and /v1/git routes', () => {
   let base: string;
   let root: string;
   let app: express.Express;
 
   beforeEach(() => {
-    base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-perm-')));
+    base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'files-perm-')));
     root = path.join(base, 'projects');
     fs.mkdirSync(path.join(root, 'app'), { recursive: true });
     fs.writeFileSync(path.join(root, 'app', 'README.md'), '# app\n');
     app = express();
     app.use(express.json());
-    app.use('/api', createProjectsRouter(Object.values(KEYS), root, { logger: silentLogger }));
+    app.use('/api', createFilesRouter(Object.values(KEYS), root, { logger: silentLogger }));
   });
   afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
 
   const routes = () => {
-    createProjectsRouter([], '', { logger: silentLogger });
-    return getRegisteredRoutes().filter((r) => r.path.startsWith('/v1/projects'));
+    createFilesRouter([], '', { logger: silentLogger });
+    return getRegisteredRoutes().filter((r) => /^\/v1\/(files|git)\b/.test(r.path));
   };
   const call = (route: string, key?: ApiKey) => {
     const [method, url] = route.split(' ') as [string, string];
-    const req = (request(app) as unknown as Record<string, (u: string) => request.Test>)[method.toLowerCase()]!(
-      `/api${url.replace(':name', 'app')}`,
-    );
-    return (key ? req.set('Authorization', `Bearer ${key.key}`) : req).send({ name: 'made-by-test', confirm: 'app' });
+    const query = method === 'GET' && url !== '/v1/git/summary' ? '?path=app' : '';
+    const req = (request(app) as unknown as Record<string, (u: string) => request.Test>)[method.toLowerCase()]!(`/api${url}${query}`);
+    const body = method === 'POST' ? { path: 'made-by-test' } : { path: 'app', confirm: 'app' };
+    return (key ? req.set('Authorization', `Bearer ${key.key}`) : req).send(body);
   };
 
-  it('registers the five routes, and marks exactly create and delete as admin', () => {
+  it('registers the five routes, and marks exactly mkdir and delete as admin', () => {
     const all = routes().map((r) => `${r.method} ${r.path}`);
     expect(all.sort()).toEqual([...ADMIN_ONLY_ROUTES, ...READ_ROUTES].sort());
     expect(routes().filter((r) => r.auth === 'admin').map((r) => `${r.method} ${r.path}`).sort()).toEqual([...ADMIN_ONLY_ROUTES].sort());
   });
 
-  it.each(NON_ADMIN)('lets $key read every project route', async (key) => {
+  it.each(NON_ADMIN)('lets $key read every read route', async (key) => {
     for (const route of READ_ROUTES) {
       const res = await call(route, key);
-      const expected = route.endsWith('/git') ? 409 : 200;
+      const expected = route.endsWith('/status') ? 409 : 200;
       expect([route, res.status]).toEqual([route, expected]);
     }
   });
 
-  it.each(NON_ADMIN)('refuses $key on create and delete with 403 forbidden_key, and changes nothing', async (key) => {
+  it.each(NON_ADMIN)('refuses $key on mkdir and delete with 403 forbidden_key, and changes nothing', async (key) => {
     for (const route of ADMIN_ONLY_ROUTES) {
       const res = await call(route, key);
-      expect([route, res.status, res.body.code, res.body.error]).toEqual([route, 403, 'forbidden_key', 'An admin API key is required for Projects']);
+      expect([route, res.status, res.body.code, res.body.error]).toEqual([route, 403, 'forbidden_key', 'An admin API key is required']);
     }
     expect(fs.readdirSync(root)).toEqual(['app']);
   });
@@ -82,7 +82,7 @@ describe('the /v1/projects routes', () => {
       expect([route, res.body?.code === 'forbidden_key']).toEqual([route, false]);
       expect([route, (await call(route)).status]).toEqual([route, 401]);
     }
-    expect((await call('DELETE /v1/projects/:name', KEYS.admin)).status).toBe(200);
+    expect((await call('DELETE /v1/files', KEYS.admin)).status).toBe(200);
     expect(fs.existsSync(path.join(root, 'app'))).toBe(false);
   });
 });
@@ -108,7 +108,7 @@ describe('a project-bound chat', () => {
       return { id, description: id, workspace, env: '', claude: { model: 'm', dangerouslySkipPermissions: true, extraFlags: [] } };
     });
     const gateway: GatewayConfig = {
-      gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, projects: { root: path.join(base, 'projects') } },
+      gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, files: { root: path.join(base, 'projects') } },
       agents: configs,
     };
     runners = configs.map((c) => new AgentRunner(c, gateway));
@@ -200,9 +200,9 @@ describe('a project-bound chat', () => {
     expect((await bind(KEYS.podWrite, 'alfred', 'missing')).body.code).toBe('project_not_found');
   });
 
-  it.each(Object.values(KEYS))('answers $key 404 on the removed project file routes of the full gateway', async (key) => {
+  it.each(Object.values(KEYS))('answers $key 404 on the removed project routes of the full gateway', async (key) => {
     fs.writeFileSync(path.join(base, 'projects', 'site', 'README.md'), 'SITE-README');
-    for (const url of ['/api/v1/projects/site/tree', '/api/v1/projects/site/tree?path=', '/api/v1/projects/site/file?path=README.md']) {
+    for (const url of ['/api/v1/projects', '/api/v1/projects/site/git', '/api/v1/projects/site/tree', '/api/v1/projects/site/file?path=README.md', '/api/v1/files/content?path=site/README.md']) {
       const res = await as(key, 'get', url);
       expect([url, res.status]).toEqual([url, 404]);
       expect(res.text).not.toContain('SITE-README');

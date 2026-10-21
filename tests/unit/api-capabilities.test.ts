@@ -16,9 +16,13 @@ import {
   createCapabilitiesRouter,
   buildCapabilitiesResponse,
   CROSS_CHANNEL_MESSAGE_CHANNELS,
+  FILES_ADMIN_CAPABILITIES,
+  FILES_CAPABILITIES,
+  GIT_CAPABILITIES,
   PROJECTS_CAPABILITIES,
 } from '../../src/api/capabilities';
 import { GATEWAY_VERSION } from '../../src/api/gateway-version';
+import { collectManifest } from '../../src/api/manifest-sources';
 import { CHAT_CHANNELS } from '../../src/history/types';
 import type { ApiKey } from '../../src/types';
 
@@ -48,6 +52,8 @@ describe('GET /api/v1/capabilities', () => {
       version: expect.any(String),
       capabilities: {
         cross_channel_message: expect.any(Array),
+        files: expect.any(Array),
+        git: expect.any(Array),
         projects: expect.any(Array),
       },
     });
@@ -69,44 +75,58 @@ describe('GET /api/v1/capabilities', () => {
     expect(res.body.capabilities.cross_channel_message).toContain('telegram');
   });
 
-  it('advertises every project token to an admin key', async () => {
+  it('advertises every files, git and chat token to an admin key', async () => {
     const res = await request(buildApp(apiKeys)).get('/api/v1/capabilities').set(AUTH);
-    expect(res.body.capabilities.projects).toEqual(['list', 'create', 'git', 'chat', 'delete']);
+    const { files, git, projects } = res.body.capabilities;
+    expect({ files, git, projects }).toEqual({ files: ['list', 'create', 'delete'], git: ['status', 'summary'], projects: ['chat'] });
   });
 
-  it('drops chat without orchestration and everything when the Projects API is disabled', () => {
+  it('drops chat without orchestration and every token when the files API is disabled', () => {
     const gw = (g: Record<string, unknown>) => ({ gateway: g, agents: [] }) as never;
-    expect(buildCapabilitiesResponse('1', gw({ orchestration: false })).capabilities.projects).toEqual(['list', 'create', 'git', 'delete']);
-    expect(buildCapabilitiesResponse('1', gw({ orchestration: true })).capabilities.projects).toEqual(['list', 'create', 'git', 'chat', 'delete']);
-    expect(buildCapabilitiesResponse('1', gw({ orchestration: true, projects: { enabled: false } })).capabilities.projects).toEqual([]);
+    expect(buildCapabilitiesResponse('1', gw({ orchestration: false })).capabilities).toMatchObject({ files: ['list', 'create', 'delete'], git: ['status', 'summary'], projects: [] });
+    expect(buildCapabilitiesResponse('1', gw({ orchestration: true })).capabilities.projects).toEqual(['chat']);
+    expect(buildCapabilitiesResponse('1', gw({ orchestration: true, files: { enabled: false } })).capabilities).toMatchObject({ files: [], git: [], projects: [] });
   });
 
-  it.each(['sk-pod-write', 'sk-pod-read', 'sk-agent'])('%s gets every project token but create and delete', async (key) => {
+  it.each(['sk-pod-write', 'sk-pod-read', 'sk-agent'])('%s gets every token but create and delete', async (key) => {
     const res = await request(buildApp(apiKeys)).get('/api/v1/capabilities').set(as(key));
     expect(res.status).toBe(200);
-    expect(res.body.capabilities.projects).toEqual(['list', 'git', 'chat']);
-    expect(res.body).not.toHaveProperty('projectsUnavailable');
+    const { files, git, projects } = res.body.capabilities;
+    expect({ files, git, projects }).toEqual({ files: ['list'], git: ['status', 'summary'], projects: ['chat'] });
+    expect(res.body).not.toHaveProperty('filesUnavailable');
     expect(res.body.capabilities.cross_channel_message).toContain('telegram');
   });
 
   it('drops chat for a non-admin key too when orchestration is off', () => {
     const config = { gateway: { orchestration: false }, agents: [] } as never;
-    expect(buildCapabilitiesResponse('1', config, apiKeys[2]).capabilities.projects).toEqual(['list', 'git']);
+    expect(buildCapabilitiesResponse('1', config, apiKeys[2]).capabilities).toMatchObject({ files: ['list'], projects: [] });
   });
 
-  it('omits projectsUnavailable for an admin key when Projects is usable', async () => {
+  it('omits filesUnavailable for an admin key when the files API is usable', async () => {
     const res = await request(buildApp(apiKeys)).get('/api/v1/capabilities').set(AUTH);
-    expect(res.body).not.toHaveProperty('projectsUnavailable');
+    expect(res.body).not.toHaveProperty('filesUnavailable');
   });
 
-  it('says disabled to every key, admin included, when Projects is off', async () => {
-    const config = { gateway: { projects: { enabled: false } }, agents: [] } as never;
+  it('says disabled to every key, admin included, when the files API is off', async () => {
+    const config = { gateway: { files: { enabled: false } }, agents: [] } as never;
     const app = express();
     app.use('/api', createCapabilitiesRouter(apiKeys, config));
     for (const key of ['sk-test-app', 'sk-pod-write', 'sk-agent']) {
       const res = await request(app).get('/api/v1/capabilities').set(as(key));
-      expect([res.body.capabilities.projects, res.body.projectsUnavailable]).toEqual([[], 'disabled']);
+      const { files, git, projects } = res.body.capabilities;
+      expect([files, git, projects, res.body.filesUnavailable]).toEqual([[], [], [], 'disabled']);
     }
+  });
+
+  it('maps every files and git token to one served route, admin-only exactly where the token is', () => {
+    const routes: Record<string, string> = {
+      'files.list': 'GET /v1/files', 'files.create': 'POST /v1/files/mkdir', 'files.delete': 'DELETE /v1/files',
+      'git.status': 'GET /v1/git/status', 'git.summary': 'GET /v1/git/summary',
+    };
+    const served = new Map(collectManifest().filter((r) => /^\/v1\/(files|git)\b/.test(r.path)).map((r) => [`${r.method} ${r.path}`, r.auth]));
+    const tokens = [...FILES_CAPABILITIES.map((t) => `files.${t}`), ...GIT_CAPABILITIES.map((t) => `git.${t}`)];
+    expect(tokens.map((t) => routes[t]).sort()).toEqual([...served.keys()].sort());
+    for (const t of tokens) expect([t, served.get(routes[t]!)]).toEqual([t, FILES_ADMIN_CAPABILITIES.has(t.slice(6) as never) && t.startsWith('files.') ? 'admin' : 'key']);
   });
 
   it('only advertises channel identifiers the gateway itself uses', () => {
@@ -119,13 +139,16 @@ describe('GET /api/v1/capabilities', () => {
     expect(new Set(CROSS_CHANNEL_MESSAGE_CHANNELS).size).toBe(CROSS_CHANNEL_MESSAGE_CHANNELS.length);
   });
 
-  it('system.md shows the projects array the gateway serves, in the example and the reference table', () => {
-    const doc = fs.readFileSync(path.join(__dirname, '../../website/api/system.md'), 'utf8');
-    const example = doc.match(/"projects": (\[[^\]]*\])/);
-    const table = doc.match(/Currently `(\[[^\]]*\])`/);
-    expect(JSON.parse(example![1])).toEqual([...PROJECTS_CAPABILITIES]);
-    expect(JSON.parse(table![1])).toEqual([...PROJECTS_CAPABILITIES]);
-  });
+  it.each([['files', FILES_CAPABILITIES], ['git', GIT_CAPABILITIES], ['projects', PROJECTS_CAPABILITIES]] as const)(
+    'system.md shows the %s array the gateway serves, in the example and the reference table',
+    (key, tokens) => {
+      const doc = fs.readFileSync(path.join(__dirname, '../../website/api/system.md'), 'utf8');
+      const example = doc.match(new RegExp(`"${key}": (\\[[^\\]]*\\])`));
+      const table = doc.match(new RegExp(`\\| \`${key}\` \\|[^\\n]*Currently \`(\\[[^\\]]*\\])\``));
+      expect(JSON.parse(example![1])).toEqual([...tokens]);
+      expect(JSON.parse(table![1])).toEqual([...tokens]);
+    },
+  );
 
   it('the handler serves exactly what the builder produces (single source of truth)', async () => {
     const res = await request(buildApp(apiKeys)).get('/api/v1/capabilities').set(AUTH);

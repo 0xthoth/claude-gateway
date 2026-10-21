@@ -22,7 +22,7 @@ function config(): [AgentConfig, GatewayConfig] {
   const workspace = path.join(base, 'agents', 'alfred', 'workspace');
   fs.mkdirSync(workspace, { recursive: true });
   const cfg: AgentConfig = { id: 'alfred', description: 'a', workspace, env: '', claude: { model: 'm', dangerouslySkipPermissions: true, extraFlags: [] } };
-  return [cfg, { gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', projects: { root: path.join(base, 'projects') } }, agents: [cfg] }];
+  return [cfg, { gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', files: { root: path.join(base, 'projects') } }, agents: [cfg] }];
 }
 
 beforeEach(() => {

@@ -87,11 +87,12 @@ import { isChatChannel } from '../history/types';
 import type { SkillLearningManager } from './skill-learning';
 import { spawnArchiveReindex } from './knowledge';
 import { resolveEnabledConnectors } from '../connectors/resolve';
-import { ProjectChatError, ProjectCwd, ProjectUnsupportedReason, projectUnavailableError, resolveProjectCwd, resolveProjectsRoot, sessionProjectView, SessionProjectView } from '../projects/chat';
-import { resolveProjectDir } from '../projects/fs';
+import { ProjectChatError, ProjectCwd, ProjectUnsupportedReason, projectUnavailableError, resolveProjectCwd, sessionProjectView, SessionProjectView } from '../projects/chat';
+import { resolveFilesRoot } from '../files/config';
+import { resolveDir } from '../files/fs';
 import { resolveOrchestrationConfig } from '../orchestration/config';
 import { resolveWorkerHarness } from '../orchestration/worker-harness';
-import { ProjectName } from '../projects/paths';
+import { EntryName, overlaps, RelPath } from '../files/paths';
 import { err, Result } from '../utils/result';
 
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 30;
@@ -515,10 +516,10 @@ export class AgentRunner extends EventEmitter {
     const binding = await this.apiSessionBinding(sessionId);
     if (binding.kind === 'unbound') return undefined;
     if (binding.kind === 'unreadable') return err({ code: 'project_unavailable', reason: 'internal' });
-    return this.resolveApiProject(binding.project as ProjectName);
+    return this.resolveApiProject(binding.project as EntryName);
   }
 
-  async resolveApiProject(name: ProjectName): Promise<Result<ProjectCwd, ProjectChatError>> {
+  async resolveApiProject(name: EntryName): Promise<Result<ProjectCwd, ProjectChatError>> {
     const reason = this.projectUnsupportedReason();
     if (reason) return err({ code: 'project_unsupported_agent', reason });
     return resolveProjectCwd(this.gatewayConfig, name);
@@ -5509,12 +5510,12 @@ export class AgentRunner extends EventEmitter {
   }
 
   /**
-   * A chat or task works in the folder `project` names, through any name or symlink alias: a live turn, a process
-   * still spawning, an accepted input not yet handled, or an unfinished task. Keyed on live work and on the
-   * folder, not on the session record, so deleting a session mid-turn does not unlock the project. An
-   * unreadable binding on a live session counts as active.
+   * A chat or task works in the real folder `dir`, in a folder inside it, or in one holding it, through any name or
+   * symlink alias: a live turn, a process still spawning, an accepted input not yet handled, or an unfinished task.
+   * Keyed on live work and on the folder, not on the session record, so deleting a session mid-turn does not unlock
+   * the folder. An unreadable binding on a live session counts as active.
    */
-  async hasActiveProjectTurn(project: string): Promise<boolean> {
+  async hasActiveWorkIn(dir: string): Promise<boolean> {
     const orchestratedLive = this.orchestration?.liveSessionIds() ?? new Set<string>();
     await this.reapRetiredBindings();
     const names = new Set<string>(this.orchestration?.activeTaskProjects() ?? []);
@@ -5523,13 +5524,10 @@ export class AgentRunner extends EventEmitter {
       if (binding.kind === 'unreadable') return true;
       if (binding.kind === 'bound') names.add(binding.project);
     }
-    if (names.has(project)) return true;
-    const root = resolveProjectsRoot(this.gatewayConfig);
-    const target = await resolveProjectDir(root, project as ProjectName);
-    if (!target.ok) return false;
+    const root = resolveFilesRoot(this.gatewayConfig);
     for (const name of names) {
-      const dir = await resolveProjectDir(root, name as ProjectName);
-      if (dir.ok && dir.value === target.value) return true;
+      const working = await resolveDir(root, name as string as RelPath);
+      if (working.ok && overlaps(working.value, dir)) return true;
     }
     return false;
   }
@@ -6031,7 +6029,7 @@ export class AgentRunner extends EventEmitter {
     return this.sessionStore.apiSessionExists(this.agentConfig.id, chatId, sessionId);
   }
 
-  async createApiSession(chatId: string, prompt?: string, name?: string, project?: ProjectName): Promise<import('../types').SessionMeta> {
+  async createApiSession(chatId: string, prompt?: string, name?: string, project?: EntryName): Promise<import('../types').SessionMeta> {
     const sessionName = name ?? (prompt
       ? (prompt.length > 60 ? `${prompt.slice(0, 60)}...` : prompt)
       : undefined);

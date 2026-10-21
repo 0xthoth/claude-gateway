@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { AgentOrchestrationRuntime } from '../../../src/orchestration/runtime';
 import { SessionStore } from '../../../src/session/store';
 import { HistoryDB } from '../../../src/history/db';
-import type { ProjectName } from '../../../src/projects/paths';
+import type { EntryName } from '../../../src/files/paths';
 import type { SessionProcess } from '../../../src/session/process';
 import type { AgentConfig, GatewayConfig } from '../../../src/types';
 
@@ -20,7 +20,7 @@ test('the deciding agent of a project chat is told its project in the stable sys
   const overlays = new Map<string, string[]>(), prompts: string[] = [];
   const runtime = await AgentOrchestrationRuntime.open(agent, gateway, dir, sessions, history, {
     skills: () => ({ skills: new Map(), cliSkills: [] } as any),
-    sessionProject: async scope => scope.agentSessionId === bound ? { ok: true, value: { name: 'demo' as ProjectName, dir: '/srv/projects/demo', trusted: false, identity: '1:1' } } : undefined,
+    sessionProject: async scope => scope.agentSessionId === bound ? { ok: true, value: { name: 'demo' as EntryName, dir: '/srv/projects/demo', trusted: false, identity: '1:1' } } : undefined,
     createAgentSession: async (id, profile) => Object.assign(new EventEmitter(), {
       start: async () => {}, stop: async () => {},
       sendMessage: function (this: EventEmitter, prompt: string) {

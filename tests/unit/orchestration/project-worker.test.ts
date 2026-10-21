@@ -8,7 +8,7 @@ import { TaskBridge } from '../../../src/orchestration/bridge';
 import { TaskWorkspaces } from '../../../src/orchestration/tasks/workspace';
 import { ClaudeWorkerDriver } from '../../../src/orchestration/tasks/driver';
 import { resolveProjectCwd } from '../../../src/projects/chat';
-import type { ProjectName } from '../../../src/projects/paths';
+import type { EntryName } from '../../../src/files/paths';
 import { AgentConfig, GatewayConfig } from '../../../src/types';
 
 // A real SessionProcess spawn of the mock CLI, which records its cwd and argv.
@@ -24,9 +24,9 @@ async function fixture(body: (run: Run) => Promise<void>, options: { trusted?: b
   const saved = { bin: process.env.CLAUDE_BIN, mode: process.env.MOCK_WORKER_MODE, args: process.env.MOCK_WORKER_ARGSFILE };
   Object.assign(process.env, { CLAUDE_BIN: `${process.execPath} ${MOCK}`, MOCK_WORKER_MODE: 'complete', MOCK_WORKER_ARGSFILE: argsfile });
   const agent = { id: 'a', workspace, description: 'fixture', env: '', claude: { model: options.model ?? 'fixture', extraFlags: [] }, orchestration: { tasks: { workspaceMode: 'host' } } } as unknown as AgentConfig;
-  const gateway = { gateway: { headless: true, timezone: 'UTC', logDir: join(root, 'logs'), projects: { root: join(root, 'projects'), trusted: options.trusted ? ['demo'] : [] } }, agents: [agent] } as unknown as GatewayConfig;
+  const gateway = { gateway: { headless: true, timezone: 'UTC', logDir: join(root, 'logs'), files: { root: join(root, 'projects'), trusted: options.trusted ? ['demo'] : [] } }, agents: [agent] } as unknown as GatewayConfig;
   const store = new OrchestrationStore(':memory:', 'a');
-  const tasks = new TaskService(store, agent.orchestration, workspace, async () => resolveProjectCwd(gateway, 'demo' as ProjectName));
+  const tasks = new TaskService(store, agent.orchestration, workspace, async () => resolveProjectCwd(gateway, 'demo' as EntryName));
   const bridge = new TaskBridge(tasks);
   try {
     await bridge.start();

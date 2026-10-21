@@ -31,7 +31,7 @@ import { TaskService } from './service';
 import { TaskWorkspaces } from './workspace';
 import { TaskAttempt, TaskSnapshot, OrchestrationError } from '../types';
 import { resolveInProject, resolveProjectCwd, type ProjectCwd } from '../../projects/chat';
-import type { ProjectName } from '../../projects/paths';
+import type { EntryName } from '../../files/paths';
 import { WorkerDriver, WorkerHandle } from './scheduler';
 import { startProcessTurn } from '../process-turn';
 import { randomUUID } from 'crypto';
@@ -64,7 +64,7 @@ async function startProject(gateway: GatewayConfig, task: TaskSnapshot): Promise
   if (!task.project) return undefined;
   if (task.resourceProfile?.mode !== 'host') throw new OrchestrationError('PROJECT_UNSUPPORTED_AGENT', 'Project tasks run only in host workspace mode. No worker was started.');
   const root = task.resourceProfile?.projectRoot ?? '';
-  const project = await resolveProjectCwd(gateway, task.project as ProjectName);
+  const project = await resolveProjectCwd(gateway, task.project as EntryName);
   const dir = project.ok ? await resolveInProject(project.value.dir, root) : undefined;
   if (!project.ok || !dir?.ok || dir.value !== root) throw new OrchestrationError('PROJECT_UNAVAILABLE', 'The chat\'s project folder is no longer available. No worker was started.');
   return project.value;

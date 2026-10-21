@@ -44,7 +44,7 @@ import { SessionProcess } from '../../src/session/process';
 import { sandboxContainerName } from '../../src/apps/conversation-sandbox';
 import { SessionStore } from '../../src/session/store';
 import { chatMemoryDir } from '../../src/agent/workspace-loader';
-import type { ProjectName } from '../../src/projects/paths';
+import type { EntryName } from '../../src/files/paths';
 import { ok } from '../../src/utils/result';
 import { AgentConfig, GatewayConfig } from '../../src/types';
 
@@ -283,7 +283,7 @@ describe('API sessions', () => {
     fs.mkdirSync(folder, { recursive: true });
     const bound = (isolate: boolean): SessionProcess => {
       const sp = new SessionProcess(`sess-${isolate}`, 'api', agent(isolate), gateway, store, undefined, undefined, 'web-chat');
-      sp.projectResolver = async () => ok({ name: 'site' as ProjectName, dir: folder, trusted: false, identity: '1:1' });
+      sp.projectResolver = async () => ok({ name: 'site' as EntryName, dir: folder, trusted: false, identity: '1:1' });
       return sp;
     };
     const isolated = (await start(bound(true))).args;

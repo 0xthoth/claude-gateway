@@ -19,7 +19,7 @@ import { withConfigWriteLock, writeConfigAtomic } from '../config/config-write-l
 import { createApiAuthMiddleware, canAccessAgent, canWriteAgent, isAdmin } from './auth';
 import { guardAsyncRoutes } from './async-guard';
 import { PROJECT_CHAT_ERRORS } from '../projects/chat';
-import { parseProjectName, ProjectName } from '../projects/paths';
+import { parseEntryName, EntryName } from '../files/paths';
 import { MediaStore } from '../history/media-store';
 import { SESSION_ID_RE } from '../session/store';
 import { isInsideAnyDir, sessionMediaDirs } from '../share/share-store';
@@ -4517,11 +4517,11 @@ export function createApiRouter(
     const body = req.body as { prompt?: unknown; name?: unknown; project?: unknown };
     const promptText = typeof body.prompt === 'string' ? body.prompt.trim() : undefined;
     const explicitName = typeof body.name === 'string' ? body.name.trim() : undefined;
-    let project: ProjectName | undefined;
+    let project: EntryName | undefined;
     // Clients serialize an unset optional field as null.
     if (body.project !== undefined && body.project !== null) {
       if (!canWriteAgent((req as AuthedRequest).apiKey, agentId)) { res.status(403).json({ error: 'Write permission required' }); return; }
-      const name = parseProjectName(body.project);
+      const name = parseEntryName(body.project);
       if (!name.ok) { res.status(400).json({ error: 'Invalid project name', code: name.error }); return; }
       const bound = await runner.resolveApiProject(name.value);
       if (!bound.ok) {

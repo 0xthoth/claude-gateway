@@ -43,7 +43,7 @@ async function start(keys: ApiKey[]): Promise<void> {
   fs.mkdirSync(brucesWorkspace, { recursive: true });
   const bruce: AgentConfig = { ...cfg, id: 'bruce', workspace: brucesWorkspace };
   const gateway: GatewayConfig = {
-    gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', orchestration: false, publicUrl: 'https://gw.example', api: { keys }, projects: { root: path.join(base, 'projects') } },
+    gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', orchestration: false, publicUrl: 'https://gw.example', api: { keys }, files: { root: path.join(base, 'projects') } },
     agents: [cfg, bruce],
   };
   runner = new AgentRunner(cfg, gateway);

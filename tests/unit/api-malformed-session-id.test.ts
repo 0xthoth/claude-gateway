@@ -49,7 +49,7 @@ beforeEach(() => {
   fs.mkdirSync(path.join(base, 'projects', 'site'), { recursive: true });
   const cfg: AgentConfig = { id: 'alfred', description: 'a', workspace, env: '', claude: { model: 'm', dangerouslySkipPermissions: true, extraFlags: [] } };
   const gateway: GatewayConfig = {
-    gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, projects: { root: path.join(base, 'projects') } },
+    gateway: { logDir: path.join(base, 'logs'), timezone: 'UTC', api: { keys: Object.values(KEYS) }, files: { root: path.join(base, 'projects') } },
     agents: [cfg],
   };
   fs.writeFileSync(path.join(base, 'config.json'), JSON.stringify(gateway));

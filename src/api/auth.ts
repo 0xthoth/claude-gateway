@@ -75,4 +75,4 @@ export function isAdmin(apiKey: ApiKey): boolean {
 }
 
 /** The 403 body for creating, starting, stopping or deleting a project without an admin key. */
-export const PROJECTS_ADMIN_REQUIRED = { error: 'An admin API key is required for Projects', code: 'forbidden_key' } as const;
+export const ADMIN_KEY_REQUIRED = { error: 'An admin API key is required', code: 'forbidden_key' } as const;

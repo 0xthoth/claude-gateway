@@ -2,7 +2,7 @@ import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import { err, ok, Result } from '../utils/result';
-import { redactCredentials } from './git-status';
+import { redactCredentials } from './status';
 import type { Logger } from '../types';
 
 export const GIT_READ_TIMEOUT_MS = 3_000;
@@ -89,7 +89,7 @@ const EXIT_DRAIN_MS = 200;
 const KILL_GRACE_MS = 1_000;
 
 /**
- * Runs git in the project dir `cwd`. Discovery stops at `cwd`, so a folder inside some
+ * Runs git in the folder `cwd`. Discovery stops at `cwd`, so a folder inside some
  * other repository never reads as a repo itself.
  */
 export async function runGit(cwd: string, args: string[], opts: RunOptions): Promise<Result<GitOutput, GitRunFailure>> {
@@ -131,11 +131,11 @@ export async function runGit(cwd: string, args: string[], opts: RunOptions): Pro
       if ((e as NodeJS.ErrnoException).code === 'ENOENT' && existsSync(cwd)) {
         if (!warnedGitMissing) {
           warnedGitMissing = true;
-          opts.logger.warn('projects: git is not installed or not on PATH, so project git status is unavailable');
+          opts.logger.warn('git: git is not installed or not on PATH, so git status is unavailable');
         }
         return settle(err('git_unavailable'));
       }
-      opts.logger.warn(`projects: git ${args[0]} in ${cwd} failed: ${redactCredentials(e.message)}`);
+      opts.logger.warn(`git: git ${args[0]} in ${cwd} failed: ${redactCredentials(e.message)}`);
       settle(err('git_failed'));
     });
     const finish = (code: number | null) => {

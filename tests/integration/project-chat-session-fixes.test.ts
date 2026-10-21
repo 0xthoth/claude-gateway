@@ -1,5 +1,5 @@
 /**
- * Project-scoped API chat: a session bound to one folder under gateway.projects.root.
+ * Project-scoped API chat: a session bound to one folder under gateway.files.root.
  * Real AgentRunner, real filesystem, real HTTP through GatewayRouter.
  */
 import { execFileSync } from 'child_process';
@@ -54,7 +54,7 @@ async function harness(opts: { trusted?: string[]; orchestration?: boolean; extr
       timezone: 'UTC',
       orchestration: opts.orchestration ?? false,
       api: { keys: Object.values(KEYS) },
-      projects: { root, ...(opts.trusted ? { trusted: opts.trusted } : {}) },
+      files: { root, ...(opts.trusted ? { trusted: opts.trusted } : {}) },
     },
     agents: [],
   };
@@ -135,11 +135,11 @@ describe('project chat session fixes', () => {
     jest.spyOn(chat, 'projectContext').mockImplementation(async (...a) => { entered(); await gate; return orig(...a); });
     const turn = send(h, sid, 'a').then((r) => r, (e: unknown) => e);
     await inCtx;
-    const del = await supertest(h.app).delete('/api/v1/projects/site').set(auth(KEYS.admin!)).send({ confirm: 'site' });
+    const del = await supertest(h.app).delete('/api/v1/files').set(auth(KEYS.admin!)).send({ path: 'site', confirm: 'site' });
     release();
     await turn;
     expect(del.status).toBe(409);
-    expect(del.body.code).toBe('project_running');
+    expect(del.body.code).toBe('in_use');
     expect(fs.existsSync(path.join(h.root, 'site'))).toBe(true);
   }, 30000);
 
@@ -178,7 +178,7 @@ describe('project chat session fixes', () => {
     const sid = await projectSession(h);
     await send(h, sid, 'a');
     expect(flagValue(spawns(h)[0]!.argv, '--setting-sources')).toBeUndefined();
-    (h.runners[0] as any).gatewayConfig.gateway.projects.trusted = [];
+    (h.runners[0] as any).gatewayConfig.gateway.files.trusted = [];
     await send(h, sid, 'b');
     expect(spawns(h)).toHaveLength(2);
     expect(flagValue(spawns(h)[1]!.argv, '--setting-sources')).toBe('user');

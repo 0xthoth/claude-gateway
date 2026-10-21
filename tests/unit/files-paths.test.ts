@@ -1,26 +1,58 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { parseProjectName, resolveInside } from '../../src/projects/paths';
+import { overlaps, parseEntryName, parseRelPath, resolveInside } from '../../src/files/paths';
 
-describe('parseProjectName', () => {
+describe('parseEntryName', () => {
   it.each(['app', 'my-app_1.2', 'A', 'a'.repeat(64)])('accepts %p', (name) => {
-    expect(parseProjectName(name)).toEqual({ ok: true, value: name });
+    expect(parseEntryName(name)).toEqual({ ok: true, value: name });
   });
 
   it.each(['../x', 'a/b', '.', '..', 'a'.repeat(65), '', '.hidden', '-x', 'a b', 'a\\b', 'a\0b', 42, undefined])(
     'rejects %p',
     (name) => {
-      expect(parseProjectName(name)).toEqual({ ok: false, error: 'invalid_name' });
+      expect(parseEntryName(name)).toEqual({ ok: false, error: 'invalid_name' });
     },
   );
+});
+
+describe('parseRelPath', () => {
+  it.each(['', 'app', 'app/node_modules', 'a/b.c/d-e_f', Array(32).fill('a').join('/')])('accepts %p', (rel) => {
+    expect(parseRelPath(rel)).toEqual({ ok: true, value: rel });
+  });
+
+  it.each(['/etc', 'app/', '/', 'a//b', Array(33).fill('a').join('/'), 42, null, undefined, ['app'], { path: 'app' }])(
+    'refuses %p as invalid_path',
+    (rel) => {
+      expect(parseRelPath(rel)).toEqual({ ok: false, error: 'invalid_path' });
+    },
+  );
+
+  it.each(['..', '../x', 'app/..', 'app/../../etc', '.', 'app/./x', 'app/.git', 'app/.deleting-x', '%2e%2e', 'a\\b', 'a b/c', 'app/a\0b'])(
+    'refuses %p as invalid_name, so no segment can climb out or reach a dot entry',
+    (rel) => {
+      expect(parseRelPath(rel)).toEqual({ ok: false, error: 'invalid_name' });
+    },
+  );
+});
+
+describe('overlaps', () => {
+  it.each([
+    ['/r/app', '/r/app', true],
+    ['/r/app', '/r/app/node_modules', true],
+    ['/r/app/node_modules', '/r/app', true],
+    ['/r/app', '/r/app2', false],
+    ['/r/app', '/r/other', false],
+  ])('%s and %s: %s', (a, b, want) => {
+    expect(overlaps(a, b)).toBe(want);
+  });
 });
 
 describe('resolveInside', () => {
   let root: string;
 
   beforeEach(() => {
-    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-paths-')));
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'files-paths-')));
     fs.mkdirSync(path.join(root, 'proj'));
     fs.writeFileSync(path.join(root, 'proj', 'a.txt'), 'a');
   });

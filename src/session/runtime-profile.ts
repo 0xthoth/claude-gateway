@@ -29,7 +29,7 @@ export interface RuntimeProfile {
   /** Explicit execution tool set resolved by gateway policy. */
   workerTools?: string[];
   hostExecution?: boolean;
-  /** A host worker in a project not in gateway.projects.trusted: the repo's hooks, MCP servers and settings must not load. */
+  /** A host worker in a folder not in gateway.files.trusted: the repo's hooks, MCP servers and settings must not load. */
   untrustedProject?: boolean;
   containerExecution?: boolean;
   /** Captured optional evaluation-tool inventory for this process; permissions remain live. */

@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 const config = (root: string, trusted: string[]) =>
-  ({ gateway: { logDir: base, projects: { root, trusted } }, agents: [] }) as unknown as GatewayConfig;
+  ({ gateway: { logDir: base, files: { root, trusted } }, agents: [] }) as unknown as GatewayConfig;
 
 describe('projectTrusted', () => {
   it.each([

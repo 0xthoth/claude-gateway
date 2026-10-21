@@ -2,7 +2,7 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { GitOutput, runGit } from '../../src/projects/git-runner';
+import { GitOutput, runGit } from '../../src/git/runner';
 import { err, Result } from '../../src/utils/result';
 import { silentLogger } from '../helpers/silent-logger';
 
@@ -12,7 +12,7 @@ let base: string;
 let repo: string;
 
 beforeEach(() => {
-  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-git-runner-')));
+  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-')));
   repo = path.join(base, 'repo');
   fs.mkdirSync(repo);
   execFileSync('git', ['init', '-q', '-b', 'main', repo]);
@@ -111,7 +111,7 @@ describe('runGit', () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
-  it('does not discover a repository above the project dir', async () => {
+  it('does not discover a repository above the folder it runs in', async () => {
     const plain = path.join(repo, 'plain');
     fs.mkdirSync(plain);
     const r = value(await runGit(plain, ['rev-parse', '--show-toplevel'], { logger: silentLogger, timeoutMs: 3000 }));

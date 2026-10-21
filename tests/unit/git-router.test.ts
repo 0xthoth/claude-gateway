@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
-import { createProjectsRouter } from '../../src/api/projects-router';
+import { createFilesRouter } from '../../src/api/files-router';
 import type { ApiKey } from '../../src/types';
 import { silentLogger } from '../helpers/silent-logger';
 
@@ -72,13 +72,14 @@ function commitUpstream(file: string, content: string): void {
   git(other, 'push', '-q', 'origin', 'main');
 }
 
-const status = (name: string, key = POD) => request(app).get(`/api/v1/projects/${name}/git`).set(key);
+const status = (name: string, key = POD) => request(app).get('/api/v1/git/status').query({ path: name }).set(key);
+const summaryOf = (rel = '', key = POD) => request(app).get('/api/v1/git/summary').query({ path: rel }).set(key);
 
 let warn: jest.Mock;
 
 beforeEach(() => {
   warn = jest.fn();
-  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-git-')));
+  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-router-')));
   root = path.join(base, 'projects');
   remote = path.join(base, 'remote.git');
   fs.mkdirSync(root);
@@ -88,7 +89,7 @@ beforeEach(() => {
   fs.mkdirSync(process.env.HOME);
   app = express();
   app.use(express.json());
-  app.use('/api', createProjectsRouter(apiKeys, root, { logger: { ...silentLogger, warn } }));
+  app.use('/api', createFilesRouter(apiKeys, root, { logger: { ...silentLogger, warn } }));
 });
 
 afterEach(() => {
@@ -96,7 +97,7 @@ afterEach(() => {
   fs.rmSync(base, { recursive: true, force: true });
 });
 
-describe('GET /api/v1/projects/:name/git', () => {
+describe('GET /api/v1/git/status', () => {
   it('reports a clean repo in sync with its upstream', async () => {
     addRemote(makeRepo('app'));
     const res = await status('app');
@@ -196,7 +197,7 @@ describe('GET /api/v1/projects/:name/git', () => {
     fs.symlinkSync(outside, path.join(root, 'escape'));
     const res = await status('escape');
     expect([res.status, res.body.code]).toEqual([403, 'path_escape']);
-    const summary = await request(app).get('/api/v1/projects/git-summary').set(POD);
+    const summary = await summaryOf();
     expect(summary.body.summaries).toEqual({});
   });
 
@@ -204,11 +205,11 @@ describe('GET /api/v1/projects/:name/git', () => {
     makeRepo('app');
     expect((await status('app', as('k-pod-read'))).status).toBe(200);
     expect((await status('app', as('k-agent'))).status).toBe(200);
-    expect((await request(app).get('/api/v1/projects/git-summary').set(as('k-agent'))).status).toBe(200);
+    expect((await summaryOf('', as('k-agent'))).status).toBe(200);
   });
 });
 
-describe('GET /api/v1/projects/git-summary', () => {
+describe('GET /api/v1/git/summary', () => {
   it('summarises every repository, omits plain folders, and nulls a repo whose status times out', async () => {
     addRemote(makeRepo('app'));
     fs.mkdirSync(path.join(root, 'plain'));
@@ -218,7 +219,7 @@ describe('GET /api/v1/projects/git-summary', () => {
     execFileSync('mkfifo', [fifo]);
     git(slow, 'config', 'include.path', fifo);
 
-    const res = await request(app).get('/api/v1/projects/git-summary').set(POD);
+    const res = await summaryOf();
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       summaries: {
@@ -268,7 +269,7 @@ describe('git-summary counts', () => {
   it('counts an untracked folder once, while the detail status lists every file in it', async () => {
     const dir = makeRepo('app');
     for (const f of ['a', 'b', 'c']) write(path.join(dir, 'build', f), f);
-    const summary = await request(app).get('/api/v1/projects/git-summary').set(POD);
+    const summary = await summaryOf();
     expect(summary.body.summaries.app.change_count).toBe(1);
     expect((await status('app')).body.change_count).toBe(3);
   });
@@ -316,8 +317,27 @@ describe('a clone of an empty remote', () => {
 describe('git write routes', () => {
   it.each(['init', 'fetch', 'identity', 'commit', 'pull', 'push'])('POST git/%s is not served', async (action) => {
     makeRepo('app');
-    const res = await request(app).post(`/api/v1/projects/app/git/${action}`).set(POD).send({});
+    const res = await request(app).post(`/api/v1/git/${action}`).query({ path: 'app' }).set(POD).send({});
     expect(res.status).toBe(404);
+  });
+});
+
+describe('paths', () => {
+  it('refuses the root itself with 400 invalid_path, and a traversal with 400 invalid_name', async () => {
+    git(root, 'init', '-q');
+    expect([(await status('')).status, (await status('')).body.code]).toEqual([400, 'invalid_path']);
+    for (const rel of ['..', '../outside', 'app/../..']) expect([rel, (await status(rel)).body.code]).toEqual([rel, 'invalid_name']);
+  });
+
+  it('reads a repository nested in a folder, and summarises the children of a nested path', async () => {
+    fs.mkdirSync(path.join(root, 'group'));
+    makeRepo('group/one');
+    fs.mkdirSync(path.join(root, 'group', 'plain'));
+    const res = await status('group/one');
+    expect([res.status, res.body.branch]).toEqual([200, 'main']);
+    const summary = await summaryOf('group');
+    expect([summary.status, Object.keys(summary.body.summaries)]).toEqual([200, ['one']]);
+    expect((await summaryOf()).body.summaries).toEqual({});
   });
 });
 
@@ -331,7 +351,7 @@ describe('git missing from PATH', () => {
     const detail = await status('app');
     expect([detail.status, detail.body.code]).toEqual([503, 'git_unavailable']);
     expect(detail.body.error).toMatch(/git is not installed/i);
-    const summary = await request(app).get('/api/v1/projects/git-summary').set(POD);
+    const summary = await summaryOf();
     expect([summary.status, summary.body.code]).toEqual([503, 'git_unavailable']);
     await status('web');
     expect(warn.mock.calls.filter(([m]) => String(m).includes('git is not installed'))).toHaveLength(1);

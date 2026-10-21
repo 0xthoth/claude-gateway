@@ -1,7 +1,7 @@
 import { promises as fsp } from 'fs';
 import * as path from 'path';
-import { listProjects, mapLimit, resolveProjectDir } from './fs';
-import { GIT_READ_TIMEOUT_MS, GitOutput, MAX_BLANKED_FILTER_KEYS, MAX_FILTER_KEY, RunOptions, runGit } from './git-runner';
+import { listDir, mapLimit, resolveDir } from '../files/fs';
+import { GIT_READ_TIMEOUT_MS, GitOutput, MAX_BLANKED_FILTER_KEYS, MAX_FILTER_KEY, RunOptions, runGit } from './runner';
 import {
   buildStatus,
   GitCommitInfo,
@@ -12,8 +12,8 @@ import {
   parseConfigList,
   parseStatusV2,
   toSummary,
-} from './git-status';
-import { ProjectName, ProjectsErrorCode } from './paths';
+} from './status';
+import { FilesErrorCode, RelPath } from '../files/paths';
 import type { Logger } from '../types';
 import { err, ok, Result } from '../utils/result';
 
@@ -28,11 +28,11 @@ export type GitErrorCode =
   | 'git_unavailable'
   | 'git_failed';
 
-export type GitError = { code: GitErrorCode | ProjectsErrorCode };
+export type GitError = { code: GitErrorCode | FilesErrorCode };
 
 export type GitResult<T> = Result<T, GitError>;
 
-const fail = (code: GitErrorCode | ProjectsErrorCode) => err({ code });
+const fail = (code: GitErrorCode | FilesErrorCode) => err({ code });
 
 const SUMMARY_CONCURRENCY = 4;
 const COMMIT_FORMAT = '%H%x00%s%x00%an%x00%cI';
@@ -128,34 +128,33 @@ async function unbornBehind(dir: string, opts: RunOptions): Promise<number> {
   return count.ok && count.value.code === 0 ? Number(count.value.stdout.trim()) || 0 : 0;
 }
 
-export async function projectDir(root: string, name: ProjectName): Promise<GitResult<string>> {
-  const dir = await resolveProjectDir(root, name);
-  return dir.ok ? dir : fail(dir.error);
+/** The detailed read: every untracked file, the last commit and any operation in progress. `dir` must be a real folder under the root. */
+export function readStatus(dir: string, logger: Logger): Promise<GitResult<GitStatus>> {
+  return readRepo(dir, DETAIL_READ, logger);
 }
 
-async function readStatus(root: string, name: ProjectName, read: ReadOptions, logger: Logger): Promise<GitResult<GitStatus>> {
-  const dir = await projectDir(root, name);
-  if (!dir.ok) return dir;
-  return readRepo(dir.value, read, logger);
+/** The cheaper read for a summary or a chat's context note: an untracked folder counts once, and no last commit or operation. */
+export function readStatusSummary(dir: string, logger: Logger): Promise<GitResult<GitStatus>> {
+  return readRepo(dir, SUMMARY_READ, logger);
 }
 
-export function getStatus(root: string, name: ProjectName, logger: Logger): Promise<GitResult<GitStatus>> {
-  return readStatus(root, name, DETAIL_READ, logger);
+/** Git status of the folder `rel` names under `root`. The root itself is refused. */
+export async function getStatus(root: string, rel: RelPath, logger: Logger): Promise<GitResult<GitStatus>> {
+  const dir = await resolveDir(root, rel);
+  return dir.ok ? readStatus(dir.value, logger) : fail(dir.error);
 }
 
-/** The cheaper read for a chat's context note: an untracked folder counts once, no secret check needs its files, and no last commit or operation. */
-export function getStatusSummary(root: string, name: ProjectName, logger: Logger): Promise<GitResult<GitStatus>> {
-  return readStatus(root, name, SUMMARY_READ, logger);
-}
-
-/** Every project with a `.git`; null when its status timed out or failed. Non-git folders are left out. */
-export async function getSummaries(root: string, logger: Logger): Promise<GitResult<{ summaries: Record<string, GitSummary | null> }>> {
-  const list = await listProjects(root);
+/** Every folder directly under `rel` with a `.git`, keyed by name; null when its status timed out or failed. Others are left out. */
+export async function getSummaries(root: string, rel: RelPath, logger: Logger): Promise<GitResult<{ summaries: Record<string, GitSummary | null> }>> {
+  const list = await listDir(root, rel);
   if (!list.ok) return fail(list.error);
-  const repos = list.value.projects.filter((p) => p.is_git);
-  const reads = await mapLimit(repos, SUMMARY_CONCURRENCY, (p) => readStatus(root, p.name, SUMMARY_READ, logger));
+  const repos = list.value.entries.filter((e) => e.is_git);
+  const reads = await mapLimit(repos, SUMMARY_CONCURRENCY, async (e) => {
+    const dir = await resolveDir(root, e.path);
+    return dir.ok ? readStatusSummary(dir.value, logger) : fail(dir.error);
+  });
   const noGit = reads.find((r) => !r.ok && r.error.code === 'git_unavailable');
   if (noGit && !noGit.ok) return fail(noGit.error.code);
   const results = reads.map((r) => (r.ok ? toSummary(r.value) : null));
-  return ok({ summaries: Object.fromEntries(repos.map((p, i) => [p.name, results[i]])) });
+  return ok({ summaries: Object.fromEntries(repos.map((e, i) => [e.name, results[i]])) });
 }

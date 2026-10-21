@@ -507,17 +507,17 @@ export interface GatewayConfig {
       keys: ApiKey[];
     };
     /**
-     * Pod-wide root the Projects API lists (default `~/projects`). Distinct
+     * The one pod-wide root the files and git API serves (default `~/projects`). Distinct
      * from an agent's `orchestration.tasks.projectRoot`, which is one repo per agent.
      */
-    projects?: {
+    files?: {
       root?: string;
-      /** false leaves the Projects API unmounted; loadConfig sets it when the default root would expose HOME or the config dir. */
+      /** false leaves the files and git API unmounted; loadConfig sets it when the default root would expose HOME or the config dir. */
       enabled?: boolean;
       /**
-       * Project names whose own `.claude/` settings, hooks, `.mcp.json` and
-       * CLAUDE.md load in project-bound chats. Every other project runs with
-       * `--setting-sources user`.
+       * Names of folders directly under the root whose own `.claude/` settings,
+       * hooks, `.mcp.json` and CLAUDE.md load in chats bound to that folder.
+       * Every other folder runs with `--setting-sources user`.
        */
       trusted?: string[];
     };

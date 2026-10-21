@@ -4,7 +4,7 @@ import { CHAT_CHANNELS, type ChatChannel } from '../history/types';
 import { createApiAuthMiddleware, isAdmin } from './auth';
 import { GATEWAY_VERSION } from './gateway-version';
 import { gatewayOrchestrationEnabled } from '../orchestration/gateway-config';
-import { projectsEnabled } from '../projects/chat';
+import { filesEnabled } from '../files/config';
 import type { GatewayConfig } from '../types';
 
 /**
@@ -41,48 +41,66 @@ import type { GatewayConfig } from '../types';
 export const CROSS_CHANNEL_MESSAGE_CHANNELS: readonly ChatChannel[] = [...CHAT_CHANNELS];
 
 /**
- * Project operations served by projects-router.ts. Clients gate listing on `includes('list')`, the git routes on
- * `includes('git')`, project-bound chat on `includes('chat')`, creating a project on `includes('create')`, and deleting
- * one on `includes('delete')`. The gateway serves no project files; they are viewed in code-server.
+ * Folder operations served by files-router.ts under the one files root. Clients gate listing on `includes('list')`,
+ * `POST /v1/files/mkdir` on `includes('create')` and `DELETE /v1/files` on `includes('delete')`. The gateway serves no
+ * file contents; they are viewed in code-server.
  */
-export const PROJECTS_CAPABILITIES = ['list', 'create', 'git', 'chat', 'delete'] as const;
-export type ProjectsCapability = (typeof PROJECTS_CAPABILITIES)[number];
+export const FILES_CAPABILITIES = ['list', 'create', 'delete'] as const;
+export type FilesCapability = (typeof FILES_CAPABILITIES)[number];
 
-/** The operations projects-router.ts serves only to an admin key; every other token is open to any key. */
-export const PROJECTS_ADMIN_CAPABILITIES: ReadonlySet<ProjectsCapability> = new Set(['create', 'delete']);
+/** The operations files-router.ts serves only to an admin key; every other token is open to any key. */
+export const FILES_ADMIN_CAPABILITIES: ReadonlySet<FilesCapability> = new Set(['create', 'delete']);
+
+/** Read-only git routes served by files-router.ts: `GET /v1/git/status` and `GET /v1/git/summary`. */
+export const GIT_CAPABILITIES = ['status', 'summary'] as const;
+export type GitCapability = (typeof GIT_CAPABILITIES)[number];
+
+/**
+ * `chat`: `POST /v1/agents/:agentId/sessions` accepts `project`, the name of a folder directly under the files root,
+ * and runs the chat there. It is accepted through the queued-admission path, which needs orchestration.
+ */
+export const PROJECTS_CAPABILITIES = ['chat'] as const;
+export type ProjectsCapability = (typeof PROJECTS_CAPABILITIES)[number];
 
 export interface CapabilitiesResponse {
   /** Gateway version from package.json. Informational — clients should key off `capabilities`, not parse this. */
   version: string;
   capabilities: {
     cross_channel_message: ChatChannel[];
+    files: FilesCapability[];
+    git: GitCapability[];
     projects: ProjectsCapability[];
   };
-  /** Why `projects` is empty; absent when Projects is usable. */
-  projectsUnavailable?: ProjectsUnavailable;
+  /** Why `files`, `git` and `projects` are empty; absent when the files API is usable. */
+  filesUnavailable?: FilesUnavailable;
 }
 
-/** `disabled`: the gateway serves no Projects API. */
-export type ProjectsUnavailable = 'disabled';
+/** `disabled`: the gateway serves no files or git API. */
+export type FilesUnavailable = 'disabled';
+
+type FilesAvailability = Pick<CapabilitiesResponse['capabilities'], 'files' | 'git' | 'projects'> & { filesUnavailable?: FilesUnavailable };
 
 /**
- * The tokens `apiKey` may use. Project-bound chat is accepted through the queued-admission path, which needs
- * orchestration, so a gateway with orchestration off does not advertise `chat`. A non-admin key gets every token but
- * the admin-only ones. Without a config or a key (tests) the gateway-wide answer is given.
+ * The tokens `apiKey` may use. A non-admin key gets every token but the admin-only ones. A gateway with orchestration
+ * off does not advertise `chat`. Without a config or a key (tests) the gateway-wide answer is given.
  */
-export function projectsAvailability(config?: GatewayConfig, apiKey?: ApiKey): { projects: ProjectsCapability[]; projectsUnavailable?: ProjectsUnavailable } {
-  if (config && !projectsEnabled(config)) return { projects: [], projectsUnavailable: 'disabled' };
+export function filesAvailability(config?: GatewayConfig, apiKey?: ApiKey): FilesAvailability {
+  if (config && !filesEnabled(config)) return { files: [], git: [], projects: [], filesUnavailable: 'disabled' };
   const orchestrated = !config || gatewayOrchestrationEnabled(config.gateway.orchestration);
   const admin = !apiKey || isAdmin(apiKey);
-  return { projects: PROJECTS_CAPABILITIES.filter((c) => (c !== 'chat' || orchestrated) && (admin || !PROJECTS_ADMIN_CAPABILITIES.has(c))) };
+  return {
+    files: FILES_CAPABILITIES.filter((c) => admin || !FILES_ADMIN_CAPABILITIES.has(c)),
+    git: [...GIT_CAPABILITIES],
+    projects: orchestrated ? [...PROJECTS_CAPABILITIES] : [],
+  };
 }
 
 export function buildCapabilitiesResponse(version: string = GATEWAY_VERSION, config?: GatewayConfig, apiKey?: ApiKey): CapabilitiesResponse {
-  const { projects, projectsUnavailable } = projectsAvailability(config, apiKey);
+  const { filesUnavailable, ...tokens } = filesAvailability(config, apiKey);
   return {
     version,
-    capabilities: { cross_channel_message: [...CROSS_CHANNEL_MESSAGE_CHANNELS], projects },
-    ...(projectsUnavailable ? { projectsUnavailable } : {}),
+    capabilities: { cross_channel_message: [...CROSS_CHANNEL_MESSAGE_CHANNELS], ...tokens },
+    ...(filesUnavailable ? { filesUnavailable } : {}),
   };
 }
 

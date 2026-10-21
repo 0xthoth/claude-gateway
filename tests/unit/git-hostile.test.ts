@@ -4,13 +4,13 @@ import * as http from 'http';
 import { AddressInfo } from 'net';
 import * as os from 'os';
 import * as path from 'path';
-import { createProject } from '../../src/projects/fs';
-import { getStatus, getSummaries } from '../../src/projects/git';
-import { parseProjectName, ProjectName } from '../../src/projects/paths';
+import { makeDir } from '../../src/files/fs';
+import { getStatus, getSummaries } from '../../src/git/read';
+import { parseRelPath, RelPath } from '../../src/files/paths';
 import { silentLogger } from '../helpers/silent-logger';
 
 /**
- * A project folder is untrusted: it may have been cloned from anywhere. Every fixture here plants a command that
+ * A folder under the root is untrusted: it may have been cloned from anywhere. Every fixture here plants a command that
  * touches a marker file, and each test asserts that the marker is absent after the gateway has read the repository.
  * `controlRuns` first proves the plant works, by running plain git on it.
  */
@@ -22,8 +22,8 @@ let script: string;
 let filterScript: string;
 const savedEnv = { ...process.env };
 
-const name = (n: string): ProjectName => {
-  const r = parseProjectName(n);
+const name = (n: string): RelPath => {
+  const r = parseRelPath(n);
   if (!r.ok) throw new Error(n);
   return r.value;
 };
@@ -82,14 +82,14 @@ async function controlRuns(dir: string, ...args: string[]): Promise<boolean> {
 async function gatewayRuns(n: string) {
   reset();
   const detail = await getStatus(root, name(n), silentLogger);
-  const summary = await getSummaries(root, silentLogger);
+  const summary = await getSummaries(root, name(''), silentLogger);
   const ran = planted();
   reset();
   return { ran, detail, summary };
 }
 
 beforeEach(() => {
-  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'projects-git-hostile-')));
+  base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-hostile-')));
   root = path.join(base, 'projects');
   fs.mkdirSync(root);
   marker = path.join(base, 'ran');
@@ -273,7 +273,7 @@ describe('filter drivers the repository defines', () => {
     git(dir, 'config', `filter.${'x'.repeat(2000)}.clean`, filterScript);
     const res = await getStatus(root, name('bad'), silentLogger);
     expect(res).toEqual({ ok: false, error: { code: 'git_unreadable' } });
-    const summary = await getSummaries(root, silentLogger);
+    const summary = await getSummaries(root, name(''), silentLogger);
     expect(summary).toMatchObject({ ok: true, value: { summaries: { good: expect.objectContaining({ branch: 'main' }), bad: null } } });
   });
 
@@ -333,7 +333,7 @@ describe('filter drivers the repository defines', () => {
     filterConfig(dir);
     attributes(dir);
     touchAll(dir);
-    const summary = await getSummaries(root, silentLogger);
+    const summary = await getSummaries(root, name(''), silentLogger);
     expect(planted()).toBe(false);
     expect(summary).toMatchObject({ ok: true, value: { summaries: { good: expect.objectContaining({ branch: 'main' }), evil: expect.objectContaining({ branch: 'main' }) } } });
   });
@@ -419,7 +419,7 @@ describe('errors that say what is wrong', () => {
   it('keeps the list working: the other-owner repository is null, the rest read', async () => {
     makeRepo('theirs');
     otherOwner();
-    expect(await getSummaries(root, silentLogger)).toEqual({ ok: true, value: { summaries: { theirs: null } } });
+    expect(await getSummaries(root, name(''), silentLogger)).toEqual({ ok: true, value: { summaries: { theirs: null } } });
   });
 
   it('still says not_a_git_repo for a plain folder', async () => {
@@ -445,7 +445,7 @@ describe('errors that say what is wrong', () => {
   });
 });
 
-describe('git init on project creation', () => {
+describe('git init on mkdir', () => {
   it('runs with the same hardening as the reads: no transport, no fsmonitor, no gateway secrets', async () => {
     const bin = path.join(base, 'spy-bin');
     const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
@@ -454,9 +454,9 @@ describe('git init on project creation', () => {
     fs.chmodSync(path.join(bin, 'git'), 0o755);
     process.env.PATH = `${bin}:${process.env.PATH}`;
     process.env.GATEWAY_SECRET_TOKEN = 'leak';
-    const res = await createProject(root, name('fresh'), true, silentLogger);
+    const res = await makeDir(root, name('fresh'), true, silentLogger);
     if (!res.ok) throw new Error(res.error);
-    expect(res.value.project.is_git).toBe(true);
+    expect(res.value.entry.is_git).toBe(true);
     const out = fs.readFileSync(seen, 'utf8');
     expect(out).toContain('core.fsmonitor=false');
     expect(out).toContain('--no-optional-locks');

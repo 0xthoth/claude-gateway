@@ -8,7 +8,7 @@ import {
   parseStatusV2,
   redactCredentials,
   RepoConfig,
-} from '../../src/projects/git-status';
+} from '../../src/git/status';
 
 const z = (...records: string[]) => records.join('\0') + '\0';
 const OID = 'f07dfbfee2ce06e378dac2f416a12cd82cad3aee';

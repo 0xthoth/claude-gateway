@@ -6,7 +6,7 @@ import { DecisionService } from '../../../src/orchestration/decisions';
 import { TaskService } from '../../../src/orchestration/tasks/service';
 import { TaskBridge } from '../../../src/orchestration/bridge';
 import { resolveProjectCwd } from '../../../src/projects/chat';
-import type { ProjectName } from '../../../src/projects/paths';
+import type { EntryName } from '../../../src/files/paths';
 import type { GatewayConfig } from '../../../src/types';
 
 interface Fixture {
@@ -22,12 +22,12 @@ async function fixture(body: (f: Fixture) => Promise<void>, options: { bound?: b
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'project-tasks-')));
   const projectDir = join(root, 'projects', 'demo');
   mkdirSync(projectDir, { recursive: true });
-  const gateway = { gateway: { projects: { root: join(root, 'projects') } } } as GatewayConfig;
+  const gateway = { gateway: { files: { root: join(root, 'projects') } } } as GatewayConfig;
   const scopes: unknown[] = [];
   const store = new OrchestrationStore(':memory:', 'a');
   const tasks = new TaskService(store, { tasks: { workspaceMode: options.mode ?? 'host' } } as any, join(root, 'workspace'), async scope => {
     scopes.push(scope);
-    return options.bound === false ? undefined : resolveProjectCwd(gateway, 'demo' as ProjectName);
+    return options.bound === false ? undefined : resolveProjectCwd(gateway, 'demo' as EntryName);
   }, () => options.harness ?? 'claude');
   const bridge = new TaskBridge(tasks);
   try {

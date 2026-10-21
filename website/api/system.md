@@ -164,7 +164,9 @@ curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/capabilities 
   "version": "2.0.9",
   "capabilities": {
     "cross_channel_message": ["telegram", "discord", "line", "slack", "whatsapp", "whatsapp_cloud", "wechat"],
-    "projects": ["list", "create", "git", "chat", "delete"]
+    "files": ["list", "create", "delete"],
+    "git": ["status", "summary"],
+    "projects": ["chat"]
   }
 }
 ```
@@ -176,15 +178,19 @@ curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/capabilities 
 | `version` | `string` | The gateway's `package.json` version. **Informational only** — never gate a feature on it; use the capability keys. |
 | `capabilities` | `object` | One entry per supported feature. A key that is **absent** means the feature is **not** supported. |
 | `capabilities.cross_channel_message` | `string[]` | Channel identifiers for which a client may inject a message into a session that belongs to that channel via `POST /api/v1/agents/:agentId/chats/:chatId/sessions/:sessionId/messages`. The injected message is delivered into the session and echoed to the channel's conversation so its users see what was sent from elsewhere. A channel is listed only once that round-trip actually works for it. |
-| `capabilities.projects` | `string[]` | Operations of the [Projects API](/api/projects) this key can use right now. Empty when the Projects API is disabled. A key that is not an admin key gets every operation except `create` and `delete` (see below). |
-| `projectsUnavailable` | `"disabled"` | Top level. Present only when `projects` is empty because `gateway.projects.enabled` is `false` or the default root failed the safety check. Absent when Projects is usable. Older gateways also sent `"admin_required"`; treat any other value as "Projects is not available". |
+| `capabilities.files` | `string[]` | Operations of the [Files API](/api/files) this key can use right now. A key that is not an admin key gets every operation except `create` and `delete` (see below). |
+| `capabilities.git` | `string[]` | Routes of the read-only [Git API](/api/git). |
+| `capabilities.projects` | `string[]` | `chat` when a session may be bound to a folder under the files root (see below). |
+| `filesUnavailable` | `"disabled"` | Top level. Present only when `files`, `git` and `projects` are empty because `gateway.files.enabled` is `false` or the root failed a safety check. Absent when the files API is usable. Treat any other value as "not available". |
 
 ### Capability keys
 
 | Key | Value | Meaning |
 |-----|-------|---------|
 | `cross_channel_message` | `string[]` of channel ids | Cross-channel message injection is supported for sessions whose channel is in the array. Currently every channel the gateway supports: `["telegram", "discord", "line", "slack", "whatsapp", "whatsapp_cloud", "wechat"]` — the web→channel echo fires for all of them. |
-| `projects` | `string[]` of operations | The [Projects API](/api/projects) is served. Currently `["list", "create", "git", "chat", "delete"]`. Check `includes("list")` before showing the project list, `includes("create")` before showing project create, `includes("git")` before showing the read-only [git status](/api/projects#git), `includes("chat")` before sending `project` on [session create](/api/sessions#post-apiv1agentsagentidsessions) and starting a project chat, and `includes("delete")` before showing [project delete](/api/projects#delete-project). Later releases may append values. `chat` is listed only when `gateway.orchestration` is on, because a project chat is started through [`POST /messages/accept`](/api/messages), which needs orchestration. The array is empty when `gateway.projects.enabled` is `false`, which the config loader sets when the default projects root (`~/projects`) is or contains your home or config directory. The list is per key: a key that is not an admin key gets `["list", "git", "chat"]` (without `chat` when orchestration is off), because creating and deleting a project need an admin key. |
+| `files` | `string[]` of operations | The [Files API](/api/files) is served. Currently `["list", "create", "delete"]`. Check `includes("list")` before showing a listing, `includes("create")` before showing folder create ([`POST /files/mkdir`](/api/files#post-files-mkdir)), and `includes("delete")` before showing [delete](/api/files#delete-files). The list is per key: a key that is not an admin key gets `["list"]`, because creating and deleting need an admin key. Empty when `gateway.files.enabled` is `false`, which the config loader also sets when the default root (`~/projects`) is or contains your home or config directory, or when the root holds `:`. Later releases may append values. |
+| `git` | `string[]` of routes | The read-only [Git API](/api/git) is served. Currently `["status", "summary"]`, for [`GET /git/status`](/api/git#get-git-status) and [`GET /git/summary`](/api/git#get-git-summary). Empty when the files API is off. |
+| `projects` | `string[]` of operations | Currently `["chat"]`: [session create](/api/sessions#post-apiv1agentsagentidsessions) accepts `project`, the name of a folder directly under the files root, and runs the chat there. `chat` is listed only when `gateway.orchestration` is on, because such a chat is started through [`POST /messages/accept`](/api/messages), which needs orchestration. Empty when the files API is off. |
 
 Channel identifiers are the gateway's canonical channel names — the same strings a
 session reports as its `channel` — drawn from `CHAT_CHANNELS` in
@@ -203,7 +209,7 @@ use one of these; there is no fourth.
 | `string[]` | A feature supported for an enumerated set (channels, formats, providers) | `value.includes(x)` — an **empty array means supported by nothing** | `"cross_channel_message": ["telegram"]` |
 | `object` | A feature with parameters or limits; the fields inside are themselves additive-only | key present ⇒ supported; read the fields you know, treat a **missing field as unknown** and behave conservatively | `"attachments": { "max_bytes": 20971520, "mime_types": ["image/png"] }` |
 
-The examples other than `cross_channel_message` and `projects` are **illustrative only**.
+The examples other than `cross_channel_message`, `files`, `git` and `projects` are **illustrative only**.
 The gateway does not serve them today.
 
 Rules that hold for every key, now and later:
@@ -250,6 +256,8 @@ interface GatewayCapabilities {
   version: string; // informational — do not gate on it
   capabilities: {
     cross_channel_message?: ChatChannel[];
+    files?: string[];
+    git?: string[];
     projects?: string[];
     // future keys are added here; every one stays optional
   };

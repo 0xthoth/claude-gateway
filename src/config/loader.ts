@@ -7,7 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { GatewayConfig, Logger } from '../types';
 import { expandHome, pathWithin } from '../utils/paths';
-import { DEFAULT_PROJECTS_ROOT, parseProjectName } from '../projects/paths';
+import { DEFAULT_FILES_ROOT, parseEntryName } from '../files/paths';
 import { resolveGatewayPublicUrl } from './public-url';
 import { upgradeAgentWhatsAppAccounts } from './whatsapp-accounts';
 import { resolveOrchestrationConfig, OrchestrationConfig } from '../orchestration/config';
@@ -167,7 +167,7 @@ export interface LoadConfigOptions {
    */
   onPublicUrlUnset?: () => void;
   /**
-   * Called with the text of each Projects warning (an unusable root, a malformed `enabled`, unknown keys). Same
+   * Called with the text of each files API warning (an unusable root, a malformed `enabled`, unknown keys). Same
    * rationale as the callbacks above: the `console.warn` alone never reaches `logs/gateway.log`.
    */
   onWarning?: (message: string) => void;
@@ -193,17 +193,17 @@ export function logSkippedAgents(
   }
 }
 
-const PROJECTS_KEYS = ['root', 'trusted', 'enabled'];
+const FILES_KEYS = ['root', 'trusted', 'enabled'];
 
 /** The spelling every check and the runtime agree on: no surrounding spaces, no trailing slashes (`/` stays). */
-function cleanProjectsRoot(raw: string): string {
+function cleanFilesRoot(raw: string): string {
   const trimmed = raw.trim();
   return trimmed.replace(/\/+$/, '') || (trimmed.startsWith('/') ? '/' : trimmed);
 }
 
 /** Unset, or spelled like the default in any clean or unclean way (config.template.json ships it): both mean "the operator chose nothing". */
-function isDefaultProjectsRoot(raw: unknown): boolean {
-  return raw === undefined || (typeof raw === 'string' && expandHome(cleanProjectsRoot(raw)) === expandHome(DEFAULT_PROJECTS_ROOT));
+function isDefaultFilesRoot(raw: unknown): boolean {
+  return raw === undefined || (typeof raw === 'string' && expandHome(cleanFilesRoot(raw)) === expandHome(DEFAULT_FILES_ROOT));
 }
 
 /** The folder a root resolves to when that path (not the spelling) holds ":", else null. A link into `a:b` breaks the fence like a typed `a:b`. */
@@ -217,28 +217,28 @@ function colonRealRoot(root: unknown): string | null {
   }
 }
 
-function validateProjectsRoot(raw: unknown, configPath: string): void {
+function validateFilesRoot(raw: unknown, configPath: string): void {
   if (typeof raw !== 'string' || !raw.trim()) {
-    throw new ConfigValidationError('gateway.projects.root must be a non-empty string');
+    throw new ConfigValidationError('gateway.files.root must be a non-empty string');
   }
   const root = expandHome(raw);
   if (!path.isAbsolute(root)) {
-    throw new ConfigValidationError(`gateway.projects.root must be an absolute path or start with ~/ (got "${raw}")`);
+    throw new ConfigValidationError(`gateway.files.root must be an absolute path or start with ~/ (got "${raw}")`);
   }
-  const exposed = exposedByProjectsRoot(root, configPath);
+  const exposed = exposedByFilesRoot(root, configPath);
   if (exposed !== null) {
     throw new ConfigValidationError(
-      `gateway.projects.root "${raw}" must not be or contain ${exposed}; the Projects API would expose it`,
+      `gateway.files.root "${raw}" must not be or contain ${exposed}; the files API would expose it`,
     );
   }
 }
 
 /**
- * The Projects API serves every file under its root with no denylist, so a root
+ * The files API serves every folder under its root with no denylist, so a root
  * at or above HOME or the config dir would expose ~/.ssh and config.json.
  * Returns the guarded directory the root contains, or null.
  */
-function exposedByProjectsRoot(root: string, configPath: string): string | null {
+function exposedByFilesRoot(root: string, configPath: string): string | null {
   // realpath when the path exists, so a symlink to HOME is caught too.
   const real = (p: string) => {
     try {
@@ -254,13 +254,13 @@ function exposedByProjectsRoot(root: string, configPath: string): string | null 
 }
 
 /** Trust is operator config only, so a name the API could never resolve is a typo worth failing on. */
-function validateTrustedProjects(raw: unknown): void {
+function validateTrustedNames(raw: unknown): void {
   if (!Array.isArray(raw) || raw.some((n) => typeof n !== 'string')) {
-    throw new ConfigValidationError('gateway.projects.trusted must be an array of project names');
+    throw new ConfigValidationError('gateway.files.trusted must be an array of folder names directly under gateway.files.root');
   }
-  const bad = raw.find((n) => !parseProjectName(n).ok);
+  const bad = raw.find((n) => !parseEntryName(n).ok);
   if (bad !== undefined) {
-    throw new ConfigValidationError(`gateway.projects.trusted contains an invalid project name "${bad}"`);
+    throw new ConfigValidationError(`gateway.files.trusted contains an invalid folder name "${bad}"`);
   }
 }
 
@@ -283,7 +283,7 @@ export function loadConfig(configPath: string, options?: LoadConfigOptions): Gat
     options?.onSkippedAgent?.({ id, reason, ...(missingVar ? { missingVar } : {}) });
   };
 
-  const warnProjects = (message: string): void => {
+  const warnFiles = (message: string): void => {
     console.warn(message);
     options?.onWarning?.(message);
   };
@@ -466,51 +466,54 @@ export function loadConfig(configPath: string, options?: LoadConfigOptions): Gat
     interpolatedGateway.publicUrl = normalizedPublicUrl;
   }
 
-  const projects = interpolatedGateway.projects;
-  if (projects !== undefined) {
-    if (typeof projects !== 'object' || projects === null || Array.isArray(projects)) {
-      throw new ConfigValidationError('gateway.projects must be an object');
+  if ('projects' in interpolatedGateway) {
+    throw new ConfigValidationError('gateway.projects was renamed to gateway.files; move its root, trusted and enabled keys there');
+  }
+  const files = interpolatedGateway.files;
+  if (files !== undefined) {
+    if (typeof files !== 'object' || files === null || Array.isArray(files)) {
+      throw new ConfigValidationError('gateway.files must be an object');
     }
-    const projectsConfig = projects as Record<string, unknown>;
-    if (typeof projectsConfig.root === 'string' && projectsConfig.root.trim()) projectsConfig.root = cleanProjectsRoot(projectsConfig.root);
-    const root = projectsConfig.root;
-    if (root !== undefined && !isDefaultProjectsRoot(root)) validateProjectsRoot(root, configPath);
-    const colonRoot = typeof root === 'string' && root.includes(':') ? root : colonRealRoot(root ?? DEFAULT_PROJECTS_ROOT);
-    if (colonRoot !== null && projectsConfig.enabled !== false) {
-      warnProjects(
-        `[gateway] gateway.projects.root "${colonRoot}" holds ":", which git's discovery fence (GIT_CEILING_DIRECTORIES) cannot express, so the Projects API is disabled.\n` +
-        '          Set gateway.projects.root to a path without ":".',
+    const filesConfig = files as Record<string, unknown>;
+    if (typeof filesConfig.root === 'string' && filesConfig.root.trim()) filesConfig.root = cleanFilesRoot(filesConfig.root);
+    const root = filesConfig.root;
+    if (root !== undefined && !isDefaultFilesRoot(root)) validateFilesRoot(root, configPath);
+    const colonRoot = typeof root === 'string' && root.includes(':') ? root : colonRealRoot(root ?? DEFAULT_FILES_ROOT);
+    if (colonRoot !== null && filesConfig.enabled !== false) {
+      warnFiles(
+        `[gateway] gateway.files.root "${colonRoot}" holds ":", which git's discovery fence (GIT_CEILING_DIRECTORIES) cannot express, so the files API is disabled.\n` +
+        '          Set gateway.files.root to a path without ":".',
       );
-      projectsConfig.enabled = false;
+      filesConfig.enabled = false;
     }
-    if ('enabled' in projectsConfig && typeof projectsConfig.enabled !== 'boolean') {
-      warnProjects(`[gateway] gateway.projects.enabled must be true or false (got ${JSON.stringify(projectsConfig.enabled)}); ignoring it, so Projects keeps its default, which is on.`);
-      delete projectsConfig.enabled;
+    if ('enabled' in filesConfig && typeof filesConfig.enabled !== 'boolean') {
+      warnFiles(`[gateway] gateway.files.enabled must be true or false (got ${JSON.stringify(filesConfig.enabled)}); ignoring it, so the files API keeps its default, which is on.`);
+      delete filesConfig.enabled;
     }
-    const trusted = (projects as Record<string, unknown>).trusted;
-    if (trusted !== undefined) validateTrustedProjects(trusted);
-    const unknown = Object.keys(projects).filter((key) => !PROJECTS_KEYS.includes(key));
+    const trusted = (files as Record<string, unknown>).trusted;
+    if (trusted !== undefined) validateTrustedNames(trusted);
+    const unknown = Object.keys(files).filter((key) => !FILES_KEYS.includes(key));
     if (unknown.length > 0) {
-      warnProjects(`[gateway] Ignoring unknown gateway.projects keys: ${unknown.join(', ')}. Known keys: ${PROJECTS_KEYS.join(', ')}.`);
+      warnFiles(`[gateway] Ignoring unknown gateway.files keys: ${unknown.join(', ')}. Known keys: ${FILES_KEYS.join(', ')}.`);
     }
   }
   // An operator who never chose a root, or whose config.json only carries the template's default, gets a warning, not a gateway that refuses to start.
-  if (isDefaultProjectsRoot((projects as { root?: unknown } | undefined)?.root)) {
-    const exposed = exposedByProjectsRoot(expandHome(DEFAULT_PROJECTS_ROOT), configPath);
+  if (isDefaultFilesRoot((files as { root?: unknown } | undefined)?.root)) {
+    const exposed = exposedByFilesRoot(expandHome(DEFAULT_FILES_ROOT), configPath);
     if (exposed !== null) {
-      warnProjects(
-        `[gateway] The default projects root ${DEFAULT_PROJECTS_ROOT} is or contains ${exposed}, so the Projects API is disabled.\n` +
-        '          Set gateway.projects.root to a folder that holds only projects.',
+      warnFiles(
+        `[gateway] The default files root ${DEFAULT_FILES_ROOT} is or contains ${exposed}, so the files API is disabled.\n` +
+        '          Set gateway.files.root to a folder that holds nothing else.',
       );
-      interpolatedGateway.projects = { ...(projects as object | undefined), enabled: false };
-    } else if (projects === undefined) {
-      const colonRoot = colonRealRoot(DEFAULT_PROJECTS_ROOT);
+      interpolatedGateway.files = { ...(files as object | undefined), enabled: false };
+    } else if (files === undefined) {
+      const colonRoot = colonRealRoot(DEFAULT_FILES_ROOT);
       if (colonRoot !== null) {
-        warnProjects(
-          `[gateway] The default projects root ${DEFAULT_PROJECTS_ROOT} resolves to "${colonRoot}", which holds ":", so the Projects API is disabled.\n` +
-          '          Set gateway.projects.root to a path without ":".',
+        warnFiles(
+          `[gateway] The default files root ${DEFAULT_FILES_ROOT} resolves to "${colonRoot}", which holds ":", so the files API is disabled.\n` +
+          '          Set gateway.files.root to a path without ":".',
         );
-        interpolatedGateway.projects = { enabled: false };
+        interpolatedGateway.files = { enabled: false };
       }
     }
   }

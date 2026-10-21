@@ -49,8 +49,8 @@ import { createMetaRouter } from './meta-router';
 import { createCapabilitiesRouter } from './capabilities';
 import { GATEWAY_VERSION } from './gateway-version';
 import { createWorkspaceRouter } from './workspace-router';
-import { createProjectsRouter } from './projects-router';
-import { projectsEnabled, resolveProjectsRoot } from '../projects/chat';
+import { createFilesRouter } from './files-router';
+import { filesEnabled, resolveFilesRoot } from '../files/config';
 import { createSkillsRouter } from './skills-router';
 import { createPackagesRouter } from './packages';
 import { createWebhooksRouter } from './webhooks-router';
@@ -749,11 +749,11 @@ export class GatewayRouter {
       this.app.use('/api', workspaceRouter);
     }
 
-    // Mount the pod-wide Projects API (gateway.projects.root, default ~/projects)
-    if (this.gatewayConfig?.gateway?.api?.keys && projectsEnabled(this.gatewayConfig)) {
-      this.app.use('/api', createProjectsRouter(this.gatewayConfig.gateway.api.keys, resolveProjectsRoot(this.gatewayConfig), {
+    // Mount the pod-wide files and git API (gateway.files.root, default ~/projects)
+    if (this.gatewayConfig?.gateway?.api?.keys && filesEnabled(this.gatewayConfig)) {
+      this.app.use('/api', createFilesRouter(this.gatewayConfig.gateway.api.keys, resolveFilesRoot(this.gatewayConfig), {
         logger: this.logger,
-        chatTurnActive: async (name) => (await Promise.all([...this.agents.values()].map((runner) => runner.hasActiveProjectTurn(name)))).some(Boolean),
+        inUse: async (dir) => (await Promise.all([...this.agents.values()].map((runner) => runner.hasActiveWorkIn(dir)))).some(Boolean),
       }));
     }
 
