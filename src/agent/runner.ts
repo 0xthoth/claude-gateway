@@ -519,13 +519,14 @@ export class AgentRunner extends EventEmitter {
    */
   private async claimApiSession(sessionId: string, chatId: string): Promise<void> {
     const owners = await this.sessionOwners();
-    const owner = owners.get(sessionId);
-    if (owner && owner.chatId !== chatId) {
+    if (!owners.has(sessionId)) {
+      const cwd = await this.recordCwd(sessionId, {});
+      // A parallel claim from another chat may have landed during the await; the owner check below sees it.
+      if (!owners.has(sessionId)) owners.set(sessionId, { chatId, cwd });
+    }
+    if (owners.get(sessionId)?.chatId !== chatId) {
       throw Object.assign(new Error(`Session ${sessionId} belongs to another chat`), { code: 'SESSION_ID_IN_USE' });
     }
-    if (owner) return;
-    const cwd = await this.recordCwd(sessionId, {});
-    if (!owners.has(sessionId)) owners.set(sessionId, { chatId, cwd });
   }
 
   private async registerApiSession(chatId: string, sessionId: string, onStoreError?: (err: unknown) => void): Promise<void> {

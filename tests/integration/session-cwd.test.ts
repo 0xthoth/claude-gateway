@@ -202,6 +202,28 @@ describe('session cwd', () => {
     expect(await row(h, sid)).toMatchObject({ cwd: path.join(h.root, 'site'), name: expect.not.stringMatching('stolen') });
   }, 30_000);
 
+  it('7b. two chats claiming one fresh session id in parallel: exactly one wins on every claiming route (40 races)', async () => {
+    h = harness();
+    const claims: Record<string, (sid: string, chatId: string) => supertest.Test> = {
+      rename: (sid, chatId) => supertest(h.app).patch(`/api/v1/agents/alfred/sessions/${sid}`).set(AUTH).query({ chat_id: chatId }).send({ session_name: chatId }),
+      clear: (sid, chatId) => supertest(h.app).post(`/api/v1/agents/alfred/sessions/${sid}/clear`).set(AUTH).query({ chat_id: chatId }),
+      compact: (sid, chatId) => supertest(h.app).post(`/api/v1/agents/alfred/sessions/${sid}/compact`).set(AUTH).query({ chat_id: chatId }),
+      stop: (sid, chatId) => supertest(h.app).post(`/api/v1/agents/alfred/sessions/${sid}/stop`).set(AUTH).query({ chat_id: chatId }),
+      restart: (sid, chatId) => supertest(h.app).post(`/api/v1/agents/alfred/sessions/${sid}/restart`).set(AUTH).query({ chat_id: chatId }),
+    };
+    const indexed = (chatId: string) => fs.existsSync(indexFile(h, chatId)) ? fs.readFileSync(indexFile(h, chatId), 'utf8') : '';
+    const outcomes: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      const [route, claim] = Object.entries(claims)[i % 5]!;
+      const sid = `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+      const [a, b] = await Promise.all([claim(sid, 'chat-a'), claim(sid, 'chat-b')]);
+      const inUse = [a, b].filter((r) => r.body.code === 'SESSION_ID_IN_USE').length;
+      const inBoth = indexed('chat-a').includes(sid) && indexed('chat-b').includes(sid);
+      outcomes.push(`${route} in_use=${inUse} in_both=${inBoth}`);
+    }
+    expect(outcomes.filter((o) => !o.endsWith('in_use=1 in_both=false'))).toEqual([]);
+  }, 60_000);
+
   describe('8. dev data written before sessions stored a cwd', () => {
     const seed = async (base: string, entry: Record<string, unknown>, binding?: string): Promise<string> => {
       const sid = (await new SessionStore(path.join(base, 'agents')).createTelegramSession('alfred', 'web', 'old', 'api')).id;
