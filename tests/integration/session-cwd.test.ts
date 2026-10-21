@@ -132,7 +132,7 @@ describe('session cwd', () => {
   it('2. the root itself is refused 403 cwd_outside_root, by absolute path or by a link to it', async () => {
     h = harness();
     fs.symlinkSync('.', path.join(h.root, 'all'));
-    for (const cwd of [h.root, `${h.root}/`, 'all', path.join(h.root, 'all')]) {
+    for (const cwd of [h.root, 'all', path.join(h.root, 'all')]) {
       const res = await create(h, { cwd });
       expect([cwd, res.status, res.body.code]).toEqual([cwd, 403, 'cwd_outside_root']);
     }
@@ -162,6 +162,19 @@ describe('session cwd', () => {
     expect((await send(h, nested, 'hi')).status).toBe(200);
     expect(spawns(h).map((s) => s.cwd)).toEqual([path.join(h.root, 'site', 'web')]);
   }, 30_000);
+
+  it('4b. a trailing slash is refused 400 invalid_cwd in every spelling, whatever the folder it names', async () => {
+    h = harness();
+    const outside = path.join(h.base, 'outside');
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(h.root, 'link-out'));
+    for (const cwd of ['site/', `${h.root}/site/`, 'link-out/', `${h.root}/link-out/`, 'nope/', `${h.root}/`]) {
+      const res = await create(h, { cwd });
+      expect([cwd, res.status, res.body.code]).toEqual([cwd, 400, 'invalid_cwd']);
+    }
+    expect([(await create(h, { cwd: 'link-out' })).status, (await create(h, { cwd: `${h.root}/link-out` })).status]).toEqual([403, 403]);
+    expect(fs.existsSync(indexFile(h, 'web'))).toBe(false);
+  });
 
   it('5. a symlink alias runs in the real folder, is never trusted, and keeps the real folder from being deleted mid-turn', async () => {
     h = harness({ trusted: ['site', 'alias'] });

@@ -160,7 +160,7 @@ cannot change the folder later.
 
 `cwd` names any folder under the root, not only a folder directly under it. The root itself is refused. A relative
 `cwd` such as `site/web` follows the files [path rules](/api/files#paths), so each segment must pass the entry-name
-rule. An absolute `cwd` must be a normalized path under the root, with no `.` or `..` segment and no `//`. The part below
+rule. An absolute `cwd` must be a normalized path under the root, with no `.` or `..` segment, no `//` and no trailing `/`. A trailing `/` is refused in the relative form too, so `site/` is `400 invalid_cwd` whatever `site` is. The part below
 the root follows the same rules. The root may be spelled as configured or as its real path. The session stores the absolute path `join(<real root>, <relative path>)`,
 where `<real root>` is the root resolved through symlinks. The gateway resolves the stored path again at every spawn
 and every turn.
@@ -203,7 +203,7 @@ on any of them.
 | Status | `code` | When |
 |--------|--------|------|
 | `400` | `project_replaced_by_cwd` | The body has a `project` field. `cwd` replaced it: send the folder path under the files root as `cwd`. A `null` `project` is ignored |
-| `400` | `invalid_cwd` | `cwd` is not a string, is empty, is an absolute path that is not normalized, or has a segment that fails the entry-name rule |
+| `400` | `invalid_cwd` | `cwd` is not a string, is empty, ends with `/`, is an absolute path that is not normalized, or has a segment that fails the entry-name rule |
 | `403` | | `Write permission required`: the key cannot write to this agent (it has no `write` and is not an admin key). `API key has no access to agent '<id>'`: the key does not list this agent. Binding a chat needs the same write access as any other change to the agent |
 | `403` | `cwd_outside_root` | `cwd` resolves outside the files root, through symlinks included, or is the root itself, including through a link such as `all -> .` |
 | `404` | `cwd_not_found` | No folder exists at `cwd` |

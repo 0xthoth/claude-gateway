@@ -67,7 +67,8 @@ export function createCwdResolver(config: GatewayConfig, logger: Logger): CwdRes
 
   return {
     async parse(raw) {
-      if (typeof raw !== 'string' || raw === '' || raw.includes('\0')) return err('invalid');
+      // A trailing slash is refused in both forms, as the files API refuses it, so one folder has one spelling.
+      if (typeof raw !== 'string' || raw === '' || raw.includes('\0') || (raw.length > 1 && raw.endsWith('/'))) return err('invalid');
       if (!filesEnabled(config)) return err('disabled');
       if (path.isAbsolute(raw)) return path.normalize(raw) === raw ? resolveAt(raw) : err('invalid');
       const rel = parseRelPath(raw);
