@@ -31,7 +31,7 @@ export type FilesErrorCode =
  */
 const ENTRY_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-export const MAX_PATH_DEPTH = 32;
+const MAX_PATH_DEPTH = 32;
 
 export function parseEntryName(raw: unknown): Result<EntryName, 'invalid_name'> {
   if (typeof raw !== 'string' || !ENTRY_NAME_RE.test(raw)) {

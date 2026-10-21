@@ -129,7 +129,7 @@ async function unbornBehind(dir: string, opts: RunOptions): Promise<number> {
 }
 
 /** The detailed read: every untracked file, the last commit and any operation in progress. `dir` must be a real folder under the root. */
-export function readStatus(dir: string, logger: Logger): Promise<GitResult<GitStatus>> {
+function readStatus(dir: string, logger: Logger): Promise<GitResult<GitStatus>> {
   return readRepo(dir, DETAIL_READ, logger);
 }
 

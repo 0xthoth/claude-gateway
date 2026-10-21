@@ -53,7 +53,7 @@ export interface CreatedEntry {
 
 type FsResult<T> = Result<T, FilesErrorCode>;
 
-export async function realRootOf(root: string): Promise<FsResult<string>> {
+async function realRootOf(root: string): Promise<FsResult<string>> {
   try {
     return ok(await fsp.realpath(root));
   } catch (e) {
