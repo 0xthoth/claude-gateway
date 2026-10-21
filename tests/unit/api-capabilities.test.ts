@@ -10,6 +10,7 @@
 
 import express from 'express';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
 import {
@@ -117,6 +118,37 @@ describe('GET /api/v1/capabilities', () => {
       const { files, git, sessions } = res.body.capabilities;
       expect([files, git, sessions, res.body.filesUnavailable]).toEqual([[], [], [], 'disabled']);
     }
+  });
+
+  describe('filesRoot', () => {
+    let base: string;
+    beforeEach(() => { base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'caps-root-'))); });
+    afterEach(() => fs.rmSync(base, { recursive: true, force: true }));
+    const appWith = (files: Record<string, unknown>) => {
+      const app = express();
+      app.use('/api', createCapabilitiesRouter(apiKeys, { gateway: { orchestration: true, files }, agents: [] } as never));
+      return app;
+    };
+
+    it('reports the real root to every key, through a symlink, the value the files list reports', async () => {
+      fs.mkdirSync(path.join(base, 'real'));
+      fs.symlinkSync(path.join(base, 'real'), path.join(base, 'link'));
+      for (const key of ['sk-test-app', 'sk-pod-read']) {
+        const res = await request(appWith({ root: path.join(base, 'link') })).get('/api/v1/capabilities').set(as(key));
+        expect(res.body.filesRoot).toBe(path.join(base, 'real'));
+      }
+    });
+
+    it('reports the configured spelling while the root does not exist yet', async () => {
+      const res = await request(appWith({ root: path.join(base, 'later') })).get('/api/v1/capabilities').set(AUTH);
+      expect(res.body.filesRoot).toBe(path.join(base, 'later'));
+    });
+
+    it('omits filesRoot when the files API is off', async () => {
+      const res = await request(appWith({ root: base, enabled: false })).get('/api/v1/capabilities').set(AUTH);
+      expect(res.body).not.toHaveProperty('filesRoot');
+      expect(res.body.filesUnavailable).toBe('disabled');
+    });
   });
 
   it('maps every files and git token to one served route, admin-only exactly where the token is', () => {

@@ -167,7 +167,8 @@ curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/capabilities 
     "files": ["list", "create", "delete", "marks"],
     "git": ["status", "summary"],
     "sessions": ["cwd"]
-  }
+  },
+  "filesRoot": "/home/user/projects"
 }
 ```
 
@@ -181,6 +182,7 @@ curl -H "Authorization: Bearer $KEY" http://localhost:10850/api/v1/capabilities 
 | `capabilities.files` | `string[]` | Operations of the [Files API](/api/files) this key can use right now. A key that is not an admin key gets every operation except `create`, `delete` and `marks` (see below). |
 | `capabilities.git` | `string[]` | Routes of the read-only [Git API](/api/git). |
 | `capabilities.sessions` | `string[]` | `cwd` when a session may be bound to a folder under the files root (see below). |
+| `filesRoot` | `string` | Top level. The absolute files root, the same value [`GET /files`](/api/files#get-files) reports as `root`: its real path, or the configured path while the folder does not exist yet. Present only when the files API is usable, so a client can turn a session `cwd` into a folder under the root without listing it. Absent on gateways that predate it. |
 | `filesUnavailable` | `"disabled"` | Top level. Present only when `files`, `git` and `sessions` are empty because `gateway.files.enabled` is `false` or the root failed a safety check. Absent when the files API is usable. Treat any other value as "not available". |
 
 ### Capability keys

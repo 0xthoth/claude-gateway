@@ -113,7 +113,7 @@ export async function recordFixtures(): Promise<Record<string, Fixture>> {
   Object.assign(process.env, { GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: '1' });
   try {
     seed(root, outside);
-    const config = { gateway: { orchestration: true }, agents: [] } as unknown as GatewayConfig;
+    const config = { gateway: { orchestration: true, files: { root } }, agents: [] } as unknown as GatewayConfig;
     const app = express();
     app.use(express.json());
     app.use('/api', createCapabilitiesRouter(Object.values(KEYS), config));

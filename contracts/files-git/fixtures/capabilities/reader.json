@@ -28,6 +28,7 @@
       "sessions": [
         "cwd"
       ]
-    }
+    },
+    "filesRoot": "/home/user/projects"
   }
 }

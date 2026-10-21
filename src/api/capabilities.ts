@@ -4,7 +4,8 @@ import { CHAT_CHANNELS, type ChatChannel } from '../history/types';
 import { createApiAuthMiddleware, isAdmin } from './auth';
 import { GATEWAY_VERSION } from './gateway-version';
 import { gatewayOrchestrationEnabled } from '../orchestration/gateway-config';
-import { filesEnabled } from '../files/config';
+import { filesEnabled, resolveFilesRoot } from '../files/config';
+import { reportedRoot } from '../files/fs';
 import type { GatewayConfig } from '../types';
 
 /**
@@ -75,6 +76,8 @@ export interface CapabilitiesResponse {
   };
   /** Why `files`, `git` and `sessions` are empty; absent when the files API is usable. */
   filesUnavailable?: FilesUnavailable;
+  /** The absolute files root, the value `GET /v1/files` reports as `root`; absent when the files API is off. */
+  filesRoot?: string;
 }
 
 /** `disabled`: the gateway serves no files or git API. */
@@ -97,12 +100,13 @@ export function filesAvailability(config?: GatewayConfig, apiKey?: ApiKey): File
   };
 }
 
-export function buildCapabilitiesResponse(version: string = GATEWAY_VERSION, config?: GatewayConfig, apiKey?: ApiKey): CapabilitiesResponse {
+export function buildCapabilitiesResponse(version: string = GATEWAY_VERSION, config?: GatewayConfig, apiKey?: ApiKey, filesRoot?: string | null): CapabilitiesResponse {
   const { filesUnavailable, ...tokens } = filesAvailability(config, apiKey);
   return {
     version,
     capabilities: { cross_channel_message: [...CROSS_CHANNEL_MESSAGE_CHANNELS], ...tokens },
     ...(filesUnavailable ? { filesUnavailable } : {}),
+    ...(!filesUnavailable && filesRoot ? { filesRoot } : {}),
   };
 }
 
@@ -118,8 +122,9 @@ export function buildCapabilitiesResponse(version: string = GATEWAY_VERSION, con
 export function createCapabilitiesRouter(apiKeys: ApiKey[], config?: GatewayConfig): Router {
   const router = Router();
   router.use(createApiAuthMiddleware(apiKeys));
-  router.get('/v1/capabilities', (req: Request, res: Response) => {
-    res.json(buildCapabilitiesResponse(GATEWAY_VERSION, config, (req as Request & { apiKey: ApiKey }).apiKey));
+  router.get('/v1/capabilities', async (req: Request, res: Response) => {
+    const filesRoot = config && filesEnabled(config) ? await reportedRoot(resolveFilesRoot(config)) : null;
+    res.json(buildCapabilitiesResponse(GATEWAY_VERSION, config, (req as Request & { apiKey: ApiKey }).apiKey, filesRoot));
   });
   return router;
 }

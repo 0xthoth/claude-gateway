@@ -16,6 +16,10 @@
     "filesUnavailable": {
       "const": "disabled"
     },
+    "filesRoot": {
+      "type": "string",
+      "pattern": "^/"
+    },
     "capabilities": {
       "type": "object",
       "required": [

@@ -17,7 +17,9 @@ key, a pod-wide write key included, gets `403 forbidden_key` on those routes.
 listing only when `files` includes `"list"`, folder create only when it includes `"create"`, and the Delete action
 only when it includes `"delete"`. Call the [busy and marks routes](#marks) only when it includes `"marks"`. When the
 files API is off, `files`, `git` and `sessions` are empty and
-`filesUnavailable` is `"disabled"`. See [Capabilities](/api/system#get-apiv1capabilities).
+`filesUnavailable` is `"disabled"`. While the API is on, the top-level `filesRoot` holds the same absolute root that
+[`GET /files`](#get-files) reports, so a client can place a session `cwd` without a listing. See
+[Capabilities](/api/system#get-apiv1capabilities).
 
 **On by default.** The routes are on for every install, with the root `~/projects`, and need no configuration. To
 switch them off, set `gateway.files.enabled` to `false` and restart. Only a boolean counts: the string `"false"`, `0`

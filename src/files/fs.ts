@@ -62,6 +62,13 @@ async function realRootOf(root: string): Promise<FsResult<string>> {
   }
 }
 
+/** The root `GET /v1/files` reports: its real path, or the configured spelling while it does not exist. Null when it cannot be read. */
+export async function reportedRoot(root: string): Promise<string | null> {
+  const realRoot = await realRootOf(root);
+  if (realRoot.ok) return realRoot.value;
+  return realRoot.error === 'not_found' ? root : null;
+}
+
 async function describeEntry(dirAbs: string, rel: RelPath, realDir: string, name: EntryName): Promise<Entry> {
   const st = await fsp.stat(realDir);
   const isGit = await fsp.lstat(path.join(realDir, '.git')).then(() => true, () => false);
