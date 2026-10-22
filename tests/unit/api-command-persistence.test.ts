@@ -208,4 +208,24 @@ describe('executeApiCommand persistence + dispatch (#157)', () => {
     expect(rows.filter((r) => r.role === 'user')).toHaveLength(1);
     expect(rows.filter((r) => r.role === 'assistant')).toHaveLength(1);
   });
+  it('keeps an interruption note when the web Stop button suppresses command echo', async () => {
+    const sessions = (runner as unknown as { sessions: Map<string, unknown> }).sessions;
+    sessions.set(sessionId, { interrupt: () => true });
+    try {
+      const { result, responseText } = await runner.executeApiCommand(sessionId, chatId, '/stop', { skipPersist: true });
+      expect(result.stopped).toBe(true);
+      expect(responseText).toBe('Session was interrupted before I could respond.');
+      expect(historyRows()).toEqual([{ role: 'assistant', content: responseText }]);
+      expect(await getSessionStore(runner).loadSession(agentId, sessionId)).toEqual([]);
+    } finally {
+      sessions.delete(sessionId);
+    }
+  });
+
+  it('does not create a history note for Stop when there is no active turn', async () => {
+    const { result } = await runner.executeApiCommand(sessionId, chatId, '/stop', { skipPersist: true });
+    expect(result.stopped).toBe(false);
+    expect(historyRows()).toEqual([]);
+  });
+
 });

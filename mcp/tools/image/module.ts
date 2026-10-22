@@ -60,6 +60,12 @@ const ERROR_HINTS: Record<string, string> = {
 type JobResponse = {
   task_id?: string;
   status?: 'queued' | 'running' | 'done' | 'failed';
+  // What actually generated (or is generating) the image — services/api now
+  // echoes these on every poll, so a status re-poll in a LATER turn (which no
+  // longer has the original generate call's "model" argument in scope) can
+  // still recover them instead of falling back to "unknown".
+  provider?: string;
+  model?: string;
   byok?: boolean;
   cost?: number;
   images?: string[];
@@ -552,9 +558,14 @@ export class ImageModule implements ToolModule {
     // artifacts — file delivery is unaffected.
     let artifacts: Array<Record<string, unknown>> | undefined;
     if (shareBridgeEnabled() && files.length) {
+      // `model` (the caller's "provider/model" arg) is only known on the
+      // generate path (same-turn poll) — same limitation as `prompt` above.
+      // On an action="status" re-entry, fall back to job.provider/job.model,
+      // which services/api now echoes on every poll response for exactly
+      // this reason, instead of silently mislabeling the artifact "unknown".
       const slash = (model ?? '').indexOf('/');
-      const provider = slash > 0 ? (model as string).slice(0, slash) : 'unknown';
-      const modelName = slash > 0 ? (model as string).slice(slash + 1) : (model || 'unknown');
+      const provider = slash > 0 ? (model as string).slice(0, slash) : (job.provider || 'unknown');
+      const modelName = slash > 0 ? (model as string).slice(slash + 1) : (job.model || model || 'unknown');
       const registered = await registerArtifacts(files, { provider, model: modelName, taskId, prompt });
       if (registered) {
         artifacts = registered.map((item, index) => ({
@@ -799,6 +810,14 @@ const imageToolDefs: McpToolDefinition[] = [
       'attach it with your reply tool and answer in one or two short sentences. Every extra step risks pushing ' +
       'the request past its timeout. ' +
       'action="status" polls a previously returned task_id. ' +
+      'PATIENCE: image generation can legitimately take several minutes — a "running" status (including the ' +
+      '"still generating, call again with action=status" note you get back when the local poll budget runs out) ' +
+      'is normal, not stuck. Keep calling action="status" with the SAME task_id until it resolves to done/failed. ' +
+      'Do NOT submit a new action="generate" call (on the same or a different model) for the same request while ' +
+      'an earlier task_id for it is still running — the earlier job may finish moments later, and you will have ' +
+      'generated and charged for the image twice while delivering only one. If you are genuinely considering ' +
+      'giving up after a long wait, say so to the user first in a normal reply and let them decide, instead of ' +
+      'silently abandoning the task_id and starting over. ' +
       'action="list" returns every available image model with its supported_qualities, supported_sizes, cost, and ' +
       'the capability flags supports_image_ref (image-to-image / edit) and supports_style_ref. Call it FIRST when ' +
       'choosing a model or when you need to know what a provider can do — you are NOT limited to the composer ' +
