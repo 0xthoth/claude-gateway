@@ -9,6 +9,7 @@ import { FILES_ERRORS } from './files-router';
 import { resolveRealDir } from '../files/fs';
 import { parseRelPath, RelPath } from '../files/paths';
 import { collectListeners, Listener, listenersIn } from '../processes/listeners';
+import { STOP_TERM_WAIT_MS, stopProject, StopOptions } from '../processes/stop';
 import { DEFAULT_PORT_RANGE, parsePort, START_TIMEOUT_MS, StartErrorCode, StartFailure, startProject, StartOptions } from '../processes/start';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
@@ -62,11 +63,12 @@ export interface ProcessesRouterDeps {
   logger: Logger;
   /** Overrides for tests; the defaults are the gateway's. */
   start?: Partial<StartOptions>;
+  stop?: Partial<StopOptions>;
 }
 
 /**
- * Which servers a project folder under the files root runs, and starting one with the folder's `.pod/start.sh`. Any key
- * may read; starting runs code and needs an admin key. There is no stop route.
+ * Which servers a project folder under the files root runs, starting one with the folder's `.pod/start.sh`, and
+ * stopping them. Any key may read; starting and stopping need an admin key.
  */
 export function createProcessesRouter(apiKeys: ApiKey[], root: string, deps: ProcessesRouterDeps): Router {
   const { logger } = deps;
@@ -76,6 +78,7 @@ export function createProcessesRouter(apiKeys: ApiKey[], root: string, deps: Pro
     timeoutMs: START_TIMEOUT_MS,
     ...deps.start,
   };
+  const stopOptions: StopOptions = { termWaitMs: STOP_TERM_WAIT_MS, ...deps.stop };
   const router = guardAsyncRoutes(Router(), (req, res, e) => {
     const code = (e as NodeJS.ErrnoException | undefined)?.code;
     logger.error(`processes: ${req.method} ${req.path} failed: ${e instanceof Error ? e.name : typeof e}${typeof code === 'string' ? ` ${code}` : ''}`);
@@ -117,6 +120,23 @@ export function createProcessesRouter(apiKeys: ApiKey[], root: string, deps: Pro
       }
       logger.info(`processes: started ${rel.value} on port ${started.value.port} (pid ${started.value.pid})`);
       res.status(202).json(started.value);
+    },
+  );
+
+  defineRoute(
+    router,
+    { method: 'POST', path: '/v1/processes/stop', auth: 'admin', summary: 'Stop the processes that listen and work in a folder under the files root', cli: null },
+    auth,
+    requireAdmin,
+    async (req: Request, res: Response) => {
+      const rel = projectPath(((req.body ?? {}) as { path?: unknown }).path);
+      if (!rel.ok) return fail(res, rel.error);
+      const stopped = await stopProject(root, rel.value, stopOptions);
+      if (!stopped.ok) return fail(res, stopped.error);
+      if (stopped.value.stopped.length + stopped.value.remaining.length > 0) {
+        logger.info(`processes: stopped ${rel.value}: ports ${stopped.value.stopped.map((p) => p.port).join(',') || '-'}, remaining ${stopped.value.remaining.map((p) => p.port).join(',') || '-'}`);
+      }
+      res.json(stopped.value);
     },
   );
 

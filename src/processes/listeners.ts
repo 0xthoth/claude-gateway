@@ -13,6 +13,8 @@ export interface ListenSocket {
 export interface SocketOwner {
   pid: number;
   session?: number;
+  /** Field 22 of /proc/<pid>/stat, the start time in clock ticks: with the pid it names one process, never a reused pid. */
+  startTicks?: string;
   cwd?: string;
   command: string;
 }
@@ -84,15 +86,31 @@ export function displayCommand(argv: string[]): string {
   return text.length > MAX_COMMAND_CHARS ? `${text.slice(0, MAX_COMMAND_CHARS - 1)}…` : text;
 }
 
+/** Field `n` (1-based, as proc(5) numbers them) of a /proc/<pid>/stat line; the comm in parentheses may hold spaces. */
+export function statField(stat: string, n: number): string | undefined {
+  const close = stat.lastIndexOf(')');
+  if (close < 0 || n < 3) return undefined;
+  return stat.slice(close + 2).split(' ')[n - 3] || undefined;
+}
+
+/** The start time of `pid` now, or undefined when it is gone. */
+export async function readStartTicks(pid: number): Promise<string | undefined> {
+  return statField(await fsp.readFile(`/proc/${pid}/stat`, 'utf8').catch(() => ''), 22);
+}
+
 async function describeOwner(pid: number): Promise<SocketOwner> {
   const [cmdline, stat, cwd] = await Promise.all([
     fsp.readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => ''),
     fsp.readFile(`/proc/${pid}/stat`, 'utf8').catch(() => ''),
     fsp.realpath(`/proc/${pid}/cwd`).catch(() => undefined),
   ]);
-  // Fields after the parenthesised comm: state ppid pgrp session ...
-  const session = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[3]);
-  return { pid, cwd, command: displayCommand(cmdline.split('\0').filter(Boolean)), ...(Number.isInteger(session) ? { session } : {}) };
+  const session = Number(statField(stat, 6));
+  const startTicks = statField(stat, 22);
+  return {
+    pid, cwd, command: displayCommand(cmdline.split('\0').filter(Boolean)),
+    ...(Number.isInteger(session) ? { session } : {}),
+    ...(startTicks ? { startTicks } : {}),
+  };
 }
 
 /** Every listening socket with the processes whose fd table holds it. Processes the gateway may not inspect are left out. */

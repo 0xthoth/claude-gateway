@@ -6,7 +6,8 @@ import * as os from 'os';
 import * as path from 'path';
 import request from 'supertest';
 import { createProcessesRouter } from '../../src/api/processes-router';
-import { listeningPorts, parseProcNetTcp } from '../../src/processes/listeners';
+import { listeningPorts, parseProcNetTcp, readStartTicks } from '../../src/processes/listeners';
+import { signalIfSame, stopTargets } from '../../src/processes/stop';
 import type { ApiKey } from '../../src/types';
 import { silentLogger } from '../helpers/silent-logger';
 
@@ -29,7 +30,9 @@ const startedPids: number[] = [];
 function makeApp(portRange: [number, number] = [41000, 41010], timeoutMs = 8000): void {
   app = express();
   app.use(express.json());
-  app.use('/api', createProcessesRouter(apiKeys, root, { logger: silentLogger, start: { logDir, portRange, timeoutMs, pollMs: 50 } }));
+  app.use('/api', createProcessesRouter(apiKeys, root, {
+    logger: silentLogger, start: { logDir, portRange, timeoutMs, pollMs: 50 }, stop: { termWaitMs: 300, pollMs: 50 },
+  }));
 }
 
 beforeEach(() => {
@@ -59,8 +62,8 @@ function project(name: string, script?: string): string {
 }
 
 /** A real child process working in `cwd` that listens on `port` (0 for a random one); resolves with the port. */
-function listenIn(cwd: string, port = 0, extraArgs: string[] = []): Promise<{ port: number; pid: number }> {
-  const code = `const s=require('net').createServer().listen(${port},'127.0.0.1',()=>console.log(s.address().port))`;
+function listenIn(cwd: string, port = 0, extraArgs: string[] = [], prelude = ''): Promise<{ port: number; pid: number }> {
+  const code = `${prelude}const s=require('net').createServer().listen(${port},'127.0.0.1',()=>console.log(s.address().port))`;
   const child = spawn(process.execPath, ['-e', code, '--', ...extraArgs], { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
   children.push(child);
   return new Promise((resolve, reject) => {
@@ -84,6 +87,10 @@ const start = async (body: object, key = 'k-admin') => {
   if (res.status === 202) startedPids.push(res.body.pid);
   return res;
 };
+
+const stop = (body: object, key = 'k-admin') => request(app).post('/api/v1/processes/stop').set(as(key)).send(body);
+
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 describe('parseProcNetTcp', () => {
   it('reads LISTEN rows only and decodes v4 and v6 addresses', () => {
@@ -115,7 +122,7 @@ describe('path rejection', () => {
     ['out', 403, 'path_escape'],
     ['missing', 404, 'not_found'],
   ])('GET and start refuse %j with %i %s', async (rel, status, code) => {
-    for (const res of [await get(rel), await start({ path: rel })]) {
+    for (const res of [await get(rel), await start({ path: rel }), await stop({ path: rel })]) {
       expect([res.status, res.body.code]).toEqual([status, code]);
     }
   });
@@ -279,5 +286,47 @@ describe('POST /v1/processes/start', () => {
     // Once it listens, a later start reports the port instead.
     const again = await start({ path: 'app' });
     expect([again.status, again.body.code, again.body.port]).toEqual([409, 'already_running', won.body.port]);
+  });
+});
+
+describe('POST /v1/processes/stop', () => {
+  it('needs an admin key', async () => {
+    project('app');
+    expect((await stop({ path: 'app' }, 'k-read')).status).toBe(403);
+  });
+
+  it('answers 200 with empty lists for a folder with no listeners', async () => {
+    project('app');
+    const res = await stop({ path: 'app' });
+    expect([res.status, res.body]).toEqual([200, { path: 'app', stopped: [], remaining: [], running: false }]);
+  });
+
+  it('stops a real child listening in the folder and leaves other folders alone', async () => {
+    const dir = project('app');
+    const other = await listenIn(project('other'));
+    const { port, pid } = await listenIn(dir);
+    const res = await stop({ path: 'app' });
+    expect([res.status, res.body]).toEqual([200, { path: 'app', stopped: [{ port, pids: [pid] }], remaining: [], running: false }]);
+    expect((await get('app')).body.running).toBe(false);
+    expect((await get('other')).body.listeners.map((l: { port: number }) => l.port)).toEqual([other.port]);
+  });
+
+  it('SIGKILLs a process that ignores SIGTERM', async () => {
+    const dir = project('app');
+    const { port, pid } = await listenIn(dir, 0, [], "process.on('SIGTERM',()=>{});");
+    const res = await stop({ path: 'app' });
+    expect(res.body).toEqual({ path: 'app', stopped: [{ port, pids: [pid] }], remaining: [], running: false });
+  });
+
+  it('signals nothing when the recorded start time no longer matches the pid', async () => {
+    const dir = project('app');
+    const { port, pid } = await listenIn(dir);
+    const ticks = await readStartTicks(pid);
+    expect(ticks).toMatch(/^\d+$/);
+    const reused = { pid, startTicks: String(Number(ticks) + 1) };
+    expect(await signalIfSame(reused, 'SIGTERM')).toBe(false);
+    await stopTargets([reused], { termWaitMs: 200, pollMs: 50 });
+    expect(alive(pid)).toBe(true);
+    expect((await get('app')).body.listeners.map((l: { port: number }) => l.port)).toEqual([port]);
   });
 });

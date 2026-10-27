@@ -65,7 +65,8 @@
           "items": {
             "enum": [
               "list",
-              "start"
+              "start",
+              "stop"
             ]
           }
         }

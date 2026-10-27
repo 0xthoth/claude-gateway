@@ -67,13 +67,13 @@ export type SessionsCapability = (typeof SESSIONS_CAPABILITIES)[number];
 
 /**
  * Routes served by processes-router.ts for folders under the files root: `list` is `GET /v1/processes`, `start` is
- * `POST /v1/processes/start`, which needs an admin key. There is no stop route.
+ * `POST /v1/processes/start` and `stop` is `POST /v1/processes/stop`; the last two need an admin key.
  */
-export const PROCESSES_CAPABILITIES = ['list', 'start'] as const;
+export const PROCESSES_CAPABILITIES = ['list', 'start', 'stop'] as const;
 export type ProcessesCapability = (typeof PROCESSES_CAPABILITIES)[number];
 
 /** The processes operations served only to an admin key. */
-export const PROCESSES_ADMIN_CAPABILITIES: ReadonlySet<ProcessesCapability> = new Set(['start']);
+export const PROCESSES_ADMIN_CAPABILITIES: ReadonlySet<ProcessesCapability> = new Set(['start', 'stop']);
 
 export interface CapabilitiesResponse {
   /** Gateway version from package.json. Informational — clients should key off `capabilities`, not parse this. */

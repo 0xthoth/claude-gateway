@@ -33,7 +33,8 @@
       ],
       "processes": [
         "list",
-        "start"
+        "start",
+        "stop"
       ]
     },
     "filesRoot": "/home/user/projects"
