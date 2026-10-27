@@ -84,7 +84,7 @@ import { receiveChannelMedia } from '../orchestration/channel-media';
 import { scheduleCleanup, resolveRetentionDays } from '../history/cleanup';
 import type { HistorySource, ChatChannel, ChatChannelOrApi } from '../history/types';
 import { isChatChannel } from '../history/types';
-import type { SkillLearningManager } from './skill-learning';
+import { managedTurnSkills, toolUseSkills, type SkillLearningManager } from './skill-learning';
 import { spawnArchiveReindex } from './knowledge';
 import { resolveEnabledConnectors } from '../connectors/resolve';
 import { CwdFailure, CwdResolver, CwdState, WorkReason, CwdUnavailableReason, CwdUnsupportedReason, cwdError, NO_CWD_RESOLVER, SessionCwd, StoredCwd, storedCwd } from '../session/cwd';
@@ -455,6 +455,7 @@ export class AgentRunner extends EventEmitter {
 
   // Skill registry for detecting /skill-name commands in user messages
   private skillRegistry: SkillRegistry = { skills: new Map() };
+  private workspaceRecompose?: () => Promise<unknown>;
 
   // Skill self-improvement (planning-62). Optional — set by index.ts per agent.
   // All calls are guarded (`this.skillLearning?.`) and best-effort.
@@ -648,7 +649,7 @@ export class AgentRunner extends EventEmitter {
           },
           onManagedTurn: (sessionId, text, metrics, skills) => {
             const key = `orchestration:${sessionId}`;
-            this.skillLearning?.onTurnStart(key, sessionId, text, skills, metrics.startedAt);
+            this.skillLearning?.onTurnStart(key, sessionId, text, managedTurnSkills(skills, metrics.usedSkills, this.skillRegistry, metrics.usedSkillFiles), metrics.startedAt);
             for (const id of metrics.toolIds) this.skillLearning?.onToolUse(key, id);
             this.skillLearning?.onTokenUsage(key, metrics.inputTokens, metrics.totalTokens);
             this.skillLearning?.onTurnEnd(key, sessionId);
@@ -921,10 +922,29 @@ export class AgentRunner extends EventEmitter {
       Number(process.env.CHANNEL_COALESCE_WINDOW_MS) || CHANNEL_COALESCE_WINDOW_MS;
   }
 
+  /** Wire this agent's CLAUDE.md + skill registry rebuild (src/index.ts, workspaceRecomposer). */
+  setWorkspaceRecomposer(recompose: () => Promise<unknown>): void {
+    this.workspaceRecompose = recompose;
+  }
+
+  /** Rebuild CLAUDE.md and the skill registry through the wired recomposer; false if none is wired. */
+  async recomposeWorkspace(): Promise<boolean> {
+    if (!this.workspaceRecompose) return false;
+    await this.workspaceRecompose();
+    return true;
+  }
+
   /**
-   * Update the skill registry used for detecting /skill-name commands.
+   * Update the skill registry used for detecting /skill-name commands. A workspace
+   * reload has no CLI/extension skills of its own: it keeps the last discovered ones
+   * until refreshCliSkillRegistry swaps in a new list.
    */
   setSkillRegistry(registry: SkillRegistry): void {
+    const previous = this.skillRegistry;
+    if (registry.cliSkills === undefined && previous.cliSkills !== undefined) {
+      const { cliSkills, cliDiscoveryError, extensionServers, extensionNotices } = previous;
+      Object.assign(registry, { cliSkills, extensionServers, extensionNotices }, cliDiscoveryError ? { cliDiscoveryError } : {});
+    }
     this.skillRegistry = registry;
   }
 
@@ -2724,6 +2744,7 @@ export class AgentRunner extends EventEmitter {
                 // completed blocks). Cheap, best-effort.
                 if (block.type === 'tool_use') {
                   this.skillLearning?.onToolUse(mapKey, (block as Record<string, unknown>)['id'] as string | undefined);
+                  for (const usedSkill of toolUseSkills(block, this.skillRegistry)) this.skillLearning?.onSkillUsed(mapKey, usedSkill);
                 }
                 // LINE sends images through its own line_image tool (not the reply
                 // tool's `files`), so capture those sends into history too — the
@@ -3222,7 +3243,7 @@ export class AgentRunner extends EventEmitter {
     } else if (/^\/pstack[-_]setup\b/.test(content)) {
       await this.handleCommandPstackSetup(chatId, content.replace(/^\/pstack[-_]setup(?:@\w+)?/, '').trim(), meta);
     } else if (content.startsWith('/models')) {
-      await this.handleCommandModels(chatId);
+      await this.handleCommandModels(chatId, meta);
     } else if (content.startsWith('/model')) {
       await this.handleCommandModel(chatId, content.replace('/model', '').trim(), meta);
     } else if (content.startsWith('/stop')) {
@@ -3235,15 +3256,19 @@ export class AgentRunner extends EventEmitter {
    *
    * Telegram never reaches this: its receiver answers `/models` itself with a
    * button keyboard and does not forward the message. Discord and LINE have no
-   * picker of their own, so they get the list as text plus the command that
-   * selects from it (issue #409).
+   * picker of their own, so direct messages get the list as text plus the
+   * command that selects from it (issue #409); groups get a DM instruction.
    *
    * A channel listed in BUILTIN_COMMANDS but missing a branch here is worse
    * than one not listed at all — the gate swallows the message and the user
    * gets silence instead of the agent's reply. `/model` on Discord was in
    * exactly that state before this.
    */
-  private async handleCommandModels(chatId: string): Promise<void> {
+  private async handleCommandModels(chatId: string, meta: Record<string, string> = {}): Promise<void> {
+    if (!this.isDirectChat(meta)) {
+      this.writeAutoForward(chatId, 'Use /models in a direct message with the bot to view available models.');
+      return;
+    }
     this.writeAutoForward(chatId, (await this.modelList('Switch with /model <id or alias>')).text);
   }
 
@@ -3371,16 +3396,13 @@ export class AgentRunner extends EventEmitter {
   ): Promise<void> {
     const current = this.agentConfig.claude.model;
     if (!arg) {
-      this.writeAutoForward(chatId, `Current model: ${current}\n\nUse /models to see the list.`);
+      this.writeAutoForward(chatId, this.isDirectChat(meta)
+        ? `Current model: ${current}\n\nUse /models to see the list.`
+        : `Current model: ${current}`);
       return;
     }
     if (!this.isDirectChat(meta)) {
-      this.writeAutoForward(
-        chatId,
-        'Switching models is only available in a direct message with the bot — '
-        + 'it changes the model for every chat of this agent. '
-        + 'Use /models here to see the list.',
-      );
+      this.writeAutoForward(chatId, 'Use /model <model-id> in a direct message with the bot to change the model.');
       return;
     }
     const match = findModel(await this.selectableModels(), arg);
@@ -3829,9 +3851,16 @@ export class AgentRunner extends EventEmitter {
    */
   async restartSessionsUsingConnector(
     connectorId: string,
-    opts?: { overlay?: Record<string, CustomConnectorEntry | null> },
+    opts?: {
+      overlay?: Record<string, CustomConnectorEntry | null>;
+      /** This agent's new per-agent enablement map, just written by a scope route. */
+      agentConnectors?: AgentConfig['connectors'];
+    },
   ): Promise<{ restarted: boolean }> {
     const overlay = opts?.overlay;
+    // Adopted for the overlay's reason below: the watcher has not delivered the
+    // write yet, and the restarted sessions respawn from this.agentConfig.
+    if (opts?.agentConnectors) this.agentConfig.connectors = opts.agentConnectors;
     const customConnectors = {
       ...this.gatewayConfig?.gateway?.customConnectors,
       ...overlay,
@@ -6049,12 +6078,12 @@ export class AgentRunner extends EventEmitter {
    * (`allowFrom` in mcp/tools/discord/access.ts is DM-only), so without this
    * any member of an allowlisted channel could switch the model out from under
    * everyone else and kill their in-flight turns. LINE forwards group and room
-   * messages the same way. Telegram's receiver answers `/model` itself behind
-   * a private-chat + allowlist check and does not forward it here.
+   * messages the same way. Telegram's receiver handles `/model` itself, using
+   * its existing group access policy for bare queries.
    *
    * Fails closed: a channel that does not report a chat type cannot switch.
-   * Listing models (`/models`, bare `/model`) is unaffected — it reads nothing
-   * and changes nothing.
+   * The bare `/model` query remains read-only in groups; `/models` is separately
+   * restricted because its catalog exposes model IDs and aliases.
    */
   private isDirectChat(meta: Record<string, string>): boolean {
     const kind = meta['chat_type'] ?? meta['line_chat_type'] ?? meta['slack_chat_type'];
