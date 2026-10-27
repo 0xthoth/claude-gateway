@@ -50,6 +50,7 @@ import { createCapabilitiesRouter } from './capabilities';
 import { GATEWAY_VERSION } from './gateway-version';
 import { createWorkspaceRouter } from './workspace-router';
 import { createFilesRouter } from './files-router';
+import { createProcessesRouter } from './processes-router';
 import { filesEnabled, resolveFilesRoot } from '../files/config';
 import { blocking, FolderWork } from '../files/marks';
 import { createSkillsRouter } from './skills-router';
@@ -761,6 +762,7 @@ export class GatewayRouter {
         inUse: async (dir) => { await work.prepare(); return blocking(work.reasons(dir)).length > 0; },
         work,
       }));
+      this.app.use('/api', createProcessesRouter(this.gatewayConfig.gateway.api.keys, resolveFilesRoot(this.gatewayConfig), { logger: this.logger }));
     }
 
     // Mount skills routes

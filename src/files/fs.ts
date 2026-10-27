@@ -90,6 +90,15 @@ export async function resolveDir(root: string, rel: RelPath, allowRoot = false):
   return st.isDirectory() ? dir : err('not_a_directory');
 }
 
+/** {@link resolveDir} without any symlink on the way: `symlink_in_path` when the real folder is not `root/rel` as spelled. */
+export async function resolveRealDir(root: string, rel: RelPath): Promise<FsResult<string>> {
+  const dir = await resolveDir(root, rel);
+  if (!dir.ok) return dir;
+  const realRoot = await realRootOf(root);
+  if (!realRoot.ok) return realRoot;
+  return dir.value === path.join(realRoot.value, rel) ? dir : err('symlink_in_path');
+}
+
 /** Bounds the open file handles a large folder costs one list request. */
 const LIST_CONCURRENCY = 16;
 
@@ -195,14 +204,8 @@ function serializeCreate<T>(parent: string, fn: () => Promise<T>): Promise<T> {
 
 /** The real parent folder of a new entry. A missing root is created, as the first mkdir on a fresh pod needs; a missing deeper parent is not. */
 async function parentOf(root: string, parentRel: RelPath): Promise<FsResult<string>> {
-  if (parentRel !== '') {
-    const dir = await resolveDir(root, parentRel);
-    if (!dir.ok) return dir;
-    // As DELETE does: a new folder never lands through a symlinked parent, where it would appear under two names.
-    const realRoot = await realRootOf(root);
-    if (!realRoot.ok) return realRoot;
-    return dir.value === path.join(realRoot.value, parentRel) ? dir : err('symlink_in_path');
-  }
+  // As DELETE does: a new folder never lands through a symlinked parent, where it would appear under two names.
+  if (parentRel !== '') return resolveRealDir(root, parentRel);
   try {
     await fsp.mkdir(root, { recursive: true });
   } catch (e) {

@@ -27,6 +27,9 @@
       ],
       "sessions": [
         "cwd"
+      ],
+      "processes": [
+        "list"
       ]
     },
     "filesRoot": "/home/user/projects"

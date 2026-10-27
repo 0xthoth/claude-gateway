@@ -1,0 +1,124 @@
+import { NextFunction, Request, Response, Router } from 'express';
+import * as os from 'os';
+import * as path from 'path';
+import { ApiKey, Logger } from '../types';
+import { createApiAuthMiddleware, isAdmin } from './auth';
+import { guardAsyncRoutes } from './async-guard';
+import { defineRoute } from './route-registry';
+import { FILES_ERRORS } from './files-router';
+import { resolveRealDir } from '../files/fs';
+import { parseRelPath, RelPath } from '../files/paths';
+import { collectListeners, Listener, listenersIn } from '../processes/listeners';
+import { DEFAULT_PORT_RANGE, parsePort, START_TIMEOUT_MS, StartErrorCode, StartFailure, startProject, StartOptions } from '../processes/start';
+
+type AuthedRequest = Request & { apiKey: ApiKey };
+
+/** Every error code the processes routes answer, with its status. Path errors are the files API's. */
+export const PROCESSES_ERRORS: Record<StartErrorCode, { status: number; message: string }> = {
+  invalid_path: FILES_ERRORS.invalid_path,
+  invalid_name: FILES_ERRORS.invalid_name,
+  not_a_directory: FILES_ERRORS.not_a_directory,
+  invalid_port: { status: 400, message: 'port must be an integer from 1024 to 65535' },
+  path_escape: FILES_ERRORS.path_escape,
+  permission_denied: FILES_ERRORS.permission_denied,
+  forbidden_key: FILES_ERRORS.forbidden_key,
+  not_found: FILES_ERRORS.not_found,
+  already_exists: FILES_ERRORS.already_exists,
+  symlink_in_path: FILES_ERRORS.symlink_in_path,
+  cross_device: FILES_ERRORS.cross_device,
+  already_running: { status: 409, message: 'A process working in this folder already listens, or a start of it is running' },
+  port_in_use: { status: 409, message: 'Something already listens on this port' },
+  no_free_port: { status: 409, message: `Every port from ${DEFAULT_PORT_RANGE[0]} to ${DEFAULT_PORT_RANGE[1]} is in use` },
+  no_start_command: { status: 422, message: 'The folder has no .pod/start.sh in a real .pod directory' },
+  internal: FILES_ERRORS.internal,
+  start_failed: { status: 502, message: 'The start script exited or did not listen in time' },
+};
+
+function fail(res: Response, error: StartErrorCode | StartFailure): void {
+  const body = typeof error === 'string' ? { code: error } : error;
+  const { status, message } = PROCESSES_ERRORS[body.code];
+  res.status(status).json({ error: message, ...body });
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (isAdmin((req as AuthedRequest).apiKey)) next();
+  else fail(res, 'forbidden_key');
+}
+
+/** A project folder: a non-empty path under the root, as the files API parses it. */
+function projectPath(raw: unknown): { ok: true; value: RelPath } | { ok: false; error: 'invalid_path' | 'invalid_name' } {
+  const rel = parseRelPath(raw);
+  if (!rel.ok) return rel;
+  return rel.value === '' ? { ok: false, error: 'invalid_path' } : rel;
+}
+
+export interface ProcessesResponse {
+  path: RelPath;
+  running: boolean;
+  listeners: Listener[];
+}
+
+export interface ProcessesRouterDeps {
+  logger: Logger;
+  /** Overrides for tests; the defaults are the gateway's. */
+  start?: Partial<StartOptions>;
+}
+
+/**
+ * Which servers a project folder under the files root runs, and starting one with the folder's `.pod/start.sh`. Any key
+ * may read; starting runs code and needs an admin key. There is no stop route.
+ */
+export function createProcessesRouter(apiKeys: ApiKey[], root: string, deps: ProcessesRouterDeps): Router {
+  const { logger } = deps;
+  const startOptions: StartOptions = {
+    logDir: path.join(os.homedir(), '.claude-gateway', 'process-logs'),
+    portRange: DEFAULT_PORT_RANGE,
+    timeoutMs: START_TIMEOUT_MS,
+    ...deps.start,
+  };
+  const router = guardAsyncRoutes(Router(), (req, res, e) => {
+    const code = (e as NodeJS.ErrnoException | undefined)?.code;
+    logger.error(`processes: ${req.method} ${req.path} failed: ${e instanceof Error ? e.name : typeof e}${typeof code === 'string' ? ` ${code}` : ''}`);
+    if (res.headersSent) res.end();
+    else fail(res, 'internal');
+  });
+  const auth = createApiAuthMiddleware(apiKeys);
+
+  defineRoute(
+    router,
+    { method: 'GET', path: '/v1/processes', auth: 'key', summary: 'The TCP listeners of processes working in a folder under the files root', cli: null },
+    auth,
+    async (req: Request, res: Response) => {
+      const rel = projectPath(req.query.path);
+      if (!rel.ok) return fail(res, rel.error);
+      const dir = await resolveRealDir(root, rel.value);
+      if (!dir.ok) return fail(res, dir.error);
+      const listeners = listenersIn(await collectListeners(), dir.value);
+      const body: ProcessesResponse = { path: rel.value, running: listeners.length > 0, listeners };
+      res.json(body);
+    },
+  );
+
+  defineRoute(
+    router,
+    { method: 'POST', path: '/v1/processes/start', auth: 'admin', summary: "Start a folder's server with its .pod/start.sh", cli: null },
+    auth,
+    requireAdmin,
+    async (req: Request, res: Response) => {
+      const body = (req.body ?? {}) as { path?: unknown; port?: unknown };
+      const rel = projectPath(body.path);
+      if (!rel.ok) return fail(res, rel.error);
+      const port = parsePort(body.port);
+      if (!port.ok) return fail(res, port.error);
+      const started = await startProject(root, rel.value, port.value, startOptions);
+      if (!started.ok) {
+        if (started.error.code === 'start_failed') logger.warn(`processes: start of ${rel.value} failed`);
+        return fail(res, started.error);
+      }
+      logger.info(`processes: started ${rel.value} on port ${started.value.port} (pid ${started.value.pid})`);
+      res.status(202).json(started.value);
+    },
+  );
+
+  return router;
+}

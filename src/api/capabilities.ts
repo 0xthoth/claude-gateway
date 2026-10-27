@@ -65,6 +65,16 @@ export type GitCapability = (typeof GIT_CAPABILITIES)[number];
 export const SESSIONS_CAPABILITIES = ['cwd'] as const;
 export type SessionsCapability = (typeof SESSIONS_CAPABILITIES)[number];
 
+/**
+ * Routes served by processes-router.ts for folders under the files root: `list` is `GET /v1/processes`, `start` is
+ * `POST /v1/processes/start`, which needs an admin key. There is no stop route.
+ */
+export const PROCESSES_CAPABILITIES = ['list', 'start'] as const;
+export type ProcessesCapability = (typeof PROCESSES_CAPABILITIES)[number];
+
+/** The processes operations served only to an admin key. */
+export const PROCESSES_ADMIN_CAPABILITIES: ReadonlySet<ProcessesCapability> = new Set(['start']);
+
 export interface CapabilitiesResponse {
   /** Gateway version from package.json. Informational — clients should key off `capabilities`, not parse this. */
   version: string;
@@ -73,8 +83,9 @@ export interface CapabilitiesResponse {
     files: FilesCapability[];
     git: GitCapability[];
     sessions: SessionsCapability[];
+    processes: ProcessesCapability[];
   };
-  /** Why `files`, `git` and `sessions` are empty; absent when the files API is usable. */
+  /** Why `files`, `git`, `sessions` and `processes` are empty; absent when the files API is usable. */
   filesUnavailable?: FilesUnavailable;
   /** The absolute files root, the value `GET /v1/files` reports as `root`; absent when the files API is off. */
   filesRoot?: string;
@@ -83,20 +94,21 @@ export interface CapabilitiesResponse {
 /** `disabled`: the gateway serves no files or git API. */
 export type FilesUnavailable = 'disabled';
 
-type FilesAvailability = Pick<CapabilitiesResponse['capabilities'], 'files' | 'git' | 'sessions'> & { filesUnavailable?: FilesUnavailable };
+type FilesAvailability = Pick<CapabilitiesResponse['capabilities'], 'files' | 'git' | 'sessions' | 'processes'> & { filesUnavailable?: FilesUnavailable };
 
 /**
  * The tokens `apiKey` may use. A non-admin key gets every token but the admin-only ones. A gateway with orchestration
  * off does not advertise `sessions: ['cwd']`. Without a config or a key (tests) the gateway-wide answer is given.
  */
 export function filesAvailability(config?: GatewayConfig, apiKey?: ApiKey): FilesAvailability {
-  if (config && !filesEnabled(config)) return { files: [], git: [], sessions: [], filesUnavailable: 'disabled' };
+  if (config && !filesEnabled(config)) return { files: [], git: [], sessions: [], processes: [], filesUnavailable: 'disabled' };
   const orchestrated = !config || gatewayOrchestrationEnabled(config.gateway.orchestration);
   const admin = !apiKey || isAdmin(apiKey);
   return {
     files: FILES_CAPABILITIES.filter((c) => admin || !FILES_ADMIN_CAPABILITIES.has(c)),
     git: [...GIT_CAPABILITIES],
     sessions: orchestrated ? [...SESSIONS_CAPABILITIES] : [],
+    processes: PROCESSES_CAPABILITIES.filter((c) => admin || !PROCESSES_ADMIN_CAPABILITIES.has(c)),
   };
 }
 

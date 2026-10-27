@@ -30,6 +30,10 @@
       ],
       "sessions": [
         "cwd"
+      ],
+      "processes": [
+        "list",
+        "start"
       ]
     },
     "filesRoot": "/home/user/projects"

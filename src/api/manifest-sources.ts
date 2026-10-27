@@ -2,6 +2,7 @@ import { resetRegisteredRoutes, getRegisteredRoutes, RouteDef } from './route-re
 import { createCronRouter } from './cron-router';
 import { createPstackRouter } from './pstack-router';
 import { createFilesRouter } from './files-router';
+import { createProcessesRouter } from './processes-router';
 
 /**
  * Populate the route manifest by instantiating every CONVERTED router with
@@ -21,6 +22,7 @@ export function collectManifest(): RouteDef[] {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   createPstackRouter(undefined as any, new Map(), undefined, () => undefined);
   createFilesRouter([], '', { logger: console });
+  createProcessesRouter([], '', { logger: console });
 
   return getRegisteredRoutes();
 }

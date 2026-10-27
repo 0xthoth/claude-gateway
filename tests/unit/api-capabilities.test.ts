@@ -56,6 +56,7 @@ describe('GET /api/v1/capabilities', () => {
         files: expect.any(Array),
         git: expect.any(Array),
         sessions: expect.any(Array),
+        processes: expect.any(Array),
       },
     });
     expect(res.body.version.length).toBeGreaterThan(0);
@@ -97,6 +98,16 @@ describe('GET /api/v1/capabilities', () => {
     expect({ files, git, sessions }).toEqual({ files: ['list'], git: ['status', 'summary'], sessions: ['cwd'] });
     expect(res.body).not.toHaveProperty('filesUnavailable');
     expect(res.body.capabilities.cross_channel_message).toContain('telegram');
+  });
+
+  it('advertises processes list to every key, start only to an admin key, and nothing when files are off', () => {
+    const on = { gateway: { orchestration: true }, agents: [] } as never;
+    expect(buildCapabilitiesResponse('1', on, apiKeys[0]).capabilities.processes).toEqual(['list', 'start']);
+    expect(buildCapabilitiesResponse('1', on, apiKeys[2]).capabilities.processes).toEqual(['list']);
+    const off = { gateway: { files: { enabled: false } }, agents: [] } as never;
+    expect(buildCapabilitiesResponse('1', off, apiKeys[0]).capabilities.processes).toEqual([]);
+    const served = new Map(collectManifest().filter((r) => r.path.startsWith('/v1/processes')).map((r) => [`${r.method} ${r.path}`, r.auth]));
+    expect(Object.fromEntries(served)).toEqual({ 'GET /v1/processes': 'key', 'POST /v1/processes/start': 'admin' });
   });
 
   it('drops sessions cwd for a non-admin key too when orchestration is off', () => {
