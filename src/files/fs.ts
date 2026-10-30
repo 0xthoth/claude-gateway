@@ -82,7 +82,7 @@ export async function reportedRoot(root: string): Promise<string | null> {
  * but still prints the total, so that total is used. Only a folder with no total at all, or one past the time limit,
  * reports null.
  */
-async function folderSize(realDir: string): Promise<number | null> {
+export async function folderSize(realDir: string): Promise<number | null> {
   const hit = sizeCache.get(realDir);
   if (hit && Date.now() - hit.at < SIZE_TTL_MS) return hit.size;
   let size: number | null = null;

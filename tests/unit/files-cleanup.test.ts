@@ -65,8 +65,8 @@ describe('GET /v1/files/cleanup/candidates', () => {
     const res = await request(app).get('/api/v1/files/cleanup/candidates').set(POD);
     expect(res.status).toBe(200);
     expect(res.body.candidates).toEqual([
-      { project: 'app', folder: 'node_modules' },
-      { project: 'py', folder: '.venv' },
+      { project: 'app', folder: 'node_modules', bytes: expect.any(Number) },
+      { project: 'py', folder: '.venv', bytes: expect.any(Number) },
     ]);
   });
 

@@ -1,7 +1,7 @@
 import { promises as fsp } from 'fs';
 import * as path from 'path';
 import { deleteEntry, DeleteErrorCode } from './delete';
-import { listDir, resolveRealDir } from './fs';
+import { folderSize, listDir, resolveRealDir } from './fs';
 import { FilesErrorCode, parseEntryName, RelPath } from './paths';
 import { err, ok, Result } from '../utils/result';
 import type { Logger } from '../types';
@@ -71,16 +71,23 @@ async function isCandidate(projectDir: string, folder: CleanupFolder): Promise<b
   return true;
 }
 
-/** Every project directly under the root, that has a cleanable folder. Reads only. */
-export async function listCleanupCandidates(root: string): Promise<CleanupCandidate[]> {
+export interface CleanupListing extends CleanupCandidate {
+  /** Bytes the folder occupies, as the files listing counts them. Null when the measurement ran out of time. */
+  bytes: number | null;
+}
+
+/** Every project directly under the root, that has a cleanable folder, with what each one occupies. Reads only. */
+export async function listCleanupCandidates(root: string): Promise<CleanupListing[]> {
   const listing = await listDir(root, '' as RelPath);
   if (!listing.ok) return [];
-  const found: CleanupCandidate[] = [];
+  const found: CleanupListing[] = [];
   for (const entry of listing.value.entries) {
     const projectDir = await resolveRealDir(root, entry.path);
     if (!projectDir.ok) continue;
     for (const folder of CLEANUP_FOLDERS) {
-      if (await isCandidate(projectDir.value, folder)) found.push({ project: entry.name, folder });
+      if (!(await isCandidate(projectDir.value, folder))) continue;
+      const bytes = await folderSize(path.join(projectDir.value, folder));
+      found.push({ project: entry.name, folder, bytes });
     }
   }
   return found;
