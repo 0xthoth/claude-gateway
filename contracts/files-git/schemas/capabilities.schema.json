@@ -36,7 +36,8 @@
               "list",
               "create",
               "delete",
-              "marks"
+              "marks",
+            "cleanup"
             ]
           }
         },

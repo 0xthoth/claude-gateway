@@ -104,6 +104,7 @@ gets the gateway's usual `401` or `403` before it reaches these routes.
 | 400 | `not_a_directory` | The path names a file, a link to a file, or the root exists but is not a directory. |
 | 400 | `confirm_mismatch` | `DELETE` did not send `confirm` equal to the last segment of `path`. |
 | 400 | `invalid_mark` | `POST /files/busy` did not send 1 to 200 `paths`, or `POST /files/marks` did not send `purpose` `cleaning` or `starting` and an integer `ttlSec` from 60 to 300. |
+| 400 | `invalid_cleanup` | `POST /files/cleanup` did not send 1 to 200 `items`, each an object with a `project` and a `folder`. |
 | 403 | `path_escape` | The real path (after symlinks) leaves the root, or is the root itself. |
 | 403 | `permission_denied` | The gateway's user cannot read or change it. |
 | 403 | `forbidden_key` | mkdir, delete, busy or marks with a key that is not an admin key. |
@@ -242,6 +243,37 @@ example a subfolder without write permission, the response is still `200` and ad
 remove by hand (`rm -rf <parent>/.deleting-<name>-<id>`). The folder is also listed in `leftovers` of
 [the list](#get-files) of its parent. A folder is never left listed with part of its files gone. Chats bound to a
 deleted folder are kept, and their folder no longer resolves.
+
+## Cleanup {#cleanup}
+
+The gateway decides which folders a cleaner may remove. A caller chooses among them and nothing else is removed.
+
+| Folder | Cleanable when |
+| ------ | -------------- |
+| `node_modules` | The project's top holds `package.json`. |
+| `.venv` | A requirements, `pyproject.toml`, Pipfile, `poetry.lock`, `uv.lock` or `setup.py` file sits at the project's top, and `pyvenv.cfg` sits inside the folder. |
+| `venv` | The same as `.venv`. |
+
+A folder that is a link is never a candidate. The rules are the gateway's own and change only with a gateway release.
+
+### GET /api/v1/files/cleanup/candidates {#get-files-cleanup-candidates}
+
+Admin key only, like every cleanup route. Answers `{ "candidates": [{ "project": "app", "folder": "node_modules" }] }`, every candidate directly under every project in the root. It reads only and names no sizes.
+
+### POST /api/v1/files/cleanup {#post-files-cleanup}
+
+Admin key only. Body: `{ "items": [{ "project": "app", "folder": "node_modules" }] }`, 1 to 200 items. Each item is handled on its own, in order, and the answer is `200` with `{ "results": [...] }`, one entry per item with `project`, `folder`, `state` and, unless removed, `code`:
+
+| `state` | `code` | Meaning |
+| ------- | ------ | ------- |
+| `removed` | | The folder is gone. |
+| `skipped` | `in_use`, `marked`, `deleting` | A chat, task or mark holds the folder. Nothing was removed. |
+| `failed` | `not_a_candidate` | The folder is not on the list above right now, or the `folder` is not one of the three names. |
+| `failed` | `not_found` | The `project` folder does not exist. |
+| `failed` | `invalid_name` | The `project` name fails the [name rule](#paths), so `..` is refused. |
+| `failed` | another error | The same code the delete route answers, such as `symlink_in_path`. |
+
+A removal keeps every guard of `DELETE /files`: it stops at a link on the way, a mount point, and any hold.
 
 ## Busy checks and marks {#marks}
 

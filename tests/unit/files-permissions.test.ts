@@ -21,7 +21,7 @@ const NON_ADMIN = [KEYS.podWrite, KEYS.podRead, KEYS.alfredOnly];
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
 
 const ADMIN_ONLY_ROUTES = [
-  'POST /v1/files/mkdir', 'DELETE /v1/files',
+  'POST /v1/files/mkdir', 'DELETE /v1/files', 'GET /v1/files/cleanup/candidates', 'POST /v1/files/cleanup',
 ];
 /** Admin-only too; tests/integration/files-marks.test.ts checks each refuses a non-admin key. */
 const MARKS_ROUTES = ['POST /v1/files/busy', 'POST /v1/files/marks', 'DELETE /v1/files/marks/:markId'];

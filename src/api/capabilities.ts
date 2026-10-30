@@ -44,14 +44,14 @@ export const CROSS_CHANNEL_MESSAGE_CHANNELS: readonly ChatChannel[] = [...CHAT_C
 /**
  * Folder operations served by files-router.ts under the one files root. Clients gate listing on `includes('list')`,
  * `POST /v1/files/mkdir` on `includes('create')`, `DELETE /v1/files` on `includes('delete')`, and
- * `POST /v1/files/busy` with `POST|DELETE /v1/files/marks` on `includes('marks')`. The gateway serves no file
- * contents; they are viewed in code-server.
+ * `POST /v1/files/busy` with `POST|DELETE /v1/files/marks` on `includes('marks')`, and the cleanup candidates and
+ * removal on `includes('cleanup')`. The gateway serves no file contents; they are viewed in code-server.
  */
-export const FILES_CAPABILITIES = ['list', 'create', 'delete', 'marks'] as const;
+export const FILES_CAPABILITIES = ['list', 'create', 'delete', 'marks', 'cleanup'] as const;
 export type FilesCapability = (typeof FILES_CAPABILITIES)[number];
 
 /** The operations files-router.ts serves only to an admin key; every other token is open to any key. */
-export const FILES_ADMIN_CAPABILITIES: ReadonlySet<FilesCapability> = new Set(['create', 'delete', 'marks']);
+export const FILES_ADMIN_CAPABILITIES: ReadonlySet<FilesCapability> = new Set(['create', 'delete', 'marks', 'cleanup']);
 
 /** Read-only git routes served by files-router.ts: `GET /v1/git/status` and `GET /v1/git/summary`. */
 export const GIT_CAPABILITIES = ['status', 'summary'] as const;

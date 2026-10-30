@@ -22,7 +22,8 @@
         "list",
         "create",
         "delete",
-        "marks"
+        "marks",
+        "cleanup"
       ],
       "git": [
         "status",

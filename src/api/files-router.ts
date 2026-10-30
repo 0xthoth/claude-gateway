@@ -4,6 +4,7 @@ import { ADMIN_KEY_REQUIRED, createApiAuthMiddleware, isAdmin } from './auth';
 import { guardAsyncRoutes } from './async-guard';
 import { defineRoute } from './route-registry';
 import { listDir, makeDir } from '../files/fs';
+import { CLEANUP_FOLDERS, listCleanupCandidates, MAX_CLEANUP_ITEMS, parseCleanupItems, removeCleanupItems } from '../files/cleanup';
 import { DeleteErrorCode, deleteEntry } from '../files/delete';
 import { FilesErrorCode, parseRelPath, pathSegments, RelPath } from '../files/paths';
 import { getStatus, getSummaries, GitError, GitErrorCode } from '../git/read';
@@ -12,7 +13,7 @@ import { Result } from '../utils/result';
 
 type AuthedRequest = Request & { apiKey: ApiKey };
 
-export type FilesApiErrorCode = FilesErrorCode | GitErrorCode | DeleteErrorCode | 'confirm_mismatch' | 'invalid_mark' | 'too_many_marks';
+export type FilesApiErrorCode = FilesErrorCode | GitErrorCode | DeleteErrorCode | 'confirm_mismatch' | 'invalid_mark' | 'too_many_marks' | 'invalid_cleanup';
 
 /** The most paths one `POST /v1/files/busy` checks. */
 const MAX_BUSY_PATHS = 200;
@@ -24,6 +25,7 @@ export const FILES_ERRORS: Record<FilesApiErrorCode, { status: number; message: 
   not_a_directory: { status: 400, message: 'Not a directory' },
   confirm_mismatch: { status: 400, message: 'confirm must equal the last segment of path' },
   invalid_mark: { status: 400, message: `paths must be 1 to ${MAX_BUSY_PATHS} paths; a mark needs purpose ${MARK_PURPOSES.join(' or ')} and ttlSec ${MARK_TTL_SEC.min} to ${MARK_TTL_SEC.max}` },
+  invalid_cleanup: { status: 400, message: `items must be 1 to ${MAX_CLEANUP_ITEMS} objects, each with a project name and one folder of ${CLEANUP_FOLDERS.join(', ')}` },
   path_escape: { status: 403, message: 'Path resolves outside the files root' },
   permission_denied: { status: 403, message: 'Permission denied' },
   forbidden_key: { status: 403, message: ADMIN_KEY_REQUIRED.error },
@@ -141,6 +143,28 @@ export function createFilesRouter(apiKeys: ApiKey[], root: string, deps: FilesRo
       if (name === undefined) return fail(res, 'invalid_path');
       if (body.confirm !== name) return fail(res, 'confirm_mismatch');
       respond(res, await deleteEntry(root, rel.value, { logger, inUse: deps.inUse ?? (() => false) }));
+    },
+  );
+
+  defineRoute(
+    router,
+    { method: 'GET', path: '/v1/files/cleanup/candidates', auth: 'admin', summary: 'The folders under each project that a cleaner may remove', cli: null },
+    auth,
+    requireAdmin,
+    async (_req: Request, res: Response) => {
+      res.json({ candidates: await listCleanupCandidates(root) });
+    },
+  );
+
+  defineRoute(
+    router,
+    { method: 'POST', path: '/v1/files/cleanup', auth: 'admin', summary: 'Remove the chosen cleanup candidates; anything else is refused', cli: null },
+    auth,
+    requireAdmin,
+    async (req: Request, res: Response) => {
+      const items = parseCleanupItems(((req.body ?? {}) as { items?: unknown }).items);
+      if (!items.ok) return fail(res, items.error);
+      res.json({ results: await removeCleanupItems(root, items.value, { logger, inUse: deps.inUse ?? (() => false) }) });
     },
   );
 
