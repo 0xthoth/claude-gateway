@@ -18,7 +18,8 @@
         "abs": "/home/user/projects/site/api",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": true
+        "is_git": true,
+        "size": 192512
       },
       {
         "name": "node_modules",
@@ -26,7 +27,8 @@
         "abs": "/home/user/projects/site/node_modules",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": false
+        "is_git": false,
+        "size": 8192
       },
       {
         "name": "web",
@@ -34,7 +36,8 @@
         "abs": "/home/user/projects/site/web",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": false
+        "is_git": false,
+        "size": 4096
       }
     ]
   }

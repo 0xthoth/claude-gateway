@@ -86,7 +86,7 @@ describe('GET /api/v1/files', () => {
     const top = await list();
     expect(top.body).toEqual({
       root, exists: true, path: '', abs: root,
-      entries: [{ name: 'app', path: 'app', abs: path.join(root, 'app'), type: 'dir', modified_at: expect.any(String), is_git: false }],
+      entries: [{ name: 'app', path: 'app', abs: path.join(root, 'app'), type: 'dir', modified_at: expect.any(String), is_git: false, size: expect.any(Number) }],
     });
     const nested = await list('app');
     expect(nested.body).toMatchObject({ path: 'app', abs: path.join(root, 'app'), entries: [{ name: 'src', path: 'app/src', abs: path.join(root, 'app', 'src') }] });
@@ -150,7 +150,7 @@ describe('POST /api/v1/files/mkdir', () => {
   it('creates, then 409s a duplicate while keeping the first folder intact', async () => {
     const first = await mkdir({ path: 'app' });
     expect(first.status).toBe(201);
-    expect(first.body).toEqual({ entry: { name: 'app', path: 'app', abs: path.join(root, 'app'), type: 'dir', modified_at: expect.any(String), is_git: false } });
+    expect(first.body).toEqual({ entry: { name: 'app', path: 'app', abs: path.join(root, 'app'), type: 'dir', modified_at: expect.any(String), is_git: false, size: expect.any(Number) } });
     fs.writeFileSync(path.join(root, 'app', 'work.txt'), 'unsaved work');
 
     const second = await mkdir({ path: 'app', git_init: true });

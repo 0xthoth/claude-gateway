@@ -9,6 +9,12 @@ import { err, ok, Result } from '../utils/result';
 import type { Logger } from '../types';
 
 const GIT_INIT_TIMEOUT_MS = 10_000;
+/** How long one folder's size may take. A folder that runs longer is listed with `size: null`. */
+const DU_TIMEOUT_MS = 8_000;
+/** How long a measured size stays fresh, so a repeated list does not walk every folder again. */
+const SIZE_TTL_MS = 60_000;
+const execFileAsync = promisify(execFile);
+const sizeCache = new Map<string, { at: number; size: number | null }>();
 
 export interface Entry {
   name: EntryName;
@@ -19,6 +25,8 @@ export interface Entry {
   type: 'dir';
   modified_at: string;
   is_git: boolean;
+  /** Bytes the folder occupies on disk, as `du -s -B1 -x` counts them. Null when the measurement ran out of time. */
+  size: number | null;
 }
 
 /** Why a folder under the listed one is not an entry. */
@@ -69,10 +77,35 @@ export async function reportedRoot(root: string): Promise<string | null> {
   return realRoot.error === 'not_found' ? root : null;
 }
 
+/**
+ * Bytes under a folder, measured with `du` on the real path. `du` exits non-zero when part of the tree is unreadable
+ * but still prints the total, so that total is used. Only a folder with no total at all, or one past the time limit,
+ * reports null.
+ */
+async function folderSize(realDir: string): Promise<number | null> {
+  const hit = sizeCache.get(realDir);
+  if (hit && Date.now() - hit.at < SIZE_TTL_MS) return hit.size;
+  let size: number | null = null;
+  try {
+    const { stdout } = await execFileAsync('du', ['-s', '-B1', '-x', realDir], { timeout: DU_TIMEOUT_MS });
+    size = parseDuTotal(stdout);
+  } catch (e) {
+    size = parseDuTotal((e as { stdout?: string }).stdout ?? '');
+  }
+  sizeCache.set(realDir, { at: Date.now(), size });
+  return size;
+}
+
+export function parseDuTotal(stdout: string): number | null {
+  const n = Number.parseInt(stdout.split('\t')[0] ?? '', 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 async function describeEntry(dirAbs: string, rel: RelPath, realDir: string, name: EntryName): Promise<Entry> {
   const st = await fsp.stat(realDir);
   const isGit = await fsp.lstat(path.join(realDir, '.git')).then(() => true, () => false);
-  return { name, path: joinRel(rel, name), abs: path.join(dirAbs, name), type: 'dir', modified_at: st.mtime.toISOString(), is_git: isGit };
+  const size = await folderSize(realDir);
+  return { name, path: joinRel(rel, name), abs: path.join(dirAbs, name), type: 'dir', modified_at: st.mtime.toISOString(), is_git: isGit, size };
 }
 
 /**

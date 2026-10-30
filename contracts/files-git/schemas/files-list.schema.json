@@ -95,6 +95,10 @@
         },
         "is_git": {
           "type": "boolean"
+        },
+        "size": {
+          "type": ["integer", "null"],
+          "minimum": 0
         }
       },
       "required": [
@@ -103,7 +107,8 @@
         "abs",
         "type",
         "modified_at",
-        "is_git"
+        "is_git",
+        "size"
       ],
       "additionalProperties": false
     }

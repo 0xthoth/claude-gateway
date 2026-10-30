@@ -18,7 +18,8 @@
         "abs": "/home/user/projects/alias",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": false
+        "is_git": false,
+        "size": 208896
       },
       {
         "name": "app",
@@ -26,7 +27,8 @@
         "abs": "/home/user/projects/app",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": true
+        "is_git": true,
+        "size": 192512
       },
       {
         "name": "busy",
@@ -34,7 +36,8 @@
         "abs": "/home/user/projects/busy",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": false
+        "is_git": false,
+        "size": 4096
       },
       {
         "name": "locked",
@@ -42,7 +45,8 @@
         "abs": "/home/user/projects/locked",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": false
+        "is_git": false,
+        "size": 12288
       },
       {
         "name": "site",
@@ -50,7 +54,8 @@
         "abs": "/home/user/projects/site",
         "type": "dir",
         "modified_at": "2026-01-02T03:04:05.000Z",
-        "is_git": false
+        "is_git": false,
+        "size": 208896
       }
     ],
     "skipped": [

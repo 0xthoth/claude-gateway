@@ -2,7 +2,7 @@ import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { listDir, makeDir, resolveDir } from "../../src/files/fs";
+import { listDir, makeDir, parseDuTotal, resolveDir } from "../../src/files/fs";
 import { RelPath } from "../../src/files/paths";
 import { silentLogger } from "../helpers/silent-logger";
 
@@ -92,6 +92,7 @@ describe("makeDir", () => {
         type: "dir",
         modified_at: expect.any(String),
         is_git: false,
+        size: expect.any(Number),
       },
     });
     fs.writeFileSync(path.join(root, "app", "keep.txt"), "precious");
@@ -342,5 +343,19 @@ describe("nested paths", () => {
   it("refuses an empty path, which names the root", async () => {
     fs.mkdirSync(root);
     expect(await makeDir(root, rel(""), false, silentLogger)).toEqual({ ok: false, error: "invalid_path" });
+  });
+});
+
+describe('folder size', () => {
+  it('reports the bytes a folder occupies, and parses du output', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'files-size-'));
+    fs.mkdirSync(path.join(root, 'app'));
+    fs.writeFileSync(path.join(root, 'app', 'big.bin'), Buffer.alloc(64 * 1024, 1));
+    const listing = await listDir(root, rel(''));
+    if (!listing.ok) throw new Error('list failed');
+    const app = listing.value.entries.find((e) => e.name === 'app');
+    expect(app?.size).toBeGreaterThanOrEqual(64 * 1024);
+    expect(parseDuTotal('8192\t/x\n')).toBe(8192);
+    expect(parseDuTotal('')).toBeNull();
   });
 });
