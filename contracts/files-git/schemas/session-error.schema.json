@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-gateway.dev/contracts/files-git/session-error.schema.json",
+  "title": "SessionError",
+  "description": "Error body of POST /v1/agents/:agentId/sessions for its cwd, and for the removed project field. website/api/sessions.md lists each code with its status.",
+  "type": "object",
+  "required": [
+    "error",
+    "code"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "error": {
+      "type": "string",
+      "minLength": 1
+    },
+    "code": {
+      "enum": [
+        "project_replaced_by_cwd",
+        "invalid_cwd",
+        "cwd_outside_root",
+        "cwd_not_found",
+        "files_disabled",
+        "path_marked",
+        "cwd_unavailable",
+        "cwd_unsupported_agent"
+      ]
+    },
+    "reason": {
+      "type": "string"
+    }
+  }
+}

@@ -65,7 +65,7 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/api/v1/agents/:agentId/sessions` | Key | List API sessions for a `chat_id` |
-| `POST` | `/api/v1/agents/:agentId/sessions` | Key | Create a new API session (auto-names from prompt) |
+| `POST` | `/api/v1/agents/:agentId/sessions` | Key | Create a new API session (auto-names from prompt). An optional `cwd` binds it to a folder under the files root and needs write permission |
 | `GET` | `/api/v1/agents/:agentId/sessions/:sessionId/info` | Key | Get session info (name, message count, context %) |
 | `GET` | `/api/v1/agents/:agentId/sessions/:sessionId/stream` | Key | Re-attach to the session's in-flight turn (SSE, resumable from a `seq` cursor) |
 | `PATCH` | `/api/v1/agents/:agentId/sessions/:sessionId` | Key | Rename a session |
@@ -82,6 +82,28 @@ Sessions are stored at `sessions/api-{chat_id}/` — symmetric with `telegram-{i
 |--------|------|------|-------------|
 | `GET` | `/api/v1/agents/:agentId/files/:filename` | Key | Read a workspace file |
 | `PUT` | `/api/v1/agents/:agentId/files/:filename` | Write | Write a workspace file |
+
+## Files API {#files-api}
+
+Paths are relative to `gateway.files.root` (default `~/projects`). See [Files](/api/files).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/files?path=` | Key | List the folders directly under a path of the root |
+| `POST` | `/api/v1/files/mkdir` | Admin key | Create one new folder, optionally with `git init` |
+| `DELETE` | `/api/v1/files` | Admin key | Delete a folder and everything in it (JSON body `path`, `confirm`) |
+| `POST` | `/api/v1/files/busy` | Admin key | Report what works in each of 1 to 200 folders (advisory) |
+| `POST` | `/api/v1/files/marks` | Admin key | Hold a folder for 60 to 300 seconds while a cleaner works in it |
+| `DELETE` | `/api/v1/files/marks/:markId` | Admin key | Release a mark (always `204`) |
+
+## Git API {#git-api}
+
+Read-only. See [Git](/api/git).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/v1/git/status?path=` | Key | Git status of one folder under the files root |
+| `GET` | `/api/v1/git/summary?path=` | Key | Git sync summary of every repository directly under a path of the root |
 
 ## Telegram Channel API {#telegram-channel-api}
 
