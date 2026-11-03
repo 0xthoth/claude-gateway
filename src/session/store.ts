@@ -17,6 +17,24 @@ export class SessionNotInIndexError extends Error {
   }
 }
 
+/** The only shape of session id the API accepts or a legacy binding file may name; anything else names no session. */
+export const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/** True when `name` joined to a folder stays a file directly inside it: no separator, no `.` or `..`, no NUL. */
+function isPlainFileName(name: string): boolean {
+  return name !== '' && name !== '.' && name !== '..' && !/[/\\\0]/.test(name) && path.basename(name) === name;
+}
+
+/** One api session as the indexes on disk record it: its chat, and its folder fields as written. */
+export interface ApiSessionRecord {
+  chatId: string;
+  cwd?: string;
+  project?: string;
+}
+
+/** A dev-data `project-bindings/<id>.json` file: its project name, `none` when there is no file, `unreadable` otherwise. */
+export type LegacyBinding = { project: string } | 'none' | 'unreadable';
+
 export class SessionStore {
   private readonly agentsBaseDir: string;
   private readonly queues = new Map<string, PQueue>();
@@ -229,6 +247,7 @@ export class SessionStore {
    * Resolve the path to a specific session's message file.
    */
   private resolveTelegramSessionPath(agentId: string, chatId: string, sessionId: string, channel: ChatChannelOrApi = 'telegram'): string {
+    if (!isPlainFileName(sessionId)) throw new Error('Invalid session id');
     return path.join(this.resolveTelegramDir(agentId, chatId, channel), `${sessionId}.json`);
   }
 
@@ -352,7 +371,7 @@ export class SessionStore {
    * Create a new session for a chat, add it to the index, and return the SessionMeta.
    * If name is not provided, auto-generates "Session N" based on current session count.
    */
-  async createTelegramSession(agentId: string, chatId: string, name?: string, channel: ChatChannelOrApi = 'telegram'): Promise<SessionMeta> {
+  async createTelegramSession(agentId: string, chatId: string, name?: string, channel: ChatChannelOrApi = 'telegram', cwd?: string): Promise<SessionMeta> {
     const queue = this.getTelegramQueue(agentId, chatId);
     return queue.add(async () => {
       const index = await this.loadOrCreateIndexUnlocked(agentId, chatId, channel);
@@ -367,6 +386,7 @@ export class SessionStore {
         lastActive: now,
         messageCount: 0,
         totalTokensUsed: 0,
+        ...(cwd ? { cwd } : {}),
       };
 
       // Write empty messages file
@@ -377,7 +397,13 @@ export class SessionStore {
 
       // Update index
       index.sessions.push(meta);
-      await this.saveIndex(agentId, chatId, index, channel);
+      try {
+        await this.saveIndex(agentId, chatId, index, channel);
+      } catch (error) {
+        index.sessions.pop();
+        fs.rmSync(sessionPath, { force: true });
+        throw error;
+      }
 
       return meta;
     }) as Promise<SessionMeta>;
@@ -434,7 +460,9 @@ export class SessionStore {
 
       await this.saveIndex(agentId, chatId, index, channel);
 
-      // Delete the session messages file
+      // An index entry whose id is not a plain file name never had a file in this folder: it leaves the index and
+      // nothing is unlinked, so a poisoned index.json cannot point the unlink outside the chat folder.
+      if (!isPlainFileName(sessionId)) return;
       const sessionPath = this.resolveTelegramSessionPath(agentId, chatId, sessionId, channel);
       try {
         fs.unlinkSync(sessionPath);
@@ -658,6 +686,51 @@ export class SessionStore {
       if (!index.activeSessionId) index.activeSessionId = sessionId;
       await this.saveIndex(agentId, internalChatId, index, 'api');
     });
+  }
+
+  /**
+   * Every api session the chat indexes name, keyed by session id. A session id held by two chats keeps the record
+   * that names a folder, so a binding is never lost to a later plain entry.
+   */
+  async listApiSessionRecords(agentId: string): Promise<Map<string, ApiSessionRecord>> {
+    const out = new Map<string, ApiSessionRecord>();
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(path.join(this.agentsBaseDir, agentId, 'sessions'), { withFileTypes: true });
+    } catch {
+      return out;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith('api-')) continue;
+      const chatId = entry.name.slice('api-'.length);
+      const index = await this.loadIndex(agentId, chatId, 'api').catch(() => null);
+      for (const s of index?.sessions ?? []) {
+        const record = { chatId, ...(typeof s.cwd === 'string' ? { cwd: s.cwd } : {}), ...(typeof s.project === 'string' ? { project: s.project } : {}) };
+        const held = out.get(s.id);
+        if (!held || (!held.cwd && !held.project)) out.set(s.id, record);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The `project-bindings/<id>.json` file dev pods wrote before sessions stored a cwd. Read only, for the fallback;
+   * nothing writes these files any more. No file means no binding; a file that cannot be read fails closed.
+   */
+  async readLegacyBinding(agentId: string, sessionId: string): Promise<LegacyBinding> {
+    if (!SESSION_ID_RE.test(sessionId)) return 'none';
+    let raw: string;
+    try {
+      raw = await fs.promises.readFile(path.join(this.agentsBaseDir, agentId, 'project-bindings', `${sessionId}.json`), 'utf-8');
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'none' : 'unreadable';
+    }
+    try {
+      const project = (JSON.parse(raw) as { project?: unknown }).project;
+      return typeof project === 'string' ? { project } : 'unreadable';
+    } catch {
+      return 'unreadable';
+    }
   }
 
   /** Get all session metadata (name) for an agent, keyed by sessionId. */

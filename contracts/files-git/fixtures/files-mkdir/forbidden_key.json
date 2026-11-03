@@ -1,0 +1,16 @@
+{
+  "request": {
+    "method": "POST",
+    "url": "/api/v1/files/mkdir",
+    "key": "reader",
+    "body": {
+      "path": "demo2"
+    }
+  },
+  "status": 403,
+  "schema": "Error",
+  "body": {
+    "error": "An admin API key is required",
+    "code": "forbidden_key"
+  }
+}
